@@ -14,6 +14,13 @@ from typing import Literal
 
 import numpy as np
 
+try:
+    import dynamo_rs as _dynamo_rs
+    _HAS_RUST = hasattr(_dynamo_rs, "tfpeak_histogram")
+except ImportError:
+    _dynamo_rs = None
+    _HAS_RUST = False
+
 
 BinMethod = Literal["full", "partial", "extend", "full_extend", "full extend"]
 
@@ -111,6 +118,33 @@ def tfpeak_histogram(
 
     num_fbins = freq_cbins.size
     num_cbins = c_cbins.size
+
+    # ---- Rust fast path ---------------------------------------------------
+    if _HAS_RUST:
+        cm = np.ascontiguousarray(c_metric, dtype=np.float64)
+        cs = np.ascontiguousarray(np.asarray(c_stages, dtype=float), dtype=np.float64)
+        cv = np.ascontiguousarray(c_valid, dtype=bool)
+        cva = np.ascontiguousarray(c_valid_allstages, dtype=bool)
+        pf = np.ascontiguousarray(peak_freqs, dtype=np.float64)
+        pc = np.ascontiguousarray(peak_c, dtype=np.float64)
+        fe = np.ascontiguousarray(freq_edges, dtype=np.float64)
+        ce = np.ascontiguousarray(c_edges, dtype=np.float64)
+        out = _dynamo_rs.tfpeak_histogram(
+            cm, cs, float(c_dt), cv, cva, pf, pc, fe, ce,
+            bool(circular),
+            (float(circular_bounds[0]), float(circular_bounds[1])),
+            int(norm_dim), bool(compute_rate),
+            float(min_time_in_bin), int(min_peak_at_freq),
+        )
+        return {
+            "c_mat": out["c_mat"],
+            "freq_cbins": freq_cbins,
+            "c_cbins": c_cbins,
+            "time_in_bin": out["time_in_bin"],
+            "prop_in_bin": out["prop_in_bin"],
+            "peak_at_freq": out["peak_at_freq"],
+        }
+    # ---- Python fallback --------------------------------------------------
 
     # [N_peaks × num_fbins] mask: peak p in freq bin f?
     pf = peak_freqs[:, None]

@@ -146,6 +146,126 @@ def _python_mask(spect_2s, stimes_2s, labels_1s, stimes_1s):
     return masked
 
 
+# ---------------------------------------------------------------------------
+# swap #3 — tfpeak_histogram
+# ---------------------------------------------------------------------------
+
+def _python_tfhist(c_metric, c_stages, c_dt, c_valid, c_valid_all,
+                   peak_freqs, peak_c, freq_edges, c_edges,
+                   circular, cb, norm_dim, compute_rate,
+                   min_time_in_bin, min_peak_at_freq):
+    """Pure-Python reference implementation (copied from the pre-swap version)."""
+    num_fbins = freq_edges.shape[1]
+    num_cbins = c_edges.shape[1]
+    pf = peak_freqs[:, None]
+    all_infreqbin = (pf >= freq_edges[0][None, :]) & (pf < freq_edges[1][None, :])
+    c_mat = np.full((num_cbins, num_fbins), np.nan, dtype=float)
+    time_in_bin = np.zeros((num_cbins, 5), dtype=float)
+    prop_in_bin = np.zeros((num_cbins, 5), dtype=float)
+    compute_tib = compute_rate or (min_time_in_bin > 0)
+    if compute_tib:
+        stage_valid_masks = np.zeros((c_stages.size, 5), dtype=bool)
+        for k in range(1, 6):
+            stage_valid_masks[:, k - 1] = (c_stages == k) & c_valid
+    low_b, high_b = float(cb[0]), float(cb[1])
+    crange = high_b - low_b
+    for s in range(num_cbins):
+        lo_e, hi_e = c_edges[0, s], c_edges[1, s]
+        if circular and lo_e <= low_b:
+            wrap_lo = lo_e + crange
+            tib_inds = (c_metric >= wrap_lo) | (c_metric < hi_e)
+            inc_inds = (peak_c >= wrap_lo) | (peak_c < hi_e)
+        elif circular and hi_e >= high_b:
+            wrap_hi = hi_e - crange
+            tib_inds = (c_metric < wrap_hi) | (c_metric >= lo_e)
+            inc_inds = (peak_c < wrap_hi) | (peak_c >= lo_e)
+        else:
+            tib_inds = (c_metric >= lo_e) & (c_metric < hi_e)
+            inc_inds = (peak_c >= lo_e) & (peak_c < hi_e)
+        if compute_tib:
+            tib_per_stage = np.sum(tib_inds[:, None] & stage_valid_masks, axis=0) * c_dt / 60.0
+            time_in_bin[s, :] = tib_per_stage
+            tib_all = np.sum(tib_inds & c_valid_all) * c_dt / 60.0
+            if tib_all > 0:
+                prop_in_bin[s, :] = tib_per_stage / tib_all
+            if tib_per_stage.sum() < min_time_in_bin:
+                continue
+        if inc_inds.any():
+            counts = np.sum(inc_inds[:, None] & all_infreqbin, axis=0).astype(float)
+        else:
+            counts = np.zeros(num_fbins, dtype=float)
+        c_mat[s, :] = counts
+        if compute_rate and time_in_bin[s, :].sum() > 0:
+            c_mat[s, :] = c_mat[s, :] / time_in_bin[s, :].sum()
+    peak_at_freq = np.sum(all_infreqbin, axis=0).astype(float)
+    if min_peak_at_freq > 0:
+        c_mat[:, peak_at_freq < min_peak_at_freq] = np.nan
+    if norm_dim:
+        axis = norm_dim - 1
+        dim_sum = np.nansum(c_mat, axis=axis, keepdims=True)
+        dim_sum = np.where(dim_sum == 0, 1.0, dim_sum)
+        c_mat = c_mat / dim_sum
+    return c_mat, time_in_bin, prop_in_bin, peak_at_freq
+
+
+def test_swap3_histogram_parity(bisect_segment):
+    rng = np.random.default_rng(42)
+    # Synthetic inputs mirroring real SOpower histogram scale
+    n_t = 10_000
+    n_p = 5_000
+    c_metric = rng.normal(size=n_t)
+    c_stages = rng.integers(1, 6, size=n_t).astype(float)
+    c_valid = rng.random(n_t) > 0.1
+    c_valid_all = c_valid & (rng.random(n_t) > 0.05)
+    peak_freqs = rng.uniform(0.5, 29.5, size=n_p)
+    peak_c = rng.normal(size=n_p)
+    # Use the same `create_bins` the Rust-wrapped tfpeak_histogram calls
+    # internally (partial mode, clipped at lo/hi). Passing un-clipped edges
+    # to the Python reference while Rust gets clipped ones would make the
+    # two disagree on boundary samples.
+    from pydynamo.soph.histogram import create_bins
+    freq_edges, _ = create_bins((0.0, 30.0), 1.0, 0.2, "partial")
+    c_edges, _ = create_bins((-3.0, 3.0), 0.06, 0.06, "partial")
+    kw = dict(
+        circular=False, cb=(0.0, 0.0), norm_dim=0, compute_rate=True,
+        min_time_in_bin=5.0, min_peak_at_freq=1,
+    )
+    def py_call():
+        return _python_tfhist(c_metric, c_stages, 0.5, c_valid, c_valid_all,
+                              peak_freqs, peak_c, freq_edges, c_edges, **kw)
+    py_ms, out_py = _bench(py_call)
+
+    from pydynamo.soph.histogram import tfpeak_histogram
+    def rust_call():
+        return tfpeak_histogram(
+            c_metric=c_metric, c_stages=c_stages, c_dt=0.5,
+            c_valid=c_valid, c_valid_allstages=c_valid_all,
+            peak_freqs=peak_freqs, peak_c=peak_c,
+            circular=False, circular_bounds=(0.0, 0.0),
+            freq_range=(0.0, 30.0), freq_binsizestep=(1.0, 0.2),
+            c_range=(-3.0, 3.0), c_binsizestep=(0.06, 0.06),
+            norm_dim=0, compute_rate=True,
+            min_time_in_bin=5.0, min_peak_at_freq=1,
+        )
+    # Warmup the Rust path
+    rust_ms, out_rs = _bench(rust_call)
+
+    cm_py, tib_py, prop_py, paf_py = out_py
+    # max_abs diff on c_mat (ignore NaN)
+    mask = ~(np.isnan(cm_py) | np.isnan(out_rs["c_mat"]))
+    diff_cm = float(np.abs(out_rs["c_mat"][mask] - cm_py[mask]).max()) if mask.any() else 0.0
+    diff_tib = float(np.abs(out_rs["time_in_bin"] - tib_py).max())
+    diff_paf = float(np.abs(out_rs["peak_at_freq"] - paf_py).max())
+    overall = max(diff_cm, diff_tib, diff_paf)
+    _log_timing("tfpeak_histogram", py_ms, rust_ms, overall)
+    # Time_in_bin and peak_at_freq are bit-identical (integer counts); c_mat
+    # involves a divide, so FP rounding can introduce sub-ulp noise.
+    assert overall < 1e-12, (
+        f"histogram swap introduced diff > 1e-12: c_mat={diff_cm} "
+        f"tib={diff_tib} paf={diff_paf}"
+    )
+
+
 def test_swap2_mask_parity(bisect_segment):
     d = bisect_segment
     # Deterministic synthetic pass-1 label image (we only need something

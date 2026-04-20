@@ -17,6 +17,7 @@
 
 pub mod adjacency;
 pub mod baseline;
+pub mod histogram;
 pub mod mask;
 pub mod matlab_watershed;
 pub mod merge;
@@ -197,6 +198,70 @@ mod python {
         Ok(out.into_pyarray_bound(py))
     }
 
+    /// tfpeak_histogram(...) → dict with c_mat, time_in_bin, prop_in_bin, peak_at_freq.
+    ///
+    /// Port of pydynamo `soph.histogram.tfpeak_histogram`. Stage labels 1..=5.
+    #[pyfunction]
+    #[pyo3(signature = (
+        c_metric, c_stages, c_dt,
+        c_valid, c_valid_allstages,
+        peak_freqs, peak_c,
+        freq_edges, c_edges,
+        circular, circular_bounds,
+        norm_dim=0,
+        compute_rate=true,
+        min_time_in_bin=0.0,
+        min_peak_at_freq=0,
+    ))]
+    fn tfpeak_histogram<'py>(
+        py: Python<'py>,
+        c_metric: PyReadonlyArray1<'py, f64>,
+        c_stages: PyReadonlyArray1<'py, f64>,
+        c_dt: f64,
+        c_valid: PyReadonlyArray1<'py, bool>,
+        c_valid_allstages: PyReadonlyArray1<'py, bool>,
+        peak_freqs: PyReadonlyArray1<'py, f64>,
+        peak_c: PyReadonlyArray1<'py, f64>,
+        freq_edges: PyReadonlyArray2<'py, f64>,
+        c_edges: PyReadonlyArray2<'py, f64>,
+        circular: bool,
+        circular_bounds: (f64, f64),
+        norm_dim: i32,
+        compute_rate: bool,
+        min_time_in_bin: f64,
+        min_peak_at_freq: i32,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let v = c_valid.as_array().to_owned();
+        let va = c_valid_allstages.as_array().to_owned();
+        let v_vec: Vec<bool> = v.iter().copied().collect();
+        let va_vec: Vec<bool> = va.iter().copied().collect();
+        let inp = super::histogram::HistogramInputs {
+            c_metric: c_metric.as_array(),
+            c_stages: c_stages.as_array(),
+            c_dt,
+            c_valid: &v_vec,
+            c_valid_allstages: &va_vec,
+            peak_freqs: peak_freqs.as_array(),
+            peak_c: peak_c.as_array(),
+            freq_edges: freq_edges.as_array(),
+            c_edges: c_edges.as_array(),
+            circular,
+            circular_bounds,
+            norm_dim,
+            compute_rate,
+            min_time_in_bin,
+            min_peak_at_freq,
+        };
+        let out = super::histogram::tfpeak_histogram(&inp)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        let dict = pyo3::types::PyDict::new_bound(py);
+        dict.set_item("c_mat", out.c_mat.into_pyarray_bound(py))?;
+        dict.set_item("time_in_bin", out.time_in_bin.into_pyarray_bound(py))?;
+        dict.set_item("prop_in_bin", out.prop_in_bin.into_pyarray_bound(py))?;
+        dict.set_item("peak_at_freq", out.peak_at_freq.into_pyarray_bound(py))?;
+        Ok(dict)
+    }
+
     #[pymodule]
     fn dynamo_rs(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(merge_segment, m)?)?;
@@ -206,6 +271,7 @@ mod python {
         m.add_function(wrap_pyfunction!(compute_baseline, m)?)?;
         m.add_function(wrap_pyfunction!(subtract_baseline, m)?)?;
         m.add_function(wrap_pyfunction!(mask_spectrogram, m)?)?;
+        m.add_function(wrap_pyfunction!(tfpeak_histogram, m)?)?;
         Ok(())
     }
 }
