@@ -16,6 +16,7 @@ python = ["dep:pyo3", "dep:numpy"]
 [dependencies]
 ndarray = { version = "0.16", features = ["rayon"] }
 rayon = "1"
+realfft = "3"
 
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"], optional = true }
 numpy = { version = "0.22", optional = true }

@@ -21,6 +21,7 @@ pub mod histogram;
 pub mod mask;
 pub mod matlab_watershed;
 pub mod merge;
+pub mod refine;
 pub mod trim;
 
 #[cfg(feature = "python")]
@@ -262,6 +263,65 @@ mod python {
         Ok(dict)
     }
 
+    /// hann_event_spectra(data, fs, event_times, t0, freq_range, window_size, dsfreqs, detrend_opt)
+    /// → (spect (F, N), sfreqs (F,))
+    #[pyfunction]
+    #[pyo3(signature = (
+        data, fs, event_times, t0,
+        freq_range=(0.0, 30.0), window_size=4.0, dsfreqs=0.05,
+        detrend_opt="constant",
+    ))]
+    fn hann_event_spectra<'py>(
+        py: Python<'py>,
+        data: PyReadonlyArray1<'py, f64>,
+        fs: f64,
+        event_times: PyReadonlyArray1<'py, f64>,
+        t0: f64,
+        freq_range: (f64, f64),
+        window_size: f64,
+        dsfreqs: f64,
+        detrend_opt: &str,
+    ) -> PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, numpy::PyArray1<f64>>)> {
+        let data_vec: Vec<f64> = data.as_array().iter().copied().collect();
+        let event_vec: Vec<f64> = event_times.as_array().iter().copied().collect();
+        let detrend = match detrend_opt {
+            "constant" => super::refine::DetrendOpt::Constant,
+            "linear" => super::refine::DetrendOpt::Linear,
+            "off" | "none" => super::refine::DetrendOpt::None,
+            other => return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("unknown detrend_opt {:?}", other)
+            )),
+        };
+        let (spect, sfreqs) = super::refine::hann_event_spectra(
+            &data_vec, fs, &event_vec, t0, freq_range, window_size, dsfreqs, detrend,
+        );
+        let sfreqs_arr = ndarray::Array1::from(sfreqs);
+        Ok((spect.into_pyarray_bound(py), sfreqs_arr.into_pyarray_bound(py)))
+    }
+
+    /// refine_from_spectra(spect, sfreqs, bbox_lo, bbox_hi, n_grid=1000, remove_edge_peaks=true)
+    /// → refined_freqs (N,)
+    #[pyfunction]
+    #[pyo3(signature = (spect, sfreqs, bbox_lo, bbox_hi, n_grid=1000, remove_edge_peaks=true))]
+    fn refine_from_spectra<'py>(
+        py: Python<'py>,
+        spect: PyReadonlyArray2<'py, f64>,
+        sfreqs: PyReadonlyArray1<'py, f64>,
+        bbox_lo: PyReadonlyArray1<'py, f64>,
+        bbox_hi: PyReadonlyArray1<'py, f64>,
+        n_grid: usize,
+        remove_edge_peaks: bool,
+    ) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
+        let sfreqs_vec: Vec<f64> = sfreqs.as_array().iter().copied().collect();
+        let lo_vec: Vec<f64> = bbox_lo.as_array().iter().copied().collect();
+        let hi_vec: Vec<f64> = bbox_hi.as_array().iter().copied().collect();
+        let spect_owned = spect.as_array().to_owned();
+        let out = super::refine::refine_from_spectra(
+            &spect_owned, &sfreqs_vec, &lo_vec, &hi_vec, n_grid, remove_edge_peaks,
+        );
+        Ok(ndarray::Array1::from(out).into_pyarray_bound(py))
+    }
+
     #[pymodule]
     fn dynamo_rs(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(merge_segment, m)?)?;
@@ -272,6 +332,8 @@ mod python {
         m.add_function(wrap_pyfunction!(subtract_baseline, m)?)?;
         m.add_function(wrap_pyfunction!(mask_spectrogram, m)?)?;
         m.add_function(wrap_pyfunction!(tfpeak_histogram, m)?)?;
+        m.add_function(wrap_pyfunction!(hann_event_spectra, m)?)?;
+        m.add_function(wrap_pyfunction!(refine_from_spectra, m)?)?;
         Ok(())
     }
 }
