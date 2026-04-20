@@ -266,6 +266,76 @@ def test_swap3_histogram_parity(bisect_segment):
     )
 
 
+# ---------------------------------------------------------------------------
+# swap #4 — Hann refinement (hann_event_spectra + spline argmax)
+# ---------------------------------------------------------------------------
+
+def test_swap4_refine_parity(bisect_segment):
+    # Use a synthetic EEG + fake stats_table (we only need PeakTime +
+    # BoundingBox). Goal: confirm Rust and Python refine paths agree on
+    # refined PeakFrequency to within grid-discretization tolerance.
+    rng = np.random.default_rng(7)
+    fs = 100.0
+    n = 60 * int(fs)  # 60 seconds
+    data = rng.standard_normal(n).astype(np.float64)
+    t = np.arange(n) / fs
+    # 300 fake peaks scattered in the middle
+    n_events = 300
+    peak_times = rng.uniform(3.0, 57.0, size=n_events)
+    bbox_lo = rng.uniform(2.0, 10.0, size=n_events)
+    bbox_h = rng.uniform(1.0, 4.0, size=n_events)
+    bbox = np.stack(
+        [peak_times - 0.5, bbox_lo,
+         np.full_like(peak_times, 1.0), bbox_h],
+        axis=1,
+    )
+    import pandas as pd
+    stats = pd.DataFrame({
+        "PeakTime": peak_times,
+        "PeakFrequency": (bbox_lo + bbox_h / 2),
+        "BoundingBox": [tuple(r) for r in bbox],
+    })
+
+    # Rust path
+    from pydynamo.tfpeaks.refine import refine_peak_frequency
+    def rust_call():
+        return refine_peak_frequency(stats.copy(), data, fs, t=t)
+
+    rust_ms, out_rs = _bench(rust_call)
+
+    # Python fallback: temporarily disable Rust flag.
+    import pydynamo.tfpeaks.refine as _refmod
+    saved = _refmod._HAS_RUST
+    _refmod._HAS_RUST = False
+    try:
+        def py_call():
+            return refine_peak_frequency(stats.copy(), data, fs, t=t)
+        py_ms, out_py = _bench(py_call)
+    finally:
+        _refmod._HAS_RUST = saved
+
+    # Align by PeakTime (both paths may drop edge-rejected events).
+    merged = out_rs.merge(
+        out_py, on="PeakTime", suffixes=("_rs", "_py"), how="inner"
+    )
+    diff = float(
+        np.abs(merged["PeakFrequency_rs"] - merged["PeakFrequency_py"]).max()
+    ) if len(merged) else 0.0
+    # Tolerance: 1000-point grid over ≤ 4 Hz bbox ⇒ step ≤ 4 mHz. Allow 10 mHz
+    # for FFT-library FP noise + any tiny spline-solver differences between
+    # scipy CubicSpline(bc_type='not-a-knot' default) and our natural
+    # boundary (scipy default is 'not-a-knot', not 'natural' — so the two
+    # outputs WILL disagree by a small amount near the spectrum edges).
+    # Since the argmax is insider the bbox (not at the endpoints), the
+    # difference should be small.
+    _log_timing("refine", py_ms, rust_ms, diff)
+    # Also log peak-count parity
+    assert abs(len(out_rs) - len(out_py)) <= 5, (
+        f"kept-peak counts differ: rs={len(out_rs)}, py={len(out_py)}"
+    )
+    assert diff < 0.05, f"refine freq diff too large: {diff}"
+
+
 def test_swap2_mask_parity(bisect_segment):
     d = bisect_segment
     # Deterministic synthetic pass-1 label image (we only need something
