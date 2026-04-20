@@ -17,6 +17,7 @@
 
 pub mod adjacency;
 pub mod baseline;
+pub mod mask;
 pub mod matlab_watershed;
 pub mod merge;
 pub mod trim;
@@ -161,6 +162,29 @@ mod python {
         Ok(out.into_pyarray_bound(py))
     }
 
+    /// mask_spectrogram(spect_2s, stimes_2s, labels_1s, stimes_1s) → masked (F, T2) f64.
+    ///
+    /// Port of pydynamo `mask_spectrogram`: nearest-stime lookup from pass-2 cols
+    /// to pass-1 cols, paint spect where labels>0, zero the 1-pixel inner
+    /// perimeter (8-conn) of each label.
+    #[pyfunction]
+    fn mask_spectrogram<'py>(
+        py: Python<'py>,
+        spect_2s: PyReadonlyArray2<'py, f64>,
+        stimes_2s: PyReadonlyArray1<'py, f64>,
+        labels_1s: PyReadonlyArray2<'py, i64>,
+        stimes_1s: PyReadonlyArray1<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let out = super::mask::mask_spectrogram(
+            spect_2s.as_array(),
+            stimes_2s.as_array(),
+            labels_1s.as_array(),
+            stimes_1s.as_array(),
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        Ok(out.into_pyarray_bound(py))
+    }
+
     /// subtract_baseline(spect, baseline) → spect / baseline (column broadcast).
     #[pyfunction]
     fn subtract_baseline<'py>(
@@ -181,6 +205,7 @@ mod python {
         m.add_function(wrap_pyfunction!(matlab_watershed, m)?)?;
         m.add_function(wrap_pyfunction!(compute_baseline, m)?)?;
         m.add_function(wrap_pyfunction!(subtract_baseline, m)?)?;
+        m.add_function(wrap_pyfunction!(mask_spectrogram, m)?)?;
         Ok(())
     }
 }
