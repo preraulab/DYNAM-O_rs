@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+target/
+Cargo.lock
+*.so
+*.pyd
+*.dylib
+.DS_Store
+data_cache/*
+!data_cache/.gitkeep
