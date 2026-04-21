@@ -29,14 +29,20 @@ function export_validation_segment(out_dir)
     %     full 4-arg signature (which returns timings as the 9th output).
     %     The 'segment' shortcut path routes through runExampleData which
     %     only returns 8 outputs. ---
-    ed_path = which('example_data.mat');
-    if isempty(ed_path)
-        % fall back to known location
-        here = fileparts(which('runDYNAMO'));
-        ed_path = fullfile(here, 'example_data', 'example_data.mat');
-    end
-    assert(exist(ed_path, 'file') == 2, 'example_data.mat not on path');
+    % Force the DYNAMO_dev copy — there are other example_data.mat files
+    % on the user's MATLAB path (e.g. TF_sigma_peaks_SLEEP2021) that use
+    % different variable names (EEG/stages vs data/stage_vals).
+    here = fileparts(which('runDYNAMO'));
+    assert(~isempty(here), 'runDYNAMO not on MATLAB path');
+    ed_path = fullfile(here, 'example_data', 'example_data.mat');
+    assert(exist(ed_path, 'file') == 2, ...
+        'example_data.mat not found at %s', ed_path);
     ed = load(ed_path);
+    assert(isfield(ed, 'data') && isfield(ed, 'Fs') && ...
+           isfield(ed, 'stage_times') && isfield(ed, 'stage_vals'), ...
+        'Unexpected example_data.mat schema at %s: fields are %s', ...
+        ed_path, strjoin(fieldnames(ed), ', '));
+    fprintf('Loaded %s\n', ed_path);
     data = ed.data; Fs = ed.Fs;
     stage_times = ed.stage_times; stage_vals = ed.stage_vals;
 
