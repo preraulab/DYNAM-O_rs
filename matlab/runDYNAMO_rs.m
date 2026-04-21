@@ -108,40 +108,44 @@ end
 
 
 function T = df_to_matlab_table(df)
-%DF_TO_MATLAB_TABLE  Convert a pandas DataFrame into a MATLAB table,
-%   flattening BoundingBox cells into numeric columns if present.
+%DF_TO_MATLAB_TABLE  Convert a pandas DataFrame to a MATLAB table. Uses
+%   py.getattr for column access (MATLAB's df.(nm) dot-syntax fails on
+%   some column names because MATLAB only whitelists known DataFrame
+%   attributes).
     cols = cell(py.list(df.columns));
     n = double(df.shape{1});
     varargs = {};
-    var_names = cell(1, numel(cols));
+    var_names = {};
     for i = 1:numel(cols)
         nm = char(cols{i});
-        col = df.(nm);
-        % Try numeric → double; fall back to string.
-        try
-            vals = double(col.values);
-        catch
-            try
-                vals = double(py.numpy.asarray(col.values));
-            catch
-                vals = string(cellfun(@char, cell(col.values.tolist()), 'UniformOutput', false));
-            end
-        end
-        % Handle BoundingBox (4-tuples → 4 numeric columns)
-        if strcmp(nm, 'BoundingBox') && iscell(vals)
-            bb = zeros(n, 4);
-            for r = 1:n
-                tp = vals{r};
-                bb(r, :) = double(py.numpy.asarray(tp));
+        % Python-side column access: df[nm] via __getitem__
+        col = df{nm};
+        vals_py = col.values;
+
+        if strcmp(nm, 'BoundingBox')
+            % BoundingBox is a column of 4-tuples. Convert to Nx4 numeric.
+            if n == 0
+                bb = zeros(0, 4);
+            else
+                bb = double(py.numpy.asarray(py.numpy.stack(vals_py)));
             end
             varargs{end+1} = bb; %#ok<AGROW>
-            var_names{i} = 'BoundingBox';
+            var_names{end+1} = nm; %#ok<AGROW>
         else
-            if isnumeric(vals) && size(vals, 1) == 1
-                vals = vals(:);
+            % All other columns are scalar → 1-D numeric. numpy array
+            % → MATLAB double.
+            try
+                vec = double(py.numpy.asarray(vals_py));
+            catch
+                % Fallback for object-dtype columns: cast to string array.
+                vec = string(cellfun(@char, cell(col.astype('str').tolist()), ...
+                    'UniformOutput', false));
             end
-            varargs{end+1} = vals; %#ok<AGROW>
-            var_names{i} = nm;
+            if isnumeric(vec)
+                vec = vec(:);
+            end
+            varargs{end+1} = vec; %#ok<AGROW>
+            var_names{end+1} = nm; %#ok<AGROW>
         end
     end
     T = table(varargs{:}, 'VariableNames', var_names);
