@@ -154,11 +154,13 @@ function export_validation_segment(out_dir)
     dur_max = d.dur_max;                       %#ok<NASGU>
     bw_max = d.bw_max;                         %#ok<NASGU>
 
-    % min_duration / min_bandwidth are derived inside computeSpectrogram.
-    mtm_window_length_2 = d.mtm_window_length_2;
-    df = d.mtm_taper_params(1) / mtm_window_length_2 * 2;
-    dur_min = mtm_window_length_2 / 2;         %#ok<NASGU>
-    bw_min = df / 2;                           %#ok<NASGU>
+    % min_duration / min_bandwidth for the FINAL pass-2 extract+filter.
+    % computeTFPeaks.m line 275 sets dur_min from pass-1 and NEVER
+    % recomputes it at line 342, so pass-2 uses the pass-1 value.
+    % bw_min IS recomputed at line 342 for pass-2.
+    dur_min = d.mtm_window_length_1 / 2;       %#ok<NASGU>  pass-1 value stays
+    df_pass2 = d.mtm_taper_params(1) / d.mtm_window_length_2 * 2;
+    bw_min   = df_pass2 / 2;                   %#ok<NASGU>  pass-2
 
     % ht_db_min matches computeTFPeaks.m:395-397:
     %   chi2_df = 2 * taper_params(2), alpha = 0.95
