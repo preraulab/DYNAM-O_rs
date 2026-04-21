@@ -22,6 +22,7 @@ pub mod mask;
 pub mod matlab_watershed;
 pub mod merge;
 pub mod refine;
+pub mod signal;
 pub mod trim;
 
 #[cfg(feature = "python")]
@@ -322,6 +323,70 @@ mod python {
         Ok(ndarray::Array1::from(out).into_pyarray_bound(py))
     }
 
+    /// sosfiltfilt(sos (M, 6), x (N,)) → (N,) zero-phase filtered signal.
+    /// Matches scipy.signal.sosfiltfilt with padtype='odd', default padlen.
+    #[pyfunction]
+    fn sosfiltfilt<'py>(
+        py: Python<'py>,
+        sos: PyReadonlyArray2<'py, f64>,
+        x: PyReadonlyArray1<'py, f64>,
+    ) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
+        let sos_arr = sos.as_array();
+        if sos_arr.ncols() != 6 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "sos must have 6 columns (b0 b1 b2 a0 a1 a2)",
+            ));
+        }
+        let sos_vec: Vec<[f64; 6]> = (0..sos_arr.nrows())
+            .map(|r| [
+                sos_arr[[r, 0]], sos_arr[[r, 1]], sos_arr[[r, 2]],
+                sos_arr[[r, 3]], sos_arr[[r, 4]], sos_arr[[r, 5]],
+            ])
+            .collect();
+        let x_vec: Vec<f64> = x.as_array().iter().copied().collect();
+        let y = super::signal::sosfiltfilt(&sos_vec, &x_vec);
+        Ok(ndarray::Array1::from(y).into_pyarray_bound(py))
+    }
+
+    /// hilbert(x) → (re, im) analytic signal real/imag parts.
+    #[pyfunction]
+    fn hilbert<'py>(
+        py: Python<'py>,
+        x: PyReadonlyArray1<'py, f64>,
+    ) -> PyResult<(Bound<'py, numpy::PyArray1<f64>>, Bound<'py, numpy::PyArray1<f64>>)> {
+        let x_vec: Vec<f64> = x.as_array().iter().copied().collect();
+        let (re, im) = super::signal::hilbert(&x_vec);
+        Ok((
+            ndarray::Array1::from(re).into_pyarray_bound(py),
+            ndarray::Array1::from(im).into_pyarray_bound(py),
+        ))
+    }
+
+    /// unwrap(p, discont=π) — matches numpy.unwrap.
+    #[pyfunction]
+    #[pyo3(signature = (p, discont=std::f64::consts::PI))]
+    fn unwrap<'py>(
+        py: Python<'py>,
+        p: PyReadonlyArray1<'py, f64>,
+        discont: f64,
+    ) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
+        let v: Vec<f64> = p.as_array().iter().copied().collect();
+        let out = super::signal::unwrap(&v, discont);
+        Ok(ndarray::Array1::from(out).into_pyarray_bound(py))
+    }
+
+    /// movmean(x, win) — MATLAB-style centered moving mean with partial edges.
+    #[pyfunction]
+    fn movmean<'py>(
+        py: Python<'py>,
+        x: PyReadonlyArray1<'py, f64>,
+        win: usize,
+    ) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
+        let v: Vec<f64> = x.as_array().iter().copied().collect();
+        let out = super::signal::movmean(&v, win);
+        Ok(ndarray::Array1::from(out).into_pyarray_bound(py))
+    }
+
     #[pymodule]
     fn dynamo_rs(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(merge_segment, m)?)?;
@@ -334,6 +399,10 @@ mod python {
         m.add_function(wrap_pyfunction!(tfpeak_histogram, m)?)?;
         m.add_function(wrap_pyfunction!(hann_event_spectra, m)?)?;
         m.add_function(wrap_pyfunction!(refine_from_spectra, m)?)?;
+        m.add_function(wrap_pyfunction!(sosfiltfilt, m)?)?;
+        m.add_function(wrap_pyfunction!(hilbert, m)?)?;
+        m.add_function(wrap_pyfunction!(unwrap, m)?)?;
+        m.add_function(wrap_pyfunction!(movmean, m)?)?;
         Ok(())
     }
 }

@@ -27,8 +27,36 @@ import warnings
 from pathlib import Path
 
 import numpy as np
-from scipy.signal import hilbert, iirdesign, sosfiltfilt
+from scipy.signal import hilbert as _sp_hilbert, iirdesign, sosfiltfilt as _sp_sosfiltfilt
 from scipy.interpolate import interp1d
+
+# scipy's sosfiltfilt + hilbert are faster than our Rust port for single
+# signals. SOphase runs once on the whole EEG, so we stick with scipy here.
+_HAS_RUST_SIGNAL = False
+_dynamo_rs = None
+
+
+def _sosfiltfilt(sos, x):
+    if _HAS_RUST_SIGNAL:
+        return _dynamo_rs.sosfiltfilt(
+            np.ascontiguousarray(sos, np.float64),
+            np.ascontiguousarray(x, np.float64).ravel(),
+        )
+    return _sp_sosfiltfilt(sos, x)
+
+
+def _hilbert_analytic(x):
+    """Return complex analytic signal (like scipy.signal.hilbert)."""
+    if _HAS_RUST_SIGNAL:
+        re, im = _dynamo_rs.hilbert(np.ascontiguousarray(x, np.float64).ravel())
+        return re + 1j * im
+    return _sp_hilbert(x)
+
+
+def _unwrap(p):
+    if _HAS_RUST_SIGNAL:
+        return _dynamo_rs.unwrap(np.ascontiguousarray(p, np.float64).ravel())
+    return np.unwrap(p)
 
 
 _FILTER_DIR = Path(__file__).parent.parent / "data_matlab_filters"
@@ -118,9 +146,9 @@ def compute_so_phase(
     else:
         sos = _get_sos(fs, SO_freqrange)
 
-    filtdata = sosfiltfilt(sos, eeg)
-    analytic = hilbert(filtdata)
-    SOphase = np.unwrap(np.angle(analytic))
+    filtdata = _sosfiltfilt(sos, eeg)
+    analytic = _hilbert_analytic(filtdata)
+    SOphase = _unwrap(np.angle(analytic))
 
     filtdata_out = filtdata.copy()
     filtdata_out[isexcluded] = np.nan
