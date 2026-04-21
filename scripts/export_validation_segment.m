@@ -111,8 +111,18 @@ function export_validation_segment(out_dir)
     [~, regions1, borders1] = runSegmentedData( ...
         spect1, stimes1, sfreqs, baseline1, seg_time1, downsample_spect1, 'all', ...
         dur_min1, bw_min1, merge_thresh1, inf, d.trim_vol, -1, false, false);
-    % Mask the pass-2 spectrogram using pass-1 regions + borders
-    spect_masked = maskSpectrogram(spect, stimes1, stimes, regions1, borders1);
+    % Mask the pass-2 spectrogram using pass-1 regions + borders.
+    % Inlined from the private maskSpectrogram helper in computeTFPeaks.m
+    % (it's a nested function there, not on the path).
+    dt_shift = stimes(2) - stimes(1);
+    idx_shift = round((stimes(1) - stimes1(1)) / dt_shift) * size(spect, 1);
+    all_region_inds = cat(1, regions1{:}) - idx_shift;
+    all_region_inds = all_region_inds(all_region_inds >= 1 & all_region_inds <= numel(spect));
+    spect_masked = zeros(size(spect));
+    spect_masked(all_region_inds) = spect(all_region_inds);
+    all_border_inds = cat(1, borders1{:}) - idx_shift;
+    all_border_inds = all_border_inds(all_border_inds >= 1 & all_border_inds <= numel(spect));
+    spect_masked(all_border_inds) = 0;
     % Pass-2 baseline (runDYNAMO already applied it; recompute for save)
     bl_excl_st2 = logical(interp1(t_tr, single(bl_exclude), stimes, 'nearest'));
     spect2_bl = spect(:, ~bl_excl_st2);
