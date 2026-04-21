@@ -62,13 +62,34 @@ impl ErrorCode {
 
 /// Input descriptor for [`dynamo_extract_tfpeaks`].
 ///
-/// All array pointers point to column-major-equivalent data: the spectrogram
-/// is (F, T) with F varying fastest in memory (row-major C layout matching
-/// `ndarray::Array2::from_shape_vec((F, T), vec)` where vec was built
-/// row-by-row). `stimes.len() == T`, `sfreqs.len() == F`.
+/// All array pointers point to row-major C layout: the spectrogram is
+/// (F, T) stored as `spect[row * T + col]`. `stimes.len() == T`,
+/// `sfreqs.len() == F`.
 ///
 /// If `baseline_ptr` is null the spectrogram is used as-is. Otherwise the
-/// spectrogram is divided column-wise by `baseline` (length F).
+/// spectrogram is divided row-wise by `baseline` (length F) before
+/// segmentation.
+///
+/// The pipeline mirrors pydynamo's `extract_tfpeaks` end-to-end:
+///   1. Split the full (F, T) spect into `seg_time`-second segments
+///      (MATLAB `segmentData.m` semantics: floor + ceil).
+///   2. For each segment in parallel: stride-downsample by
+///      (`downsample_f`, `downsample_t`), watershed(-spect), merge,
+///      expand_labels(distance=5), resize labels up, trim, regionprops.
+///   3. Concatenate per-segment peaks.
+///   4. Apply filterStatsTable: keep peaks where
+///        dur_min < Duration < dur_max,
+///        bw_min  < Bandwidth < bw_max,
+///        freq_min < PeakFrequency < freq_max,
+///        pow2db(Height) > ht_db_min.
+///
+/// Parameter defaults when 0.0 is passed:
+///   * `seg_time` → 30.0
+///   * `downsample_f` / `downsample_t` → 1
+///   * `max_merges` → +∞ if 0
+///   * `freq_max` → +∞ if 0
+///   * `dur_max`, `bw_max`, `ht_db_min` → no-op if you want everything
+///     through, pass +∞ / +∞ / -∞ respectively.
 #[repr(C)]
 pub struct ExtractTfpeaksIn {
     pub spect_ptr: *const f64,
@@ -77,19 +98,32 @@ pub struct ExtractTfpeaksIn {
     pub stimes_ptr: *const f64,
     pub sfreqs_ptr: *const f64,
     pub baseline_ptr: *const f64, // may be null
+    pub seg_time: f64,
+    pub downsample_f: u32,
+    pub downsample_t: u32,
     pub merge_thresh: f64,
     pub max_merges: f64,
     pub trim_vol_thresh: f64,
-    pub trim_shift_val: f64,     // NaN → use min(spect)
-    pub segment_num: f64,        // tagged onto every peak
+    pub trim_shift_val: f64, // NaN → use min(spect) per segment
+    pub dur_min: f64,
+    pub dur_max: f64,
+    pub bw_min: f64,
+    pub bw_max: f64,
+    pub freq_min: f64,
+    pub freq_max: f64,
+    pub ht_db_min: f64,
 }
 
 /// Output descriptor for [`dynamo_extract_tfpeaks`].
 ///
 /// All `*mut` pointers are callee-allocated; caller must free each with the
 /// matching `dynamo_free_buffer_*` call. `bounding_box` is `n_peaks × 4`
-/// row-major ([f_lo, f_hi, t_lo, t_hi] per peak). `labels` is `F × T`
-/// row-major (same layout as `spect_ptr`).
+/// row-major `[t_tl, f_tl, width_s, height_Hz]` per peak (pydynamo format).
+///
+/// `labels` is always null / `n_label_elems == 0` in this segmented API —
+/// we produce one label image per segment internally and discard them
+/// after properties are computed. Kept in the struct for backward
+/// compatibility with the old single-segment API layout.
 #[repr(C)]
 pub struct ExtractTfpeaksOut {
     pub n_peaks: usize,
@@ -101,8 +135,8 @@ pub struct ExtractTfpeaksOut {
     pub volume: *mut f64,
     pub segment_num: *mut f64,
     pub bounding_box: *mut f64, // n_peaks * 4
-    pub labels: *mut i64,       // n_freqs * n_times
-    pub n_label_elems: usize,
+    pub labels: *mut i64,       // always null in segmented mode
+    pub n_label_elems: usize,   // always 0 in segmented mode
 }
 
 // -------------------------------------------------------------------------
@@ -119,6 +153,7 @@ fn leak_vec_f64(v: Vec<f64>) -> *mut f64 {
 }
 
 #[inline]
+#[allow(dead_code)] // kept for symmetry with dynamo_free_buffer_i64; used by tests
 fn leak_vec_i64(v: Vec<i64>) -> *mut i64 {
     let boxed: Box<[i64]> = v.into_boxed_slice();
     Box::into_raw(boxed) as *mut i64
@@ -215,94 +250,63 @@ pub unsafe extern "C" fn dynamo_extract_tfpeaks(
             Some(b.to_vec())
         };
 
-        // Build ndarray view (F, T) row-major.
+        // Build ndarray views.
         let spect_view = match ArrayView2::from_shape((f, t), spect_slice) {
             Ok(v) => v,
             Err(_) => return ErrorCode::ShapeMismatch.code(),
         };
+        let stimes_view = ArrayView1::from(stimes_slice);
+        let sfreqs_view = ArrayView1::from(sfreqs_slice);
+        let baseline_view = baseline_vec
+            .as_ref()
+            .map(|v| ArrayView1::from(v.as_slice()));
 
-        // Optionally divide by baseline (broadcast along columns).
-        let spect_owned: Array2<f64> = if let Some(bl) = baseline_vec.as_ref() {
-            let mut m = spect_view.to_owned();
-            for row in 0..f {
-                let denom = bl[row];
-                if denom == 0.0 || !denom.is_finite() {
-                    continue;
-                }
-                for col in 0..t {
-                    m[[row, col]] /= denom;
-                }
-            }
-            m
-        } else {
-            spect_view.to_owned()
+        // Normalize parameter defaults for values sentinel'd as 0 / inf.
+        let seg_time = if input.seg_time > 0.0 { input.seg_time } else { 30.0 };
+        let df = if input.downsample_f == 0 { 1 } else { input.downsample_f as usize };
+        let dt_ds = if input.downsample_t == 0 { 1 } else { input.downsample_t as usize };
+        let max_merges = if input.max_merges == 0.0 { f64::INFINITY } else { input.max_merges };
+        let freq_max = if input.freq_max == 0.0 { f64::INFINITY } else { input.freq_max };
+
+        let params = crate::extract_pipeline::ExtractParams {
+            seg_time,
+            downsample_f: df,
+            downsample_t: dt_ds,
+            merge_thresh: input.merge_thresh,
+            max_merges,
+            trim_vol_thresh: input.trim_vol_thresh,
+            trim_shift_val: input.trim_shift_val,
+            dur_min: input.dur_min,
+            dur_max: input.dur_max,
+            bw_min: input.bw_min,
+            bw_max: input.bw_max,
+            freq_min: input.freq_min,
+            freq_max,
+            ht_db_min: input.ht_db_min,
         };
 
-        // Step 1: watershed on (negated) spectrogram — same as MATLAB which
-        // calls watershed() on -spect to get basins-at-peaks behaviour.
-        let neg: Array2<f64> = spect_owned.mapv(|v| -v);
-        let ws_u16 = crate::matlab_watershed::matlab_watershed_2d(neg.view());
-        let ws_i64: Array2<i64> = ws_u16.mapv(|v| v as i64);
-
-        // Step 2: merge (with borders) on positive spectrogram.
-        let (interior_labels, with_borders) = match crate::merge::run_with_borders(
-            ws_i64.view(),
-            spect_owned.view(),
-            input.merge_thresh,
-            input.max_merges,
+        let peaks = match crate::extract_pipeline::extract_tfpeaks(
+            spect_view, stimes_view, sfreqs_view, baseline_view, &params,
         ) {
-            Ok(r) => r,
+            Ok(p) => p,
             Err(_) => return ErrorCode::KernelError.code(),
         };
-
-        // Step 3: trim.
-        let shift_val = if input.trim_shift_val.is_nan() {
-            spect_owned
-                .iter()
-                .cloned()
-                .fold(f64::INFINITY, f64::min)
-        } else {
-            input.trim_shift_val
-        };
-        let trimmed = match crate::trim::trim_all_regions(
-            interior_labels.view(),
-            spect_owned.view(),
-            input.trim_vol_thresh,
-            shift_val,
-        ) {
-            Ok(r) => r,
-            Err(_) => return ErrorCode::KernelError.code(),
-        };
-
-        // Step 4: compute peak properties. Enumerate labels present in
-        // `trimmed`, group pixels by label, compute centroid + bbox over
-        // the trimmed interior; compute bbox using with_borders if present
-        // (MATLAB uses interior+border for bbox), fall back to interior.
-        let props = compute_peak_properties(
-            trimmed.view(),
-            with_borders.view(),
-            spect_owned.view(),
-            stimes_slice,
-            sfreqs_slice,
-            input.segment_num,
-        );
 
         // Fill out struct.
-        let np = props.n_peaks;
+        let np = peaks.len();
         output.n_peaks = np;
-        output.peak_time = leak_vec_f64(props.peak_time);
-        output.peak_freq = leak_vec_f64(props.peak_freq);
-        output.duration = leak_vec_f64(props.duration);
-        output.bandwidth = leak_vec_f64(props.bandwidth);
-        output.height = leak_vec_f64(props.height);
-        output.volume = leak_vec_f64(props.volume);
-        output.segment_num = leak_vec_f64(props.segment_num);
-        output.bounding_box = leak_vec_f64(props.bounding_box);
+        output.peak_time = leak_vec_f64(peaks.peak_time);
+        output.peak_freq = leak_vec_f64(peaks.peak_freq);
+        output.duration = leak_vec_f64(peaks.duration);
+        output.bandwidth = leak_vec_f64(peaks.bandwidth);
+        output.height = leak_vec_f64(peaks.height);
+        output.volume = leak_vec_f64(peaks.volume);
+        output.segment_num = leak_vec_f64(peaks.segment_num);
+        output.bounding_box = leak_vec_f64(peaks.bbox);
 
-        // Labels: always the trimmed F×T image as i64.
-        let labels_i64: Vec<i64> = trimmed.iter().map(|&v| v as i64).collect();
-        output.n_label_elems = labels_i64.len();
-        output.labels = leak_vec_i64(labels_i64);
+        // Labels not returned in segmented mode.
+        output.n_label_elems = 0;
+        output.labels = std::ptr::null_mut();
 
         ErrorCode::Ok.code()
     }));
@@ -326,153 +330,6 @@ fn empty_extract_out() -> ExtractTfpeaksOut {
         bounding_box: std::ptr::null_mut(),
         labels: std::ptr::null_mut(),
         n_label_elems: 0,
-    }
-}
-
-struct PeakProps {
-    n_peaks: usize,
-    peak_time: Vec<f64>,
-    peak_freq: Vec<f64>,
-    duration: Vec<f64>,
-    bandwidth: Vec<f64>,
-    height: Vec<f64>,
-    volume: Vec<f64>,
-    segment_num: Vec<f64>,
-    bounding_box: Vec<f64>,
-}
-
-/// For each label present in `trimmed_interior`, compute:
-///   * peak_time, peak_freq: intensity-weighted centroid over interior.
-///   * height: max spect value at interior pixels.
-///   * volume: sum of spect values at interior pixels.
-///   * bbox: [f_lo, f_hi, t_lo, t_hi] using interior+border pixels.
-///   * duration = t_hi - t_lo, bandwidth = f_hi - f_lo.
-///
-/// MATLAB's extractTFPeaks uses `Ldata` (interior+border) for the bbox;
-/// `with_borders` matches that. Height/volume/centroid use interior only
-/// (same as MATLAB's peak-pixel set `rgn{ii}`-interior filter).
-fn compute_peak_properties(
-    trimmed_interior: ArrayView2<i32>,
-    with_borders: ArrayView2<i32>,
-    spect: ArrayView2<f64>,
-    stimes: &[f64],
-    sfreqs: &[f64],
-    segment_num_val: f64,
-) -> PeakProps {
-    use std::collections::HashMap;
-
-    let (f, t) = trimmed_interior.dim();
-    debug_assert_eq!(with_borders.dim(), (f, t));
-    debug_assert_eq!(spect.dim(), (f, t));
-    debug_assert_eq!(sfreqs.len(), f);
-    debug_assert_eq!(stimes.len(), t);
-
-    struct Accum {
-        sum_v: f64,
-        sum_v_f: f64,
-        sum_v_t: f64,
-        max_v: f64,
-        f_min: usize,
-        f_max: usize,
-        t_min: usize,
-        t_max: usize,
-    }
-    let mut interior_map: HashMap<i32, Accum> = HashMap::new();
-
-    // First pass: interior pixels — height, volume, centroid.
-    for row in 0..f {
-        for col in 0..t {
-            let lbl = trimmed_interior[[row, col]];
-            if lbl <= 0 {
-                continue;
-            }
-            let v = spect[[row, col]];
-            let sf = sfreqs[row];
-            let st = stimes[col];
-            let entry = interior_map.entry(lbl).or_insert(Accum {
-                sum_v: 0.0,
-                sum_v_f: 0.0,
-                sum_v_t: 0.0,
-                max_v: f64::NEG_INFINITY,
-                f_min: row,
-                f_max: row,
-                t_min: col,
-                t_max: col,
-            });
-            entry.sum_v += v;
-            entry.sum_v_f += v * sf;
-            entry.sum_v_t += v * st;
-            if v > entry.max_v {
-                entry.max_v = v;
-            }
-            if row < entry.f_min { entry.f_min = row; }
-            if row > entry.f_max { entry.f_max = row; }
-            if col < entry.t_min { entry.t_min = col; }
-            if col > entry.t_max { entry.t_max = col; }
-        }
-    }
-
-    // Second pass: expand bbox to include border-painted pixels.
-    for row in 0..f {
-        for col in 0..t {
-            let lbl = with_borders[[row, col]];
-            if lbl <= 0 {
-                continue;
-            }
-            if let Some(entry) = interior_map.get_mut(&lbl) {
-                if row < entry.f_min { entry.f_min = row; }
-                if row > entry.f_max { entry.f_max = row; }
-                if col < entry.t_min { entry.t_min = col; }
-                if col > entry.t_max { entry.t_max = col; }
-            }
-        }
-    }
-
-    // Sort labels ascending for deterministic output order.
-    let mut keys: Vec<i32> = interior_map.keys().copied().collect();
-    keys.sort();
-
-    let np = keys.len();
-    let mut peak_time = Vec::with_capacity(np);
-    let mut peak_freq = Vec::with_capacity(np);
-    let mut duration = Vec::with_capacity(np);
-    let mut bandwidth = Vec::with_capacity(np);
-    let mut height = Vec::with_capacity(np);
-    let mut volume = Vec::with_capacity(np);
-    let mut segment_out = Vec::with_capacity(np);
-    let mut bbox = Vec::with_capacity(np * 4);
-
-    for k in &keys {
-        let a = &interior_map[k];
-        let cf = if a.sum_v > 0.0 { a.sum_v_f / a.sum_v } else { sfreqs[a.f_min] };
-        let ct = if a.sum_v > 0.0 { a.sum_v_t / a.sum_v } else { stimes[a.t_min] };
-        let f_lo = sfreqs[a.f_min];
-        let f_hi = sfreqs[a.f_max];
-        let t_lo = stimes[a.t_min];
-        let t_hi = stimes[a.t_max];
-        peak_time.push(ct);
-        peak_freq.push(cf);
-        duration.push(t_hi - t_lo);
-        bandwidth.push(f_hi - f_lo);
-        height.push(a.max_v);
-        volume.push(a.sum_v);
-        segment_out.push(segment_num_val);
-        bbox.push(f_lo);
-        bbox.push(f_hi);
-        bbox.push(t_lo);
-        bbox.push(t_hi);
-    }
-
-    PeakProps {
-        n_peaks: np,
-        peak_time,
-        peak_freq,
-        duration,
-        bandwidth,
-        height,
-        volume,
-        segment_num: segment_out,
-        bounding_box: bbox,
     }
 }
 
@@ -797,11 +654,16 @@ pub unsafe extern "C" fn dynamo_free_buffer_u8(ptr: *mut u8, len: usize) {
 //     stimes_ptr: stimes.as_ptr(),
 //     sfreqs_ptr: sfreqs.as_ptr(),
 //     baseline_ptr: std::ptr::null(),
+//     seg_time: 30.0,
+//     downsample_f: 2, downsample_t: 2,
 //     merge_thresh: 8.0,
 //     max_merges: f64::INFINITY,
 //     trim_vol_thresh: 0.8,
 //     trim_shift_val: f64::NAN,
-//     segment_num: 1.0,
+//     dur_min: 0.5, dur_max: 5.0,
+//     bw_min: 2.0, bw_max: 15.0,
+//     freq_min: 0.0, freq_max: 40.0,
+//     ht_db_min: 7.63,
 // };
 // let mut out = ExtractTfpeaksOut {
 //     n_peaks: 0,
@@ -891,11 +753,20 @@ mod tests {
             stimes_ptr: stimes.as_ptr(),
             sfreqs_ptr: sfreqs.as_ptr(),
             baseline_ptr: std::ptr::null(),
+            seg_time: 30.0,
+            downsample_f: 1,
+            downsample_t: 1,
             merge_thresh: 8.0,
             max_merges: f64::INFINITY,
             trim_vol_thresh: 0.8,
             trim_shift_val: f64::NAN,
-            segment_num: 1.0,
+            dur_min: 0.5,
+            dur_max: 5.0,
+            bw_min: 2.0,
+            bw_max: 15.0,
+            freq_min: 0.0,
+            freq_max: 40.0,
+            ht_db_min: 7.63,
         };
         let mut out = empty_extract_out();
         unsafe {
