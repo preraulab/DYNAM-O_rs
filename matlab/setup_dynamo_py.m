@@ -19,7 +19,12 @@ function setup_dynamo_py(python_exe)
         this_file = mfilename('fullpath');
         this_dir  = fileparts(this_file);        % .../DYNAM-O_rs/matlab
         repo_dir  = fileparts(this_dir);         % .../DYNAM-O_rs
+        % Prefer .venv-matlab (built from system Python which has
+        % libpython.dylib, required for MATLAB's pyenv) over a generic
+        % .venv that may have been built from miniconda's static-only
+        % libpython.
         candidates = { ...
+            fullfile(repo_dir, '.venv-matlab', 'bin', 'python'); ...
             fullfile(repo_dir, '.venv', 'bin', 'python'); ...
         };
         python_exe = '';
