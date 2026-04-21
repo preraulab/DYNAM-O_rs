@@ -69,10 +69,13 @@ typedef struct ExtractTfpeaksIn {
  * matching `dynamo_free_buffer_*` call. `bounding_box` is `n_peaks × 4`
  * row-major `[t_tl, f_tl, width_s, height_Hz]` per peak (pydynamo format).
  *
- * `labels` is always null / `n_label_elems == 0` in this segmented API —
- * we produce one label image per segment internally and discard them
- * after properties are computed. Kept in the struct for backward
- * compatibility with the old single-segment API layout.
+ * `labels` is a row-major `(n_freqs, n_times)` i64 buffer of length
+ * `n_label_elems = n_freqs * n_times`. Non-zero pixels carry a 1-based
+ * peak index: a pixel with value `k` belongs to the k-th peak in the
+ * returned arrays (so label `k` maps to row `k - 1` in `peak_time` etc).
+ * Zero = background. Per-segment label images are stitched column-wise
+ * with a running offset and then renumbered after the post-filter so
+ * that surviving labels span `1..=n_peaks` densely.
  */
 typedef struct ExtractTfpeaksOut {
   uintptr_t n_peaks;

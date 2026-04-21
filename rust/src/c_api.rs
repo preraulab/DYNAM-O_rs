@@ -120,10 +120,13 @@ pub struct ExtractTfpeaksIn {
 /// matching `dynamo_free_buffer_*` call. `bounding_box` is `n_peaks × 4`
 /// row-major `[t_tl, f_tl, width_s, height_Hz]` per peak (pydynamo format).
 ///
-/// `labels` is always null / `n_label_elems == 0` in this segmented API —
-/// we produce one label image per segment internally and discard them
-/// after properties are computed. Kept in the struct for backward
-/// compatibility with the old single-segment API layout.
+/// `labels` is a row-major `(n_freqs, n_times)` i64 buffer of length
+/// `n_label_elems = n_freqs * n_times`. Non-zero pixels carry a 1-based
+/// peak index: a pixel with value `k` belongs to the k-th peak in the
+/// returned arrays (so label `k` maps to row `k - 1` in `peak_time` etc).
+/// Zero = background. Per-segment label images are stitched column-wise
+/// with a running offset and then renumbered after the post-filter so
+/// that surviving labels span `1..=n_peaks` densely.
 #[repr(C)]
 pub struct ExtractTfpeaksOut {
     pub n_peaks: usize,
@@ -135,8 +138,8 @@ pub struct ExtractTfpeaksOut {
     pub volume: *mut f64,
     pub segment_num: *mut f64,
     pub bounding_box: *mut f64, // n_peaks * 4
-    pub labels: *mut i64,       // always null in segmented mode
-    pub n_label_elems: usize,   // always 0 in segmented mode
+    pub labels: *mut i64,       // (n_freqs, n_times) row-major; 1-based peak indices
+    pub n_label_elems: usize,   // = n_freqs * n_times (0 if spect was empty)
 }
 
 // -------------------------------------------------------------------------
@@ -153,7 +156,6 @@ fn leak_vec_f64(v: Vec<f64>) -> *mut f64 {
 }
 
 #[inline]
-#[allow(dead_code)] // kept for symmetry with dynamo_free_buffer_i64; used by tests
 fn leak_vec_i64(v: Vec<i64>) -> *mut i64 {
     let boxed: Box<[i64]> = v.into_boxed_slice();
     Box::into_raw(boxed) as *mut i64
@@ -285,7 +287,7 @@ pub unsafe extern "C" fn dynamo_extract_tfpeaks(
             ht_db_min: input.ht_db_min,
         };
 
-        let peaks = match crate::extract_pipeline::extract_tfpeaks(
+        let (peaks, labels) = match crate::extract_pipeline::extract_tfpeaks(
             spect_view, stimes_view, sfreqs_view, baseline_view, &params,
         ) {
             Ok(p) => p,
@@ -304,9 +306,11 @@ pub unsafe extern "C" fn dynamo_extract_tfpeaks(
         output.segment_num = leak_vec_f64(peaks.segment_num);
         output.bounding_box = leak_vec_f64(peaks.bbox);
 
-        // Labels not returned in segmented mode.
-        output.n_label_elems = 0;
-        output.labels = std::ptr::null_mut();
+        // Concatenated (F, T) row-major label image, 1-based peak indices.
+        let labels_vec: Vec<i64> = labels.into_raw_vec();
+        let n_label = labels_vec.len();
+        output.labels = leak_vec_i64(labels_vec);
+        output.n_label_elems = n_label;
 
         ErrorCode::Ok.code()
     }));
