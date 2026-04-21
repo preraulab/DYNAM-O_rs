@@ -81,6 +81,7 @@ function export_validation_segment(out_dir)
     fprintf('Computing pass-1 spectrogram + regions for masking ...\n');
     d = detection_opts();
     b = baseline_opts();
+    t_data  = (0:length(data)-1) / Fs;
     data_tr = data(t_data >= time_range(1) & t_data <= time_range(2));
     t_tr    = t_time_range;
     % Pass-1 multitaper spectrogram (1-s window)
