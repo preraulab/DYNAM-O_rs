@@ -34,6 +34,12 @@ function export_validation_segment(out_dir)
     % different variable names (EEG/stages vs data/stage_vals).
     here = fileparts(which('runDYNAMO'));
     assert(~isempty(here), 'runDYNAMO not on MATLAB path');
+    % Ensure the full toolbox/ tree is on the path (hann_event_spectra
+    % lives in toolbox/helper_functions/dynamo_helpers/; MATLAB's stale
+    % `which` cache may miss it when runDYNAMO's own auto-addpath is
+    % skipped because computeTFPeaks is already on path).
+    addpath(genpath(fullfile(here, 'toolbox')));
+    addpath(fullfile(here, 'example_data'));
     ed_path = fullfile(here, 'example_data', 'example_data.mat');
     assert(exist(ed_path, 'file') == 2, ...
         'example_data.mat not found at %s', ed_path);
