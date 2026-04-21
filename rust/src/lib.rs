@@ -17,6 +17,8 @@
 
 pub mod adjacency;
 pub mod baseline;
+pub mod c_api;
+pub mod filter_cache;
 pub mod histogram;
 pub mod io;
 pub mod mask;
