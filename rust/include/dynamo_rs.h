@@ -10,13 +10,34 @@
 /**
  * Input descriptor for [`dynamo_extract_tfpeaks`].
  *
- * All array pointers point to column-major-equivalent data: the spectrogram
- * is (F, T) with F varying fastest in memory (row-major C layout matching
- * `ndarray::Array2::from_shape_vec((F, T), vec)` where vec was built
- * row-by-row). `stimes.len() == T`, `sfreqs.len() == F`.
+ * All array pointers point to row-major C layout: the spectrogram is
+ * (F, T) stored as `spect[row * T + col]`. `stimes.len() == T`,
+ * `sfreqs.len() == F`.
  *
  * If `baseline_ptr` is null the spectrogram is used as-is. Otherwise the
- * spectrogram is divided column-wise by `baseline` (length F).
+ * spectrogram is divided row-wise by `baseline` (length F) before
+ * segmentation.
+ *
+ * The pipeline mirrors pydynamo's `extract_tfpeaks` end-to-end:
+ *   1. Split the full (F, T) spect into `seg_time`-second segments
+ *      (MATLAB `segmentData.m` semantics: floor + ceil).
+ *   2. For each segment in parallel: stride-downsample by
+ *      (`downsample_f`, `downsample_t`), watershed(-spect), merge,
+ *      expand_labels(distance=5), resize labels up, trim, regionprops.
+ *   3. Concatenate per-segment peaks.
+ *   4. Apply filterStatsTable: keep peaks where
+ *        dur_min < Duration < dur_max,
+ *        bw_min  < Bandwidth < bw_max,
+ *        freq_min < PeakFrequency < freq_max,
+ *        pow2db(Height) > ht_db_min.
+ *
+ * Parameter defaults when 0.0 is passed:
+ *   * `seg_time` → 30.0
+ *   * `downsample_f` / `downsample_t` → 1
+ *   * `max_merges` → +∞ if 0
+ *   * `freq_max` → +∞ if 0
+ *   * `dur_max`, `bw_max`, `ht_db_min` → no-op if you want everything
+ *     through, pass +∞ / +∞ / -∞ respectively.
  */
 typedef struct ExtractTfpeaksIn {
   const double *spect_ptr;
@@ -25,11 +46,20 @@ typedef struct ExtractTfpeaksIn {
   const double *stimes_ptr;
   const double *sfreqs_ptr;
   const double *baseline_ptr;
+  double seg_time;
+  uint32_t downsample_f;
+  uint32_t downsample_t;
   double merge_thresh;
   double max_merges;
   double trim_vol_thresh;
   double trim_shift_val;
-  double segment_num;
+  double dur_min;
+  double dur_max;
+  double bw_min;
+  double bw_max;
+  double freq_min;
+  double freq_max;
+  double ht_db_min;
 } ExtractTfpeaksIn;
 
 /**
@@ -37,8 +67,12 @@ typedef struct ExtractTfpeaksIn {
  *
  * All `*mut` pointers are callee-allocated; caller must free each with the
  * matching `dynamo_free_buffer_*` call. `bounding_box` is `n_peaks × 4`
- * row-major ([f_lo, f_hi, t_lo, t_hi] per peak). `labels` is `F × T`
- * row-major (same layout as `spect_ptr`).
+ * row-major `[t_tl, f_tl, width_s, height_Hz]` per peak (pydynamo format).
+ *
+ * `labels` is always null / `n_label_elems == 0` in this segmented API —
+ * we produce one label image per segment internally and discard them
+ * after properties are computed. Kept in the struct for backward
+ * compatibility with the old single-segment API layout.
  */
 typedef struct ExtractTfpeaksOut {
   uintptr_t n_peaks;

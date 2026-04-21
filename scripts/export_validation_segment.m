@@ -104,12 +104,19 @@ function export_validation_segment(out_dir)
     dur_min = mtm_window_length_2 / 2;         %#ok<NASGU>
     bw_min = df / 2;                           %#ok<NASGU>
 
+    % ht_db_min matches computeTFPeaks.m:395-397:
+    %   chi2_df = 2 * taper_params(2), alpha = 0.95
+    %   ht_db_min = -pow2db(chi2_df / chi2inv(alpha/2 + 0.5, chi2_df)) * 2
+    chi2_df = 2 * d.mtm_taper_params(2);
+    alpha = 0.95;
+    ht_db_min = -pow2db(chi2_df / chi2inv(alpha/2 + 0.5, chi2_df)) * 2; %#ok<NASGU>
+
     % --- Save spectrogram + params. ---
     spect_path = fullfile(out_dir, 'segment_spect.mat');
     fprintf('Writing %s ... ', spect_path);
     save(spect_path, 'spect', 'stimes', 'sfreqs', 'baseline', ...
         'seg_time', 'merge_thresh', 'trim_vol', 'downsample_spect', ...
-        'dur_min', 'dur_max', 'bw_min', 'bw_max', '-v7');
+        'dur_min', 'dur_max', 'bw_min', 'bw_max', 'ht_db_min', '-v7');
     d_info = dir(spect_path);
     fprintf('%.1f MB\n', d_info.bytes / 1e6);
 
