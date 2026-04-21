@@ -189,23 +189,22 @@ def _render_backend(tag, dataset, time_range, out, stats, sophs, hist_mask,
     fig.savefig(png_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
 
-    # Add banner title: "TAG — {dt}s"
+    # Add a minimal banner: "<TAG> <time>s"
     img = Image.open(png_path)
-    banner_h = 80
+    banner_h = 36
     banner = Image.new("RGB", (img.width, img.height + banner_h), "white")
     banner.paste(img, (0, banner_h))
     draw = ImageDraw.Draw(banner)
-    label = f"{tag.upper()}  —  {dt_sec:.1f} s"
-    if cos_vs_mat is not None:
-        sp, ph = cos_vs_mat
-        label += f"   [vs MATLAB: SOpower cos {sp:.4f}, SOphase cos {ph:.4f}]"
+    # tag formatting: capitalize first word; drop " (baseline)" annotation if any
+    display_tag = tag.split(" ")[0].capitalize() if " " in tag else tag.capitalize()
+    label = f"{display_tag} {dt_sec:.1f}s"
     try:
-        font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 40)
+        font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 20)
     except OSError:
         font = ImageFont.load_default()
     bbox = draw.textbbox((0, 0), label, font=font)
     tw = bbox[2] - bbox[0]
-    draw.text(((img.width - tw) // 2, 20), label, fill="black", font=font)
+    draw.text(((img.width - tw) // 2, 6), label, fill="black", font=font)
     banner.save(png_path, dpi=(120, 120))
     return png_path
 
