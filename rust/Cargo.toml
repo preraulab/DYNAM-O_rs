@@ -6,11 +6,10 @@ description = "Rust kernel + pure-Rust pipeline for DYNAM-O"
 
 [lib]
 name = "dynamo_rs"
-crate-type = ["cdylib", "rlib"]
-
-[[bin]]
-name = "dynamo"
-path = "src/bin/dynamo.rs"
+# staticlib: for MEX wrappers to statically link the Rust ABI.
+# cdylib:    for Python (maturin) and MATLAB loadlibrary.
+# rlib:      for downstream Rust consumers.
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
 default = []
@@ -33,8 +32,10 @@ multitaper_rs = { path = "/Users/Mike/code/toolboxes/DYNAMO_dev/toolbox/helper_f
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"], optional = true }
 numpy = { version = "0.22", optional = true }
 
-# build.rs is a no-op now; keeping it for future C extension hooks.
+log = "0.4"
+
 [build-dependencies]
+cbindgen = "0.27"
 
 [profile.release]
 opt-level = 3
