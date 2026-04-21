@@ -71,8 +71,19 @@ function setup_dynamo_py(python_exe)
     % Python sees our installed packages (pydynamo, dynamo_rs,
     % multitaper_rs).
     venv_root = fileparts(fileparts(python_exe));   % .venv-matlab
-    site_pkgs = fullfile(venv_root, 'lib', 'python3.9', 'site-packages');
-    if exist(site_pkgs, 'dir') == 7
+    % Detect the venv's python version dir (e.g. lib/python3.11/...).
+    site_pkgs = '';
+    lib_d = dir(fullfile(venv_root, 'lib'));
+    for k = 1:numel(lib_d)
+        if startsWith(lib_d(k).name, 'python') && lib_d(k).isdir
+            cand = fullfile(venv_root, 'lib', lib_d(k).name, 'site-packages');
+            if exist(cand, 'dir') == 7
+                site_pkgs = cand;
+                break;
+            end
+        end
+    end
+    if ~isempty(site_pkgs)
         cur_pp = getenv('PYTHONPATH');
         if isempty(cur_pp)
             setenv('PYTHONPATH', site_pkgs);
