@@ -612,6 +612,76 @@ pub unsafe extern "C" fn dynamo_tfpeak_histogram(
 }
 
 // -------------------------------------------------------------------------
+// 3b. dynamo_mask_spectrogram
+// -------------------------------------------------------------------------
+
+/// Perimeter-aware mask of pass-2 spectrogram using pass-1 labels.
+/// Thin FFI wrapper over [`crate::mask::mask_spectrogram`].
+///
+/// All 2-D arrays are row-major: `spect_2s[f * n_times_2 + t]`, etc.
+/// `labels_1s` is (n_freqs, n_times_1) int64; `spect_2s` and `out_masked`
+/// are both (n_freqs, n_times_2) float64.
+///
+/// Caller allocates `out_masked` of size `n_freqs * n_times_2`.
+///
+/// Returns 0 on success, negative on error.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn dynamo_mask_spectrogram(
+    spect_2s: *const f64,
+    stimes_2s: *const f64,
+    labels_1s: *const i64,
+    stimes_1s: *const f64,
+    n_freqs: usize,
+    n_times_2: usize,
+    n_times_1: usize,
+    out_masked: *mut f64,
+) -> c_int {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let ss = match ptr_as_slice::<f64>(spect_2s, n_freqs * n_times_2) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let st2 = match ptr_as_slice::<f64>(stimes_2s, n_times_2) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let ll = match ptr_as_slice::<i64>(labels_1s, n_freqs * n_times_1) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let st1 = match ptr_as_slice::<f64>(stimes_1s, n_times_1) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let out = match NonNull::new(out_masked) {
+            Some(p) => std::slice::from_raw_parts_mut(p.as_ptr(), n_freqs * n_times_2),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let spect_view = match ArrayView2::from_shape((n_freqs, n_times_2), ss) {
+            Ok(v) => v, Err(_) => return ErrorCode::ShapeMismatch.code(),
+        };
+        let lbl_view = match ArrayView2::from_shape((n_freqs, n_times_1), ll) {
+            Ok(v) => v, Err(_) => return ErrorCode::ShapeMismatch.code(),
+        };
+        let st2_view = ArrayView1::from(st2);
+        let st1_view = ArrayView1::from(st1);
+
+        let masked = match crate::mask::mask_spectrogram(
+            spect_view, st2_view, lbl_view, st1_view,
+        ) {
+            Ok(m) => m,
+            Err(_) => return ErrorCode::KernelError.code(),
+        };
+        // Copy into caller buffer (row-major).
+        for (i, v) in masked.iter().enumerate() {
+            out[i] = *v;
+        }
+        ErrorCode::Ok.code()
+    }));
+    match result {
+        Ok(code) => code,
+        Err(_) => ErrorCode::Panic.code(),
+    }
+}
+
+// -------------------------------------------------------------------------
 // 4. buffer-free helpers
 // -------------------------------------------------------------------------
 
