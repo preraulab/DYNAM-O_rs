@@ -77,7 +77,7 @@ function setup_dynamo_py(python_exe)
 
     % Force a Python op to verify the interpreter actually launches.
     try
-        py.exec('import sys');
+        py.importlib.import_module('sys');
     catch ME
         error('setup_dynamo_py:LaunchFailed', ...
             'Could not start Python: %s', ME.message);
