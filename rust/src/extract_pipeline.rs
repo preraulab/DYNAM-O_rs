@@ -292,7 +292,10 @@ fn compute_peak_props_from_trim(
 }
 
 /// Run the full pipeline on one (F, T) spectrogram segment with its own
-/// stimes. Returns peak stats (no filtering yet).
+/// stimes. Returns peak stats (no filtering yet) AND the trimmed label
+/// image aligned with those peaks (row k in the returned `SegmentPeaks`
+/// corresponds to label `k + 1` in the label image; zero pixels are
+/// background).
 ///
 /// `segment_num` is a 1-based tag assigned per segment (matches MATLAB).
 pub fn extract_tfpeaks_segment(
@@ -301,10 +304,10 @@ pub fn extract_tfpeaks_segment(
     sfreqs: ArrayView1<f64>,
     segment_num: f64,
     params: &ExtractParams,
-) -> Result<SegmentPeaks, String> {
+) -> Result<(SegmentPeaks, Array2<i64>), String> {
     let (f, t) = spect.dim();
     if f < 2 || t < 2 {
-        return Ok(SegmentPeaks::default());
+        return Ok((SegmentPeaks::default(), Array2::<i64>::zeros((f, t))));
     }
     // 1) Downsample.
     let f_s = params.downsample_f.max(1);
@@ -312,7 +315,7 @@ pub fn extract_tfpeaks_segment(
     let seg_lr = stride_downsample(spect, f_s, t_s);
     let (f_lr, t_lr) = seg_lr.dim();
     if f_lr < 2 || t_lr < 2 {
-        return Ok(SegmentPeaks::default());
+        return Ok((SegmentPeaks::default(), Array2::<i64>::zeros((f, t))));
     }
 
     // 2) Watershed on -seg_LR.
@@ -402,7 +405,31 @@ pub fn extract_tfpeaks_segment(
     let peaks = compute_peak_props_from_trim(
         trimmed_i64.view(), spect, stimes, sfreqs, segment_num,
     );
-    Ok(peaks)
+
+    // 8) Build the per-segment label image whose labels align with the
+    //    returned `peaks` rows. `compute_peak_props_from_trim` iterates
+    //    over unique label IDs in sorted order, so the k-th peak in the
+    //    output corresponds to the k-th smallest label in `trimmed_i64`.
+    //    Build a remap old_id -> new_id = rank+1 (1-based), zero stays 0.
+    let mut ids: Vec<i64> = Vec::new();
+    {
+        let mut seen = std::collections::BTreeSet::new();
+        for &v in trimmed_i64.iter() {
+            if v > 0 { seen.insert(v); }
+        }
+        ids.extend(seen);
+    }
+    debug_assert_eq!(ids.len(), peaks.len());
+    // Use a HashMap for the remap; small N.
+    let mut remap: HashMap<i64, i64> = HashMap::with_capacity(ids.len());
+    for (k, old) in ids.iter().enumerate() {
+        remap.insert(*old, (k as i64) + 1);
+    }
+    let labels_out = trimmed_i64.mapv(|v| {
+        if v <= 0 { 0 } else { *remap.get(&v).unwrap_or(&0) }
+    });
+
+    Ok((peaks, labels_out))
 }
 
 /// Full top-level: split spect into seg_time segments, extract peaks from
@@ -414,10 +441,10 @@ pub fn extract_tfpeaks(
     sfreqs: ArrayView1<f64>,
     baseline: Option<ArrayView1<f64>>,
     params: &ExtractParams,
-) -> Result<SegmentPeaks, String> {
+) -> Result<(SegmentPeaks, Array2<i64>), String> {
     let (f, t) = spect.dim();
     if f == 0 || t == 0 || stimes.len() < 2 {
-        return Ok(SegmentPeaks::default());
+        return Ok((SegmentPeaks::default(), Array2::<i64>::zeros((f, t))));
     }
     // Apply baseline once up front (broadcast divide along rows).
     let spect_owned: Array2<f64> = if let Some(bl) = baseline {
@@ -461,7 +488,7 @@ pub fn extract_tfpeaks(
     }
 
     // Parallel extract; collect per-segment results preserving order.
-    let results: Vec<Result<SegmentPeaks, String>> = seg_bounds
+    let results: Vec<Result<(SegmentPeaks, Array2<i64>), String>> = seg_bounds
         .par_iter()
         .map(|&(si, start, end)| {
             // Make the segment spect contiguous — trim / merge require it.
@@ -475,20 +502,60 @@ pub fn extract_tfpeaks(
         })
         .collect();
 
+    // Stitch per-segment labels into a full (F, T) image with running
+    // label offset so that peak row k in the concatenated SegmentPeaks
+    // maps to label k+1 in the global image.
     let mut all = SegmentPeaks::default();
-    for r in results {
+    let mut labels_full = Array2::<i64>::zeros((f, t));
+    let mut offset: i64 = 0;
+    let mut per_seg: Vec<(usize, usize, Array2<i64>)> = Vec::with_capacity(seg_bounds.len());
+    for (r, &(_si, start, end)) in results.into_iter().zip(seg_bounds.iter()) {
         match r {
-            Ok(p) => all.extend(p),
+            Ok((p, lbl)) => {
+                let n_here = p.len() as i64;
+                // Write with offset into the global image.
+                let (fh, tw) = lbl.dim();
+                debug_assert_eq!(fh, f);
+                debug_assert_eq!(tw, end - start);
+                for r in 0..fh {
+                    for c in 0..tw {
+                        let v = lbl[[r, c]];
+                        if v > 0 {
+                            labels_full[[r, start + c]] = v + offset;
+                        }
+                    }
+                }
+                all.extend(p);
+                offset += n_here;
+                per_seg.push((start, end, lbl));
+            }
             Err(e) => return Err(e),
         }
     }
+    // `per_seg` is kept so the debug_assert above can be cheap; drop it.
+    drop(per_seg);
 
     // filterStatsTable: Duration ∈ (dur_min, dur_max), Bandwidth ∈ (bw_min, bw_max),
     // PeakFrequency ∈ (freq_min, freq_max), pow2db(Height) > ht_db_min.
     let d_time = stimes[1] - stimes[0];
     let d_freq = if sfreqs.len() > 1 { sfreqs[1] - sfreqs[0] } else { 0.0 };
     let keep = filter_indices(&all, params, d_time, d_freq);
-    Ok(take_indices(&all, &keep))
+
+    // Build a remap from old global label id -> new label id (1..n_kept).
+    // Peaks not in `keep` -> 0.
+    let mut remap_filter: Vec<i64> = vec![0; all.len() + 1]; // index by old id (1-based)
+    for (new_idx, &old_idx) in keep.iter().enumerate() {
+        // old label id = old_idx + 1 (1-based global id)
+        remap_filter[old_idx + 1] = (new_idx as i64) + 1;
+    }
+    for v in labels_full.iter_mut() {
+        if *v > 0 {
+            let old = *v as usize;
+            *v = if old < remap_filter.len() { remap_filter[old] } else { 0 };
+        }
+    }
+
+    Ok((take_indices(&all, &keep), labels_full))
 }
 
 fn filter_indices(
@@ -619,4 +686,114 @@ mod tests {
     }
 
     fn _unused(_a: Array1<f64>) {}
+
+    /// Synthetic 2-segment extract: verify labels shape matches spect,
+    /// that non-zero labels are 1..n_peaks contiguously, that each non-zero
+    /// pixel points at a valid peak row, and that post-filter surviving
+    /// labels remain contiguous 1..n_kept.
+    #[test]
+    fn extract_tfpeaks_labels_shape_and_stitching() {
+        // Construct a 2-segment spect: 32 freq bins, 600 time bins at
+        // dt=0.1 s → T*dt = 60 s; with seg_time = 30 s the pipeline
+        // produces two segments.
+        let n_f = 32usize;
+        let n_t = 600usize;
+        let dt = 0.1_f64;
+        let df = 0.5_f64;
+        let mut spect = Array2::<f64>::zeros((n_f, n_t));
+        // Two Gaussian blobs: one in segment 1 (t around col 100), one in
+        // segment 2 (t around col 450). Both high enough in freq and wide
+        // enough to survive duration / bandwidth cuts.
+        let blobs = [(16usize, 100usize), (16usize, 450usize)];
+        for (fc, tc) in &blobs {
+            for r in 0..n_f {
+                for c in 0..n_t {
+                    let dr = r as f64 - *fc as f64;
+                    let dc = c as f64 - *tc as f64;
+                    let g = (-(dr * dr) / (2.0 * 3.0 * 3.0)
+                        - (dc * dc) / (2.0 * 8.0 * 8.0))
+                        .exp();
+                    spect[[r, c]] += 100.0 * g;
+                }
+            }
+        }
+        // Small positive floor so pow2db is finite everywhere.
+        for v in spect.iter_mut() { *v += 0.1; }
+
+        let stimes: Array1<f64> = Array1::from_iter((0..n_t).map(|i| i as f64 * dt));
+        let sfreqs: Array1<f64> = Array1::from_iter((0..n_f).map(|i| i as f64 * df));
+
+        let params = ExtractParams {
+            seg_time: 30.0,
+            downsample_f: 1, downsample_t: 1,
+            merge_thresh: 8.0, max_merges: f64::INFINITY,
+            trim_vol_thresh: 0.8, trim_shift_val: f64::NAN,
+            dur_min: 0.0, dur_max: f64::INFINITY,
+            bw_min: 0.0, bw_max: f64::INFINITY,
+            freq_min: 0.0, freq_max: f64::INFINITY,
+            ht_db_min: f64::NEG_INFINITY,
+        };
+
+        let (peaks, labels) = extract_tfpeaks(
+            spect.view(), stimes.view(), sfreqs.view(), None, &params,
+        ).expect("extract_tfpeaks failed");
+
+        // Shape matches the input spect.
+        assert_eq!(labels.dim(), (n_f, n_t));
+        // At least the two planted peaks should survive.
+        assert!(peaks.len() >= 2,
+            "expected >= 2 peaks, got {}", peaks.len());
+
+        // Non-zero labels form a 1..n_peaks contiguous set.
+        let mut seen: std::collections::BTreeSet<i64> =
+            std::collections::BTreeSet::new();
+        for &v in labels.iter() {
+            if v > 0 {
+                assert!(v as usize <= peaks.len(),
+                    "label {} out of range (n_peaks = {})", v, peaks.len());
+                seen.insert(v);
+            }
+        }
+        // After filtering, surviving labels are dense 1..=n_peaks.
+        let expected: std::collections::BTreeSet<i64> =
+            (1..=peaks.len() as i64).collect();
+        assert_eq!(seen, expected,
+            "label set {:?} != expected {:?}", seen, expected);
+
+        // Each planted blob should be associated with some non-zero label
+        // at its centre, with the peak time near the planted column.
+        for (fc, tc) in &blobs {
+            let lbl = labels[[*fc, *tc]];
+            assert!(lbl > 0, "blob at ({},{}) lost its label", fc, tc);
+            let pt = peaks.peak_time[(lbl - 1) as usize];
+            let expected_t = (*tc as f64) * dt;
+            assert!((pt - expected_t).abs() < 2.0,
+                "peak_time {} far from planted {}", pt, expected_t);
+        }
+
+        // Stitching sanity: pixels in columns [0..n_t/2) with a label
+        // should point at peaks whose segment_num == 1.0, and the mirrored
+        // half at segment_num == 2.0. This also verifies the running
+        // label-id offset across segments.
+        for r in 0..n_f {
+            for c in 0..n_t {
+                let v = labels[[r, c]];
+                if v <= 0 { continue; }
+                let idx = (v - 1) as usize;
+                let seg = peaks.segment_num[idx];
+                let boundary = n_t / 2;
+                if c < boundary - 1 {
+                    assert_eq!(seg, 1.0,
+                        "label {} in seg-1 col {} has segment_num {}",
+                        v, c, seg);
+                } else if c > boundary {
+                    assert_eq!(seg, 2.0,
+                        "label {} in seg-2 col {} has segment_num {}",
+                        v, c, seg);
+                }
+                // Near the exact boundary, either segment is acceptable
+                // (resize-nearest may straddle the cut).
+            }
+        }
+    }
 }
