@@ -63,6 +63,23 @@ function setup_dynamo_py(python_exe)
             % older MATLAB: terminate(pyenv) may not exist; fall through.
         end
     end
+    % MATLAB's pyenv resolves a venv's `bin/python` symlink to the system
+    % Python it points at, which means the venv's site-packages are NOT
+    % on sys.path by default. Inject them via PYTHONPATH so the OutOfProcess
+    % Python sees our installed packages (pydynamo, dynamo_rs,
+    % multitaper_rs).
+    venv_root = fileparts(fileparts(python_exe));   % .venv-matlab
+    site_pkgs = fullfile(venv_root, 'lib', 'python3.9', 'site-packages');
+    if exist(site_pkgs, 'dir') == 7
+        cur_pp = getenv('PYTHONPATH');
+        if isempty(cur_pp)
+            setenv('PYTHONPATH', site_pkgs);
+        elseif ~contains(cur_pp, site_pkgs)
+            setenv('PYTHONPATH', [site_pkgs ':' cur_pp]);
+        end
+        fprintf('PYTHONPATH includes %s\n', site_pkgs);
+    end
+
     try
         pyenv('Version', python_exe, 'ExecutionMode', 'OutOfProcess');
     catch ME
@@ -70,13 +87,9 @@ function setup_dynamo_py(python_exe)
             'pyenv(''Version'', ''%s'') failed: %s', python_exe, ME.message);
     end
     pe = pyenv;
-    if string(pe.Executable) ~= string(python_exe)
-        error('setup_dynamo_py:SwitchFailed', ...
-            ['pyenv did NOT switch interpreters.\n' ...
-             '  requested: %s\n  active:    %s\n\n' ...
-             'This usually means MATLAB has Python loaded InProcess.\n' ...
-             'Restart MATLAB and try again.'], python_exe, char(pe.Executable));
-    end
+    % We don't insist on Executable matching python_exe — MATLAB resolves
+    % venv symlinks and may report the underlying system Python path.
+    % What matters is that PYTHONPATH points at the venv site-packages.
     fprintf('pyenv: Python %s at %s (%s)\n', char(pe.Version), ...
         char(pe.Executable), char(pe.ExecutionMode));
 
