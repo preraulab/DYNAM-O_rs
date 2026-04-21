@@ -34,15 +34,26 @@ from scipy.signal import cheby1, sosfiltfilt as _sp_sosfiltfilt, hilbert as _sp_
 from scipy.ndimage import median_filter
 
 # scipy's sosfiltfilt + hilbert are faster than our Rust port on single
-# long signals (scipy has SIMD-vectorized C kernels). We retain the Rust
-# path only where we have parallelism across many signals (e.g., refine).
-# Flip this flag to use the Rust primitives here.
-_HAS_RUST_SIGNAL = False
-_dynamo_rs = None
+# long signals (scipy has SIMD-vectorized C kernels -- scipy beats Rust even
+# with rustfft's NEON default on Apple Silicon; see scripts/bench_signal_rust_vs_scipy.py).
+# We retain the Rust path only where we have parallelism across many signals
+# (e.g., refine).  However, Rust wins for movmean (3x vs vectorized numpy cumsum,
+# exact match) so we enable that specifically.
+_HAS_RUST_SIGNAL = False  # legacy; kept for backward-compat
+try:
+    import dynamo_rs as _dynamo_rs  # type: ignore
+    _HAS_RUST_MODULE = True
+except ImportError:
+    _dynamo_rs = None
+    _HAS_RUST_MODULE = False
+
+_USE_RUST_SOSFILTFILT = False   # scipy beats rust 2x
+_USE_RUST_HILBERT = False       # scipy beats rust 2.5x
+_USE_RUST_MOVMEAN = _HAS_RUST_MODULE  # rust 3x faster, bit-exact
 
 
 def _rust_sosfiltfilt(sos, x):
-    if _HAS_RUST_SIGNAL:
+    if _USE_RUST_SOSFILTFILT and _HAS_RUST_MODULE:
         return _dynamo_rs.sosfiltfilt(
             np.ascontiguousarray(sos, np.float64),
             np.ascontiguousarray(x, np.float64).ravel(),
@@ -53,14 +64,14 @@ def _rust_sosfiltfilt(sos, x):
 def _rust_hilbert_envelope(x):
     """|hilbert(x)| — the envelope. Returns real magnitude."""
     x_arr = np.ascontiguousarray(x, np.float64).ravel()
-    if _HAS_RUST_SIGNAL:
+    if _USE_RUST_HILBERT and _HAS_RUST_MODULE:
         re, im = _dynamo_rs.hilbert(x_arr)
         return np.hypot(re, im)
     return np.abs(_sp_hilbert(x_arr))
 
 
 def _rust_movmean(x, win):
-    if _HAS_RUST_SIGNAL and win > 1:
+    if _USE_RUST_MOVMEAN and win > 1:
         return _dynamo_rs.movmean(np.ascontiguousarray(x, np.float64).ravel(), int(win))
     return None  # caller falls back to Python _movmean
 

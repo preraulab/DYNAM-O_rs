@@ -2,11 +2,15 @@
 name = "dynamo_rs"
 version = "0.1.0"
 edition = "2021"
-description = "Rust kernel for the DYNAM-O region-merging inner loop (mergeWshedSegment)"
+description = "Rust kernel + pure-Rust pipeline for DYNAM-O"
 
 [lib]
 name = "dynamo_rs"
 crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "dynamo"
+path = "src/bin/dynamo.rs"
 
 [features]
 default = []
@@ -15,9 +19,16 @@ python = ["dep:pyo3", "dep:numpy"]
 
 [dependencies]
 ndarray = { version = "0.16", features = ["rayon"] }
+ndarray-npy = "0.9"
 rayon = "1"
 realfft = "3"
 rustfft = "6"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Pure-Rust multitaper spectrogram (path dep; `python` feature not enabled).
+multitaper_rs = { path = "/Users/Mike/code/toolboxes/DYNAMO_dev/toolbox/helper_functions/multitaper_spectrogram/rust", default-features = false }
 
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"], optional = true }
 numpy = { version = "0.22", optional = true }

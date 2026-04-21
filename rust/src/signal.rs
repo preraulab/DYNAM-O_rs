@@ -217,21 +217,27 @@ pub fn hilbert(x: &[f64]) -> (Vec<f64>, Vec<f64>) {
 
 /// numpy.unwrap with default discont = π.
 pub fn unwrap(p: &[f64], discont: f64) -> Vec<f64> {
-    let mut out = p.to_vec();
+    let n = p.len();
+    let mut out = Vec::with_capacity(n);
+    if n == 0 {
+        return out;
+    }
     let period = 2.0 * std::f64::consts::PI;
-    for i in 1..p.len() {
-        let delta = out[i] - out[i - 1];
+    // Running cumulative offset (multiples of period added to subsequent samples).
+    let mut offset = 0.0f64;
+    out.push(p[0]);
+    for i in 1..n {
+        // delta uses ORIGINAL-adjacent samples (p[i] - p[i-1]); the jump
+        // location is determined by raw input, consistent with numpy.unwrap.
+        let delta = p[i] - p[i - 1];
         if delta > discont {
             let cycles = ((delta + std::f64::consts::PI) / period).floor();
-            for v in out.iter_mut().skip(i) {
-                *v -= cycles * period;
-            }
+            offset -= cycles * period;
         } else if delta < -discont {
             let cycles = ((-delta + std::f64::consts::PI) / period).floor();
-            for v in out.iter_mut().skip(i) {
-                *v += cycles * period;
-            }
+            offset += cycles * period;
         }
+        out.push(p[i] + offset);
     }
     out
 }

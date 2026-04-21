@@ -31,13 +31,23 @@ from scipy.signal import hilbert as _sp_hilbert, iirdesign, sosfiltfilt as _sp_s
 from scipy.interpolate import interp1d
 
 # scipy's sosfiltfilt + hilbert are faster than our Rust port for single
-# signals. SOphase runs once on the whole EEG, so we stick with scipy here.
-_HAS_RUST_SIGNAL = False
-_dynamo_rs = None
+# signals (see scripts/bench_signal_rust_vs_scipy.py).  Rust wins for
+# unwrap (6x, bit-exact) so enable that specifically.
+_HAS_RUST_SIGNAL = False  # legacy; kept for backward-compat
+try:
+    import dynamo_rs as _dynamo_rs  # type: ignore
+    _HAS_RUST_MODULE = True
+except ImportError:
+    _dynamo_rs = None
+    _HAS_RUST_MODULE = False
+
+_USE_RUST_SOSFILTFILT = False
+_USE_RUST_HILBERT = False
+_USE_RUST_UNWRAP = _HAS_RUST_MODULE  # rust 6x faster, bit-exact
 
 
 def _sosfiltfilt(sos, x):
-    if _HAS_RUST_SIGNAL:
+    if _USE_RUST_SOSFILTFILT and _HAS_RUST_MODULE:
         return _dynamo_rs.sosfiltfilt(
             np.ascontiguousarray(sos, np.float64),
             np.ascontiguousarray(x, np.float64).ravel(),
@@ -47,14 +57,14 @@ def _sosfiltfilt(sos, x):
 
 def _hilbert_analytic(x):
     """Return complex analytic signal (like scipy.signal.hilbert)."""
-    if _HAS_RUST_SIGNAL:
+    if _USE_RUST_HILBERT and _HAS_RUST_MODULE:
         re, im = _dynamo_rs.hilbert(np.ascontiguousarray(x, np.float64).ravel())
         return re + 1j * im
     return _sp_hilbert(x)
 
 
 def _unwrap(p):
-    if _HAS_RUST_SIGNAL:
+    if _USE_RUST_UNWRAP:
         return _dynamo_rs.unwrap(np.ascontiguousarray(p, np.float64).ravel())
     return np.unwrap(p)
 
