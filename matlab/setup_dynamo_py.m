@@ -39,25 +39,49 @@ function setup_dynamo_py(python_exe)
         end
     end
 
-    % If pyenv is already loaded with a different Python, we need to switch
-    % via OutOfProcess mode (in-process Python can't be rebound).
+    % If pyenv is currently loaded — possibly with the wrong Python — we
+    % must terminate it first (OutOfProcess Python can be terminated and
+    % switched at runtime; InProcess can't, requires MATLAB restart).
     cur = pyenv;
-    if cur.Status == "Loaded" && cur.Executable ~= string(python_exe)
-        warning('setup_dynamo_py:Reload', ...
-            ['pyenv is already loaded with a different Python:\n' ...
-             '  current:   %s\n  requested: %s\n' ...
-             'Restart MATLAB to switch interpreters.'], ...
-            char(cur.Executable), python_exe);
-    else
+    if cur.Status == "Loaded" && string(cur.Executable) ~= string(python_exe)
+        if cur.ExecutionMode == "InProcess"
+            error('setup_dynamo_py:NeedRestart', ...
+                ['pyenv is locked InProcess to a different Python:\n' ...
+                 '  current:   %s\n  requested: %s\n\n' ...
+                 'Restart MATLAB, then run setup_dynamo_py(''%s'').'], ...
+                char(cur.Executable), python_exe, python_exe);
+        end
+        % Terminate the current OutOfProcess Python so we can switch.
         try
-            pyenv('Version', python_exe, 'ExecutionMode', 'OutOfProcess');
-        catch ME
-            error('setup_dynamo_py:PyenvFailed', ...
-                'pyenv() failed: %s', ME.message);
+            terminate(pyenv);
+        catch
+            % older MATLAB: terminate(pyenv) may not exist; fall through.
         end
     end
+    try
+        pyenv('Version', python_exe, 'ExecutionMode', 'OutOfProcess');
+    catch ME
+        error('setup_dynamo_py:PyenvFailed', ...
+            'pyenv(''Version'', ''%s'') failed: %s', python_exe, ME.message);
+    end
     pe = pyenv;
-    fprintf('pyenv: Python %s at %s\n', char(pe.Version), char(pe.Executable));
+    if string(pe.Executable) ~= string(python_exe)
+        error('setup_dynamo_py:SwitchFailed', ...
+            ['pyenv did NOT switch interpreters.\n' ...
+             '  requested: %s\n  active:    %s\n\n' ...
+             'This usually means MATLAB has Python loaded InProcess.\n' ...
+             'Restart MATLAB and try again.'], python_exe, char(pe.Executable));
+    end
+    fprintf('pyenv: Python %s at %s (%s)\n', char(pe.Version), ...
+        char(pe.Executable), char(pe.ExecutionMode));
+
+    % Force a Python op to verify the interpreter actually launches.
+    try
+        py.exec('import sys');
+    catch ME
+        error('setup_dynamo_py:LaunchFailed', ...
+            'Could not start Python: %s', ME.message);
+    end
 
     % Sanity-check imports
     try
