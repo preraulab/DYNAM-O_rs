@@ -18,6 +18,7 @@
 pub mod adjacency;
 pub mod baseline;
 pub mod histogram;
+pub mod io;
 pub mod mask;
 pub mod matlab_watershed;
 pub mod merge;
@@ -387,6 +388,125 @@ mod python {
         Ok(ndarray::Array1::from(out).into_pyarray_bound(py))
     }
 
+    /// read_edf(path, channel=None) → dict with header, signals, data, fs, channel.
+    ///
+    /// If `channel` is None, returns all signals in a list. Otherwise returns
+    /// (data, fs, label) for the single selected channel (with A–B rereference
+    /// support). Port of `read_EDF_mex.c`.
+    #[pyfunction]
+    #[pyo3(signature = (path, channel=None))]
+    fn read_edf<'py>(
+        py: Python<'py>,
+        path: &str,
+        channel: Option<&str>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        use pyo3::types::{PyDict, PyList};
+        let edf = super::io::edf::read_edf_all(path)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+
+        let out = PyDict::new_bound(py);
+
+        // Header
+        let hdr = PyDict::new_bound(py);
+        hdr.set_item("edf_ver", &edf.header.edf_ver)?;
+        hdr.set_item("patient_id", &edf.header.patient_id)?;
+        hdr.set_item("local_rec_id", &edf.header.local_rec_id)?;
+        hdr.set_item("recording_startdate", &edf.header.recording_startdate)?;
+        hdr.set_item("recording_starttime", &edf.header.recording_starttime)?;
+        hdr.set_item("num_header_bytes", edf.header.num_header_bytes)?;
+        hdr.set_item("num_data_records", edf.header.num_data_records)?;
+        hdr.set_item("data_record_duration", edf.header.data_record_duration)?;
+        hdr.set_item("num_signals", edf.header.num_signals)?;
+        out.set_item("header", hdr)?;
+
+        // All signal labels (useful even when selecting one channel).
+        let labels: Vec<&str> = edf.signals.iter().map(|s| s.signal_labels.as_str()).collect();
+        out.set_item("labels", labels)?;
+        let fs_all: Vec<f64> = edf.signals.iter().map(|s| s.sampling_frequency).collect();
+        out.set_item("sampling_frequencies", fs_all)?;
+
+        if let Some(ch) = channel {
+            let (sh, values) = super::io::edf::select_channel(&edf, ch)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+            let arr = ndarray::Array1::from(values);
+            out.set_item("data", arr.into_pyarray_bound(py))?;
+            out.set_item("fs", sh.sampling_frequency)?;
+            out.set_item("label", sh.signal_labels.clone())?;
+            let sinfo = PyDict::new_bound(py);
+            sinfo.set_item("signal_labels", sh.signal_labels)?;
+            sinfo.set_item("transducer_type", sh.transducer_type)?;
+            sinfo.set_item("physical_dimension", sh.physical_dimension)?;
+            sinfo.set_item("physical_min", sh.physical_min)?;
+            sinfo.set_item("physical_max", sh.physical_max)?;
+            sinfo.set_item("digital_min", sh.digital_min)?;
+            sinfo.set_item("digital_max", sh.digital_max)?;
+            sinfo.set_item("prefiltering", sh.prefiltering)?;
+            sinfo.set_item("samples_in_record", sh.samples_in_record)?;
+            sinfo.set_item("sampling_frequency", sh.sampling_frequency)?;
+            out.set_item("signal_header", sinfo)?;
+        } else {
+            let lst = PyList::empty_bound(py);
+            for (s, v) in edf.signals.iter().zip(edf.data.iter()) {
+                let d = PyDict::new_bound(py);
+                d.set_item("signal_labels", &s.signal_labels)?;
+                d.set_item("transducer_type", &s.transducer_type)?;
+                d.set_item("physical_dimension", &s.physical_dimension)?;
+                d.set_item("physical_min", s.physical_min)?;
+                d.set_item("physical_max", s.physical_max)?;
+                d.set_item("digital_min", s.digital_min)?;
+                d.set_item("digital_max", s.digital_max)?;
+                d.set_item("prefiltering", &s.prefiltering)?;
+                d.set_item("samples_in_record", s.samples_in_record)?;
+                d.set_item("sampling_frequency", s.sampling_frequency)?;
+                let arr = ndarray::Array1::from(v.clone());
+                d.set_item("data", arr.into_pyarray_bound(py))?;
+                lst.append(d)?;
+            }
+            out.set_item("signals", lst)?;
+        }
+
+        Ok(out)
+    }
+
+    /// read_staging(path, time_col=1, stage_col=2, header_lines=0,
+    ///              delimiter=",", epoch_dur=30.0, start_time=None)
+    /// → (times (N,), vals (N,)) numpy arrays.
+    #[pyfunction]
+    #[pyo3(signature = (
+        path, time_col=1, stage_col=2, header_lines=0,
+        delimiter=",", epoch_dur=30.0, start_time=None,
+    ))]
+    fn read_staging<'py>(
+        py: Python<'py>,
+        path: &str,
+        time_col: usize,
+        stage_col: usize,
+        header_lines: usize,
+        delimiter: &str,
+        epoch_dur: f64,
+        start_time: Option<&str>,
+    ) -> PyResult<(
+        Bound<'py, numpy::PyArray1<f64>>,
+        Bound<'py, numpy::PyArray1<f64>>,
+    )> {
+        let delim = delimiter.chars().next().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("delimiter must be at least one char")
+        })?;
+        let opts = super::io::staging::StagingOpts {
+            time_col,
+            stage_col,
+            header_lines,
+            delimiter: delim,
+            epoch_dur,
+            start_time: start_time.map(|s| s.to_string()),
+        };
+        let out = super::io::staging::read_staging(path, &opts)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+        let t = ndarray::Array1::from(out.times);
+        let v = ndarray::Array1::from(out.vals);
+        Ok((t.into_pyarray_bound(py), v.into_pyarray_bound(py)))
+    }
+
     #[pymodule]
     fn dynamo_rs(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(merge_segment, m)?)?;
@@ -403,6 +523,8 @@ mod python {
         m.add_function(wrap_pyfunction!(hilbert, m)?)?;
         m.add_function(wrap_pyfunction!(unwrap, m)?)?;
         m.add_function(wrap_pyfunction!(movmean, m)?)?;
+        m.add_function(wrap_pyfunction!(read_edf, m)?)?;
+        m.add_function(wrap_pyfunction!(read_staging, m)?)?;
         Ok(())
     }
 }

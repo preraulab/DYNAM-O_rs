@@ -120,7 +120,7 @@ function T = dict_to_table(d)
         if startsWith(nm, '_')
             continue
         end
-        val = py.getattr(d, 'get')(nm);
+        val = py.operator.getitem(d, nm);
         try
             vec = double(py.numpy.asarray(val));
         catch

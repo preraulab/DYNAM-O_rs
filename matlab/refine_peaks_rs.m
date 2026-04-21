@@ -47,8 +47,10 @@ function stats_table_refined = refine_peaks_rs(stats_table, data, Fs, varargin)
             'remove_edge_peaks', logical(a.remove_edge_peaks)));
 
     keep = logical(out{'keep_mask'});
+    keep = keep(:);
     stats_table_refined = stats_table(keep, :);
     if nnz(keep) > 0
-        stats_table_refined.PeakFrequency = double(out{'PeakFrequency'});
+        pf = double(out{'PeakFrequency'});
+        stats_table_refined.PeakFrequency = pf(:);
     end
 end

@@ -67,7 +67,15 @@ def _force_python_only():
         mod = sys.modules.get(modname)
         if mod is None:
             continue
-        for attr in ("_HAS_RUST", "_HAS_RUST_SIGNAL"):
+        for attr in (
+            "_HAS_RUST",
+            "_HAS_RUST_SIGNAL",
+            # per-function gates introduced after the rustfft-NEON bench
+            "_USE_RUST_MOVMEAN",
+            "_USE_RUST_UNWRAP",
+            "_USE_RUST_SOSFILTFILT",
+            "_USE_RUST_HILBERT",
+        ):
             if hasattr(mod, attr):
                 prev = getattr(mod, attr)
                 setattr(mod, attr, False)
