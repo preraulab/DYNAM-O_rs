@@ -65,9 +65,11 @@ function [stats_table, spect, stimes, sfreqs, data_time_range, ...
     total_wall = toc;
 
     % ---------- Convert outputs back to MATLAB types ----------
-    % stats_table: pandas DataFrame → MATLAB table
-    df = out.stats_table;
-    stats_table = df_to_matlab_table(df);
+    % stats_table: pandas DataFrame → MATLAB table. Use the Python-side
+    % helper to flatten to a plain dict of numpy arrays (MATLAB brace
+    % indexing on py.pandas.DataFrame is unreliable).
+    stats_dict = py.pydynamo.matlab_api.stats_table_to_dict(out.stats_table);
+    stats_table = dict_to_table(stats_dict);
 
     % Spectrograms + axes
     spect   = double(out.spect);
@@ -107,7 +109,40 @@ function [stats_table, spect, stimes, sfreqs, data_time_range, ...
 end
 
 
-function T = df_to_matlab_table(df)
+function T = dict_to_table(d)
+%DICT_TO_TABLE  Convert a Python dict {col_name: numpy_array} into a MATLAB
+%   table. Keys starting with '_' are treated as metadata and skipped.
+    keys = cell(py.list(d.keys()));
+    varargs = {};
+    var_names = {};
+    for i = 1:numel(keys)
+        nm = char(keys{i});
+        if startsWith(nm, '_')
+            continue
+        end
+        val = py.getattr(d, 'get')(nm);
+        try
+            vec = double(py.numpy.asarray(val));
+        catch
+            vec = string(cellfun(@char, cell(val), 'UniformOutput', false));
+        end
+        if isnumeric(vec)
+            if size(vec, 2) > 1 && size(vec, 1) == 1
+                vec = vec(:);
+            elseif ndims(vec) == 2 && size(vec, 2) ~= 1 && size(vec, 1) ~= 1
+                % Keep multi-column (e.g. BoundingBox Nx4) intact.
+            elseif isvector(vec)
+                vec = vec(:);
+            end
+        end
+        varargs{end+1} = vec; %#ok<AGROW>
+        var_names{end+1} = nm; %#ok<AGROW>
+    end
+    T = table(varargs{:}, 'VariableNames', var_names);
+end
+
+
+function T = df_to_matlab_table(df) %#ok<DEFNU>  — kept for back-compat
 %DF_TO_MATLAB_TABLE  Convert a pandas DataFrame to a MATLAB table. Uses
 %   py.getattr for column access (MATLAB's df.(nm) dot-syntax fails on
 %   some column names because MATLAB only whitelists known DataFrame
