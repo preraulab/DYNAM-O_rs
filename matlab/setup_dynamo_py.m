@@ -29,10 +29,10 @@ function setup_dynamo_py(python_exe)
         };
         python_exe = '';
         for i = 1:numel(candidates)
-            % Canonicalize any `..` components so exist() is happy.
-            cand = char(java.io.File(candidates{i}).getCanonicalPath());
-            if exist(cand, 'file') == 2
-                python_exe = cand;
+            % Test existence WITHOUT resolving symlinks — we need to keep
+            % the venv path so site-packages can be derived from it.
+            if exist(candidates{i}, 'file') == 2
+                python_exe = candidates{i};
                 break;
             end
         end
