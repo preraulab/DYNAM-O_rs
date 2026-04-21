@@ -25,11 +25,43 @@ function export_validation_segment(out_dir)
     end
     if ~exist(out_dir, 'dir'); mkdir(out_dir); end
 
-    % --- Run the full MATLAB pipeline on segment data. ---
-    fprintf('Running runDYNAMO(''segment'')...\n');
-    [stats, spect, stimes, sfreqs, ~, t_time_range, artifacts, ~, timings] = ...
-        runDYNAMO('segment');
-    fprintf('Done. Peaks: %d   wall: %.1f s\n', height(stats), timings.total);
+    % --- Load example_data.mat directly so we can call runDYNAMO with the
+    %     full 4-arg signature (which returns timings as the 9th output).
+    %     The 'segment' shortcut path routes through runExampleData which
+    %     only returns 8 outputs. ---
+    ed_path = which('example_data.mat');
+    if isempty(ed_path)
+        % fall back to known location
+        here = fileparts(which('runDYNAMO'));
+        ed_path = fullfile(here, 'example_data', 'example_data.mat');
+    end
+    assert(exist(ed_path, 'file') == 2, 'example_data.mat not on path');
+    ed = load(ed_path);
+    data = ed.data; Fs = ed.Fs;
+    stage_times = ed.stage_times; stage_vals = ed.stage_vals;
+
+    % Segment default time range (matches runExampleData's 'segment' preset)
+    time_range = [8420, 13446];
+
+    fprintf('Running runDYNAMO on segment [%g, %g]...\n', time_range(1), time_range(2));
+    t0 = tic;
+    try
+        [stats, spect, stimes, sfreqs, ~, t_time_range, artifacts, ~, timings] = ...
+            runDYNAMO(data, Fs, stage_times, stage_vals, time_range, ...
+                      'verbose', false, 'plot_on', false);
+        total_s = timings.total;
+    catch ME
+        if strcmp(ME.identifier, 'MATLAB:TooManyOutputs')
+            % older runDYNAMO: only 8 outputs, no timings field
+            [stats, spect, stimes, sfreqs, ~, t_time_range, artifacts, ~] = ...
+                runDYNAMO(data, Fs, stage_times, stage_vals, time_range, ...
+                          'verbose', false, 'plot_on', false);
+            total_s = toc(t0);
+        else
+            rethrow(ME);
+        end
+    end
+    fprintf('Done. Peaks: %d   wall: %.1f s\n', height(stats), total_s);
 
     % --- Recompute pass-2 baseline the same way computeTFPeaks does, so
     %     the Rust test can feed (spect_pass2, baseline_pass2) and replay
