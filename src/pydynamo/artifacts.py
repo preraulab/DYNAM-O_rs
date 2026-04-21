@@ -30,8 +30,39 @@ Masks from HF and BB bands are OR'd with `bad_inds` (flat runs + outlier noise).
 from __future__ import annotations
 
 import numpy as np
-from scipy.signal import cheby1, sosfiltfilt, hilbert
+from scipy.signal import cheby1, sosfiltfilt as _sp_sosfiltfilt, hilbert as _sp_hilbert
 from scipy.ndimage import median_filter
+
+# scipy's sosfiltfilt + hilbert are faster than our Rust port on single
+# long signals (scipy has SIMD-vectorized C kernels). We retain the Rust
+# path only where we have parallelism across many signals (e.g., refine).
+# Flip this flag to use the Rust primitives here.
+_HAS_RUST_SIGNAL = False
+_dynamo_rs = None
+
+
+def _rust_sosfiltfilt(sos, x):
+    if _HAS_RUST_SIGNAL:
+        return _dynamo_rs.sosfiltfilt(
+            np.ascontiguousarray(sos, np.float64),
+            np.ascontiguousarray(x, np.float64).ravel(),
+        )
+    return _sp_sosfiltfilt(sos, x)
+
+
+def _rust_hilbert_envelope(x):
+    """|hilbert(x)| — the envelope. Returns real magnitude."""
+    x_arr = np.ascontiguousarray(x, np.float64).ravel()
+    if _HAS_RUST_SIGNAL:
+        re, im = _dynamo_rs.hilbert(x_arr)
+        return np.hypot(re, im)
+    return np.abs(_sp_hilbert(x_arr))
+
+
+def _rust_movmean(x, win):
+    if _HAS_RUST_SIGNAL and win > 1:
+        return _dynamo_rs.movmean(np.ascontiguousarray(x, np.float64).ravel(), int(win))
+    return None  # caller falls back to Python _movmean
 
 
 def _flat_mask(data: np.ndarray, min_run: int) -> np.ndarray:
@@ -163,9 +194,11 @@ def _compute_band_artifacts(
     # designfilt('highpassiir', 'FilterOrder', 4, 'PassbandFrequency', pb,
     #            'PassbandRipple', 0.2, 'SampleRate', Fs)).
     sos = cheby1(4, 0.2, passband, btype="highpass", fs=fs, output="sos")
-    y = sosfiltfilt(sos, data)
-    y = np.abs(hilbert(y))
-    y = _movmean(y, int(round(smooth_duration * fs)))
+    y = _rust_sosfiltfilt(sos, data)
+    y = _rust_hilbert_envelope(y)
+    win_smooth = int(round(smooth_duration * fs))
+    y_rs = _rust_movmean(y, win_smooth)
+    y = y_rs if y_rs is not None else _movmean(y, win_smooth)
     # log (MATLAB: log = natural log)
     with np.errstate(divide="ignore", invalid="ignore"):
         y = np.log(y)
