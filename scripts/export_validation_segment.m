@@ -75,6 +75,51 @@ function export_validation_segment(out_dir)
     end
     fprintf('Done. Peaks: %d   wall: %.1f s\n', height(stats), total_s);
 
+    % Replicate computeTFPeaks's pass-1 -> mask step to capture the MASKED
+    % pass-2 spectrogram — that's what MATLAB's final extract runs on, and
+    % what MEX/pydynamo need to see for apples-to-apples peak comparison.
+    fprintf('Computing pass-1 spectrogram + regions for masking ...\n');
+    d = detection_opts();
+    b = baseline_opts();
+    data_tr = data(t_data >= time_range(1) & t_data <= time_range(2));
+    t_tr    = t_time_range;
+    % Pass-1 multitaper spectrogram (1-s window)
+    nfft1 = 2^(nextpow2(Fs / d.mtm_dsfreqs));
+    [spect1, stimes1, sfreqs_check] = multitaper_spectrogram(...
+        data_tr, Fs, d.mtm_freq_range, d.mtm_taper_params, ...
+        [d.mtm_window_length_1, d.mtm_window_stepsize], ...
+        nfft1, 'constant', 'unity', false, false);
+    stimes1 = stimes1 + t_tr(1);
+    % Pass-1 baseline (same recipe as computeTFPeaks)
+    excl_stages = ~ismember(stage_vals, b.baseline_stages);
+    excl_re = interp1(stage_times, single(excl_stages), t_tr, 'previous') ~= 0;
+    bl_exclude = artifacts(:) | excl_re(:);
+    bl_excl_st = logical(interp1(t_tr, single(bl_exclude), stimes1, 'nearest'));
+    spect1_bl = spect1(:, ~bl_excl_st);
+    spect1_bl(spect1_bl == 0) = NaN;
+    baseline1 = prctile(spect1_bl, b.baseline_ptile, 2);
+    % Pass-1 extract with regions + borders
+    [downsample_spect1, seg_time1, merge_thresh1] = deal(d.downsample_spect, d.seg_time, d.merge_thresh);
+    if isempty(downsample_spect1); downsample_spect1 = [2 2]; end
+    if isempty(seg_time1); seg_time1 = 30; end
+    if isempty(merge_thresh1); merge_thresh1 = 11; end
+    df1 = d.mtm_taper_params(1) / d.mtm_window_length_1 * 2;
+    dur_min1 = d.mtm_window_length_1 / 2;
+    bw_min1  = df1 / 2;
+    fprintf('  pass-1 runSegmentedData ...\n');
+    [~, regions1, borders1] = runSegmentedData( ...
+        spect1, stimes1, sfreqs, baseline1, seg_time1, downsample_spect1, 'all', ...
+        dur_min1, bw_min1, merge_thresh1, inf, d.trim_vol, -1, false, false);
+    % Mask the pass-2 spectrogram using pass-1 regions + borders
+    spect_masked = maskSpectrogram(spect, stimes1, stimes, regions1, borders1);
+    % Pass-2 baseline (runDYNAMO already applied it; recompute for save)
+    bl_excl_st2 = logical(interp1(t_tr, single(bl_exclude), stimes, 'nearest'));
+    spect2_bl = spect(:, ~bl_excl_st2);
+    spect2_bl(spect2_bl == 0) = NaN;
+    baseline2 = prctile(spect2_bl, b.baseline_ptile, 2);
+    fprintf('  saved spect_masked [%d x %d], baseline2 [%d]\n', ...
+        size(spect_masked, 1), size(spect_masked, 2), numel(baseline2));
+
     % --- Recompute pass-2 baseline the same way computeTFPeaks does, so
     %     the Rust test can feed (spect_pass2, baseline_pass2) and replay
     %     the final extract pass. ---
@@ -114,7 +159,8 @@ function export_validation_segment(out_dir)
     % --- Save spectrogram + params. ---
     spect_path = fullfile(out_dir, 'segment_spect.mat');
     fprintf('Writing %s ... ', spect_path);
-    save(spect_path, 'spect', 'stimes', 'sfreqs', 'baseline', ...
+    save(spect_path, 'spect', 'spect_masked', 'stimes', 'sfreqs', ...
+        'baseline', 'baseline2', ...
         'seg_time', 'merge_thresh', 'trim_vol', 'downsample_spect', ...
         'dur_min', 'dur_max', 'bw_min', 'bw_max', 'ht_db_min', '-v7');
     d_info = dir(spect_path);
