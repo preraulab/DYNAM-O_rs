@@ -27,6 +27,32 @@ from pydynamo.tfpeaks.mask import mask_spectrogram as _mask_spect
 from pydynamo.tfpeaks.refine import refine_peak_frequency
 
 
+def stats_table_to_dict(df):
+    """Flatten a pandas DataFrame `stats_table` into a dict of numpy arrays
+    MATLAB can trivially unpack (via py.getattr on the dict). BoundingBox
+    (column of 4-tuples) is converted to Nx4 float64."""
+    import pandas as pd
+    out = {}
+    n = len(df)
+    for col in df.columns:
+        v = df[col]
+        if col == "BoundingBox":
+            if n == 0:
+                out[col] = np.zeros((0, 4), dtype=np.float64)
+            else:
+                out[col] = np.asarray(
+                    [list(t) for t in v], dtype=np.float64
+                ).reshape(n, 4)
+        else:
+            try:
+                out[col] = np.asarray(v.values, dtype=np.float64)
+            except (TypeError, ValueError):
+                # object-dtype column → list of strings
+                out[col] = [str(x) for x in v]
+    out["_n_rows"] = int(n)
+    return out
+
+
 def extract_tfpeaks_rs(
     spect,
     stimes,
