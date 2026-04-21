@@ -112,6 +112,10 @@ pub struct ExtractTfpeaksIn {
     pub freq_min: f64,
     pub freq_max: f64,
     pub ht_db_min: f64,
+    /// Distance for expand_labels(). 0 = skip (MATLAB-native; labels
+    /// keep 0 on watershed lines). 5 = pydynamo default (skimage-style
+    /// fill so regions touch directly).
+    pub expand_labels_distance: u32,
 }
 
 /// Output descriptor for [`dynamo_extract_tfpeaks`].
@@ -285,6 +289,7 @@ pub unsafe extern "C" fn dynamo_extract_tfpeaks(
             freq_min: input.freq_min,
             freq_max,
             ht_db_min: input.ht_db_min,
+            expand_labels_distance: input.expand_labels_distance,
         };
 
         let (peaks, labels) = match crate::extract_pipeline::extract_tfpeaks(
@@ -841,6 +846,7 @@ mod tests {
             freq_min: 0.0,
             freq_max: 40.0,
             ht_db_min: 7.63,
+            expand_labels_distance: 5,
         };
         let mut out = empty_extract_out();
         unsafe {

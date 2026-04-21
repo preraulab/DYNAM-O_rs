@@ -76,6 +76,10 @@ pub struct ExtractParams {
     pub freq_min: f64,
     pub freq_max: f64,
     pub ht_db_min: f64,
+    /// Distance for expand_labels(). 0 = skip (MATLAB-native behavior,
+    /// labels keep 0 on watershed lines). 5 = pydynamo default
+    /// (skimage-style fill so regions touch directly).
+    pub expand_labels_distance: u32,
 }
 
 /// Stride-downsample a 2-D array: `out = arr[::f_stride, ::t_stride]`.
@@ -332,8 +336,16 @@ pub fn extract_tfpeaks_segment(
     )?;
     let merged_i64: Array2<i64> = merged_i32.mapv(|v| v as i64);
 
-    // 4) expand_labels(distance=5) to fill the watershed 0-line.
-    let expanded_lr = expand_labels_bfs(merged_i64.view(), 5);
+    // 4) expand_labels(distance=5) — fills watershed 0-line with nearest
+    //    label. pydynamo does this for skimage semantic match; MATLAB
+    //    extractTFPeaks.m does NOT. Controlled by ExtractParams.expand_labels
+    //    (default true for pydynamo parity; set false to get MATLAB-native
+    //    behavior without the 1-pixel-wider regions).
+    let expanded_lr = if params.expand_labels_distance > 0 {
+        expand_labels_bfs(merged_i64.view(), params.expand_labels_distance as usize)
+    } else {
+        merged_i64.clone()
+    };
 
     // 5) Resize up to full segment shape (nearest-neighbor).
     let labels_full = if f_s > 1 || t_s > 1 {
@@ -672,7 +684,7 @@ mod tests {
             dur_min: 0.5, dur_max: 5.0,
             bw_min: 2.0, bw_max: 15.0,
             freq_min: 0.0, freq_max: 40.0,
-            ht_db_min: 7.0,
+            ht_db_min: 7.0, expand_labels_distance: 5,
         };
         let kept = filter_indices(&p, &params, 0.05, 0.1);
         // Height=100 → pow2db = 20 dB > 7 dB ✓; filter_dur = 1.0 - 0.05
@@ -732,6 +744,7 @@ mod tests {
             bw_min: 0.0, bw_max: f64::INFINITY,
             freq_min: 0.0, freq_max: f64::INFINITY,
             ht_db_min: f64::NEG_INFINITY,
+            expand_labels_distance: 5,
         };
 
         let (peaks, labels) = extract_tfpeaks(
