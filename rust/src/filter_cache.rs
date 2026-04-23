@@ -10,7 +10,7 @@
 //!   2. Otherwise look next to the crate at
 //!      `$CARGO_MANIFEST_DIR/../data_matlab_filters`.
 //!   3. If neither hit → fall back to a **pure-Rust Chebyshev Type-I bandpass**
-//!      design (this crate already ships one in `pipeline/filter_design.rs`)
+//!      design (this crate already ships one in `filter_design.rs`)
 //!      and emit a warning. The MATLAB cache is actually an elliptic design
 //!      so this fallback introduces a small (~0.93 cosine similarity)
 //!      divergence. Callers that need bit-equivalence MUST ensure the cache
@@ -102,7 +102,7 @@ pub fn get_sophase_sos(fs: f64, band: (f64, f64)) -> Result<Array2<f64>, FilterE
     }
 
     // Fallback — log a warning (sci-rs is not currently in our deps; this
-    // crate ships a pure-Rust cheby1_sos in pipeline/filter_design.rs that
+    // crate ships a pure-Rust cheby1_sos in filter_design.rs that
     // we reuse rather than pulling in another dependency).
     log::warn!(
         "sophase SOS cache miss for (fs={}, band=({}, {})); falling back to \
@@ -124,7 +124,7 @@ pub fn get_sophase_sos(fs: f64, band: (f64, f64)) -> Result<Array2<f64>, FilterE
 /// Design a Chebyshev Type-I bandpass SOS filter.
 ///
 /// Wraps the crate's existing pure-Rust `cheby1_sos` implementation (ported
-/// from `scipy.signal.cheby1`, see `pipeline/filter_design.rs`).
+/// from `scipy.signal.cheby1`, see `filter_design.rs`).
 pub fn design_cheby1_bandpass_sos(
     order: usize,
     rp_db: f64,
@@ -149,11 +149,7 @@ pub fn design_cheby1_bandpass_sos(
         .map_err(|e| FilterError::DesignFailed(format!("{}", e)))
 }
 
-/// Re-export of the cheby1 code from `pipeline/filter_design.rs`, registered
-/// via `#[path]` so we don't touch `pipeline/mod.rs` (which has unrelated WIP
-/// module references that aren't yet on disk).
-#[path = "pipeline/filter_design.rs"]
-mod filter_design;
+use crate::filter_design;
 
 #[cfg(test)]
 mod tests {

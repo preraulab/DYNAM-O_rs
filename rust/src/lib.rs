@@ -20,6 +20,7 @@ pub mod baseline;
 pub mod c_api;
 pub mod extract_pipeline;
 pub mod filter_cache;
+pub mod filter_design;
 pub mod histogram;
 pub mod io;
 pub mod mask;
