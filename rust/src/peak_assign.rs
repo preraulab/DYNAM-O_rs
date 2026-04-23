@@ -19,14 +19,20 @@
 //!   back to `(-π, π]`.
 
 /// Previous-neighbor (step) interpolation: each query `q` maps to the value
-/// `fp[i]` where `i` is the largest index with `xp[i] <= q`. Queries below
-/// `xp[0]` get `fill`. Matches `scipy.interpolate.interp1d(kind='previous',
-/// bounds_error=False, fill_value=fill)`.
+/// `fp[i]` where `i` is the largest index with `xp[i] <= q`. Queries outside
+/// the support `[xp[0], xp[-1]]` get `fill`. Matches
+/// `scipy.interpolate.interp1d(kind='previous', bounds_error=False,
+/// fill_value=fill)` and MATLAB `interp1(xp, fp, q, 'previous', fill)`
+/// (no `'extrap'`).
 pub fn interp_previous(xp: &[f64], fp: &[f64], queries: &[f64], fill: f64) -> Vec<f64> {
     debug_assert_eq!(xp.len(), fp.len());
     let mut out = Vec::with_capacity(queries.len());
+    if xp.is_empty() {
+        return vec![fill; queries.len()];
+    }
+    let last = *xp.last().unwrap();
     for &q in queries {
-        if xp.is_empty() || q < xp[0] {
+        if q < xp[0] || q > last {
             out.push(fill);
             continue;
         }
@@ -148,9 +154,10 @@ mod tests {
     fn previous_step_basic() {
         let xp = [0.0, 10.0, 20.0, 30.0];
         let fp = [1.0, 2.0, 3.0, 4.0]; // N1 N2 N3 REM ~
+        // Fill for q < xp[0] AND q > xp[-1] (scipy/MATLAB no-extrap semantics).
         let q = [-5.0, 0.0, 5.0, 10.0, 29.9, 30.0, 100.0];
         let out = interp_previous(&xp, &fp, &q, 0.0);
-        assert_eq!(out, vec![0.0, 1.0, 1.0, 2.0, 3.0, 4.0, 4.0]);
+        assert_eq!(out, vec![0.0, 1.0, 1.0, 2.0, 3.0, 4.0, 0.0]);
     }
 
     #[test]

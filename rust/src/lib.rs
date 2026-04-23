@@ -29,6 +29,7 @@ pub mod merge;
 pub mod peak_assign;
 pub mod refine;
 pub mod signal;
+pub mod so_power;
 pub mod trim;
 
 #[cfg(feature = "python")]
@@ -155,6 +156,90 @@ mod python {
         let arr = labels.as_array();
         let out = super::extract_pipeline::matlab_paint_labels_in_order(arr);
         Ok(out.into_pyarray_bound(py))
+    }
+
+    /// so_power_from_spectrogram(so_spect, stimes, sfreqs, eeg_times, isexcluded,
+    ///                           stage_times, stage_vals, time_range,
+    ///                           outlier_threshold, norm_method, retain_fs)
+    ///   → (so_power_norm, so_power_times, so_power_stages, ptile)
+    ///
+    /// Post-spectrogram SO-power pipeline — port of computeSOpower.m steps
+    /// 3–8 and pydynamo soph/sopower.py lines ~93–164. Takes the
+    /// already-computed multitaper spectrogram over the SO band, emits the
+    /// normalized SO-power time series on either the window-center grid
+    /// (`retain_fs=False`) or upsampled back to `eeg_times` (`retain_fs=True`).
+    ///
+    /// `ptile` is:
+    ///   * None for norm_method='none'/'absolute' or the degenerate all-NaN path
+    ///   * float for p{N}shift{S} (the ptile-th percentile used as the shift)
+    ///   * (float, float) for 'percent' (p1, p99)
+    #[pyfunction]
+    #[pyo3(signature = (
+        so_spect, stimes, sfreqs, eeg_times, isexcluded,
+        stage_times, stage_vals, time_range,
+        outlier_threshold=3.0, norm_method="p2shift1234",
+        retain_fs=true,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn so_power_from_spectrogram<'py>(
+        py: Python<'py>,
+        so_spect: PyReadonlyArray2<'py, f64>,
+        stimes: PyReadonlyArray1<'py, f64>,
+        sfreqs: PyReadonlyArray1<'py, f64>,
+        eeg_times: PyReadonlyArray1<'py, f64>,
+        isexcluded: PyReadonlyArray1<'py, bool>,
+        stage_times: PyReadonlyArray1<'py, f64>,
+        stage_vals: PyReadonlyArray1<'py, f64>,
+        time_range: (f64, f64),
+        outlier_threshold: f64,
+        norm_method: &str,
+        retain_fs: bool,
+    ) -> PyResult<Py<pyo3::types::PyTuple>> {
+        use super::so_power::{so_power_from_spectrogram as rs_fn, NormMethod, PtileUsed};
+
+        let spect_arr = so_spect.as_array();
+        let (nf, nt) = spect_arr.dim();
+        let spect_contig = spect_arr.to_owned();
+        let spect_slice = spect_contig.as_slice().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("so_spect must be C-contiguous")
+        })?;
+
+        let stimes_slice = stimes.as_array().to_owned().into_raw_vec();
+        let sfreqs_slice = sfreqs.as_array().to_owned().into_raw_vec();
+        let eeg_times_slice = eeg_times.as_array().to_owned().into_raw_vec();
+        let isexcluded_slice: Vec<bool> = isexcluded.as_array().iter().copied().collect();
+        let stage_times_slice = stage_times.as_array().to_owned().into_raw_vec();
+        let stage_vals_slice = stage_vals.as_array().to_owned().into_raw_vec();
+
+        let nm = NormMethod::parse(norm_method).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "unrecognized norm_method {:?}",
+                norm_method
+            ))
+        })?;
+
+        let out = rs_fn(
+            spect_slice, nf, nt,
+            &stimes_slice, &sfreqs_slice,
+            &eeg_times_slice, &isexcluded_slice,
+            &stage_times_slice, &stage_vals_slice,
+            time_range, outlier_threshold, &nm, retain_fs,
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+
+        let arr_norm = numpy::ndarray::Array1::from(out.so_power_norm).into_pyarray_bound(py);
+        let arr_times = numpy::ndarray::Array1::from(out.so_power_times).into_pyarray_bound(py);
+        let arr_stages = numpy::ndarray::Array1::from(out.so_power_stages).into_pyarray_bound(py);
+        let ptile_obj: PyObject = match out.ptile {
+            None => py.None(),
+            Some(PtileUsed::Single(p)) => p.into_py(py),
+            Some(PtileUsed::Pair(a, b)) => (a, b).into_py(py),
+        };
+        let tup = pyo3::types::PyTuple::new_bound(py, [
+            arr_norm.into_any(), arr_times.into_any(), arr_stages.into_any(),
+            ptile_obj.into_bound(py),
+        ]);
+        Ok(tup.unbind())
     }
 
     /// compute_baseline(spect, stimes, t_data, baseline_exclude, baseline_range, baseline_ptile)
@@ -540,6 +625,7 @@ mod python {
         m.add_function(wrap_pyfunction!(trim_regions, m)?)?;
         m.add_function(wrap_pyfunction!(matlab_watershed, m)?)?;
         m.add_function(wrap_pyfunction!(matlab_paint_labels, m)?)?;
+        m.add_function(wrap_pyfunction!(so_power_from_spectrogram, m)?)?;
         m.add_function(wrap_pyfunction!(compute_baseline, m)?)?;
         m.add_function(wrap_pyfunction!(subtract_baseline, m)?)?;
         m.add_function(wrap_pyfunction!(mask_spectrogram, m)?)?;
