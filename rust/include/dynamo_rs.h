@@ -60,6 +60,12 @@ typedef struct ExtractTfpeaksIn {
   double freq_min;
   double freq_max;
   double ht_db_min;
+  /**
+   * Distance for expand_labels(). 0 = skip (MATLAB-native; labels
+   * keep 0 on watershed lines). 5 = pydynamo default (skimage-style
+   * fill so regions touch directly).
+   */
+  uint32_t expand_labels_distance;
 } ExtractTfpeaksIn;
 
 /**
@@ -176,6 +182,27 @@ int dynamo_tfpeak_histogram(const double *c_metric,
                             double *out_time_in_bin,
                             double *out_prop_in_bin,
                             double *out_peak_at_freq);
+
+/**
+ * Perimeter-aware mask of pass-2 spectrogram using pass-1 labels.
+ * Thin FFI wrapper over [`crate::mask::mask_spectrogram`].
+ *
+ * All 2-D arrays are row-major: `spect_2s[f * n_times_2 + t]`, etc.
+ * `labels_1s` is (n_freqs, n_times_1) int64; `spect_2s` and `out_masked`
+ * are both (n_freqs, n_times_2) float64.
+ *
+ * Caller allocates `out_masked` of size `n_freqs * n_times_2`.
+ *
+ * Returns 0 on success, negative on error.
+ */
+int dynamo_mask_spectrogram(const double *spect_2s,
+                            const double *stimes_2s,
+                            const int64_t *labels_1s,
+                            const double *stimes_1s,
+                            uintptr_t n_freqs,
+                            uintptr_t n_times_2,
+                            uintptr_t n_times_1,
+                            double *out_masked);
 
 /**
  * Free a buffer previously returned via one of the callee-allocated output
