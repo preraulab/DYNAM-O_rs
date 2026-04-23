@@ -137,6 +137,57 @@ fn resize_labels_nn(labels: ArrayView2<i64>, oh: usize, ow: usize) -> Array2<i64
     out
 }
 
+/// MATLAB extractTFPeaks.m paint-in-label-order semantics. For each cell
+/// index i=1..N in ascending order (N = number of distinct non-zero labels
+/// in the input, compacted densely):
+///   1. Compute 8-conn 1-pixel dilation of the cell-i mask.
+///   2. Set output[dilated_mask] = i.
+///
+/// Higher cell indices overwrite lower on shared borders. Output has NO
+/// watershed 0-lines (every pixel adjacent to any region is labeled).
+/// Exactly matches MATLAB's `Ldata(rgn{ii}) = ii` for `ii=1..N` where
+/// `rgn{ii}` is `union(interior, 8-conn-dilation-border)` from
+/// Ldata2graph.m.
+///
+/// CRITICAL: uses DENSE 1..N indexing, matching MATLAB's cell index paint.
+/// If we use sparse original labels from Rust merge, regionprops counts
+/// unique-value-regions differently and produces +/-272 peak-count drift.
+#[allow(dead_code)]
+fn matlab_paint_labels_in_order(labels: ArrayView2<i64>) -> Array2<i64> {
+    let (h, w) = labels.dim();
+    let mut out = Array2::<i64>::zeros((h, w));
+    if h == 0 || w == 0 {
+        return out;
+    }
+    // Bucket pixels by label, then paint in ascending label order with dense
+    // cell indices (matching MATLAB's 1..N paint).
+    use std::collections::BTreeMap;
+    let mut by_label: BTreeMap<i64, Vec<(usize, usize)>> = BTreeMap::new();
+    for r in 0..h {
+        for c in 0..w {
+            let v = labels[[r, c]];
+            if v > 0 { by_label.entry(v).or_insert_with(Vec::new).push((r, c)); }
+        }
+    }
+    if by_label.is_empty() {
+        return out;
+    }
+    for (idx, (_orig_label, pixels)) in by_label.iter().enumerate() {
+        let cell_idx = (idx + 1) as i64;
+        for &(r, c) in pixels {
+            for dr in [-1i32, 0, 1] {
+                for dc in [-1i32, 0, 1] {
+                    let nr = r as i32 + dr;
+                    let nc = c as i32 + dc;
+                    if nr < 0 || nr >= h as i32 || nc < 0 || nc >= w as i32 { continue; }
+                    out[[nr as usize, nc as usize]] = cell_idx;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// `skimage.segmentation.expand_labels(labels, distance=d)`: for every
 /// pixel with label 0 within Euclidean distance `d` of some labeled pixel,
 /// fill with the nearest label. Ties are broken by the lowest label id.
@@ -336,15 +387,17 @@ pub fn extract_tfpeaks_segment(
     )?;
     let merged_i64: Array2<i64> = merged_i32.mapv(|v| v as i64);
 
-    // 4) expand_labels(distance=5) — fills watershed 0-line with nearest
-    //    label. pydynamo does this for skimage semantic match; MATLAB
-    //    extractTFPeaks.m does NOT. Controlled by ExtractParams.expand_labels
-    //    (default true for pydynamo parity; set false to get MATLAB-native
-    //    behavior without the 1-pixel-wider regions).
-    let expanded_lr = if params.expand_labels_distance > 0 {
-        expand_labels_bfs(merged_i64.view(), params.expand_labels_distance as usize)
+    // 4) Border handling. Options:
+    //      0 => MATLAB paint-in-label-order (8-conn 1-px dilation, higher
+    //           labels overwrite lower). Exactly matches extractTFPeaks.m +
+    //           Ldata2graph.m. Confirmed via bisection 2026-04-21 as the
+    //           step that closes the +2% peak-count gap.
+    //      N>0 => skimage-style expand_labels (BFS to distance N, lower
+    //           label wins ties). Pydynamo semantic (default 5).
+    let expanded_lr = if params.expand_labels_distance == 0 {
+        matlab_paint_labels_in_order(merged_i64.view())
     } else {
-        merged_i64.clone()
+        expand_labels_bfs(merged_i64.view(), params.expand_labels_distance as usize)
     };
 
     // 5) Resize up to full segment shape (nearest-neighbor).
