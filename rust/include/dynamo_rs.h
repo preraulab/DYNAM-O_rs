@@ -66,6 +66,14 @@ typedef struct ExtractTfpeaksIn {
    * fill so regions touch directly).
    */
   uint32_t expand_labels_distance;
+  /**
+   * Optional progress callback invoked once per completed segment.
+   * Signature: `fn(segments_done: u32, segments_total: u32)`. Pass
+   * `NULL` / `None` to skip. Called from rayon worker threads, but
+   * dynamo_extract_tfpeaks serializes calls with an internal mutex
+   * so the C callee may assume it is never invoked concurrently.
+   */
+  void (*progress_cb)(uint32_t, uint32_t);
 } ExtractTfpeaksIn;
 
 /**

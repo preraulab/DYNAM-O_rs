@@ -506,6 +506,7 @@ pub fn extract_tfpeaks(
     sfreqs: ArrayView1<f64>,
     baseline: Option<ArrayView1<f64>>,
     params: &ExtractParams,
+    progress_cb: Option<&(dyn Fn(u32, u32) + Sync)>,
 ) -> Result<(SegmentPeaks, Array2<i64>), String> {
     let (f, t) = spect.dim();
     if f == 0 || t == 0 || stimes.len() < 2 {
@@ -553,6 +554,8 @@ pub fn extract_tfpeaks(
     }
 
     // Parallel extract; collect per-segment results preserving order.
+    let n_segs_total = seg_bounds.len() as u32;
+    let done = std::sync::atomic::AtomicU32::new(0);
     let results: Vec<Result<(SegmentPeaks, Array2<i64>), String>> = seg_bounds
         .par_iter()
         .map(|&(si, start, end)| {
@@ -561,9 +564,14 @@ pub fn extract_tfpeaks(
                 .slice(ndarray::s![.., start..end])
                 .to_owned();
             let sub_times = stimes.slice(ndarray::s![start..end]).to_owned();
-            extract_tfpeaks_segment(
+            let r = extract_tfpeaks_segment(
                 sub_spect.view(), sub_times.view(), sfreqs, si as f64, params,
-            )
+            );
+            if let Some(cb) = progress_cb {
+                let n = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                cb(n, n_segs_total);
+            }
+            r
         })
         .collect();
 
@@ -801,7 +809,7 @@ mod tests {
         };
 
         let (peaks, labels) = extract_tfpeaks(
-            spect.view(), stimes.view(), sfreqs.view(), None, &params,
+            spect.view(), stimes.view(), sfreqs.view(), None, &params, None,
         ).expect("extract_tfpeaks failed");
 
         // Shape matches the input spect.

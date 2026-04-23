@@ -116,6 +116,12 @@ pub struct ExtractTfpeaksIn {
     /// keep 0 on watershed lines). 5 = pydynamo default (skimage-style
     /// fill so regions touch directly).
     pub expand_labels_distance: u32,
+    /// Optional progress callback invoked once per completed segment.
+    /// Signature: `fn(segments_done: u32, segments_total: u32)`. Pass
+    /// `NULL` / `None` to skip. Called from rayon worker threads, but
+    /// dynamo_extract_tfpeaks serializes calls with an internal mutex
+    /// so the C callee may assume it is never invoked concurrently.
+    pub progress_cb: Option<extern "C" fn(u32, u32)>,
 }
 
 /// Output descriptor for [`dynamo_extract_tfpeaks`].
@@ -292,8 +298,23 @@ pub unsafe extern "C" fn dynamo_extract_tfpeaks(
             expand_labels_distance: input.expand_labels_distance,
         };
 
+        // Wrap the optional C callback in a Sync closure guarded by a
+        // mutex. Rayon workers may call it concurrently; the mutex
+        // ensures only one call reaches the C side at a time (MATLAB's
+        // mexPrintf is not thread-safe).
+        let progress_boxed: Option<Box<dyn Fn(u32, u32) + Sync + Send>> =
+            input.progress_cb.map(|cb| {
+                let m = std::sync::Mutex::new(());
+                Box::new(move |d, t| {
+                    let _g = m.lock().unwrap();
+                    cb(d, t);
+                }) as Box<dyn Fn(u32, u32) + Sync + Send>
+            });
+        let progress_ref: Option<&(dyn Fn(u32, u32) + Sync)> =
+            progress_boxed.as_deref().map(|b| b as &(dyn Fn(u32, u32) + Sync));
+
         let (peaks, labels) = match crate::extract_pipeline::extract_tfpeaks(
-            spect_view, stimes_view, sfreqs_view, baseline_view, &params,
+            spect_view, stimes_view, sfreqs_view, baseline_view, &params, progress_ref,
         ) {
             Ok(p) => p,
             Err(_) => return ErrorCode::KernelError.code(),
