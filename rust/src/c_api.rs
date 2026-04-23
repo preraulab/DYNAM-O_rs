@@ -868,6 +868,7 @@ mod tests {
             freq_max: 40.0,
             ht_db_min: 7.63,
             expand_labels_distance: 5,
+            progress_cb: None,
         };
         let mut out = empty_extract_out();
         unsafe {

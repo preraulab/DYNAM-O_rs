@@ -26,6 +26,7 @@ pub mod io;
 pub mod mask;
 pub mod matlab_watershed;
 pub mod merge;
+pub mod peak_assign;
 pub mod refine;
 pub mod signal;
 pub mod trim;
