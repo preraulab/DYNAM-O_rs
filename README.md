@@ -9,7 +9,7 @@ This crate is the Rust core shared by:
 
 - **[DYNAM-O](https://github.com/preraulab/DYNAM-O)** — MATLAB toolbox. The `backend='rust'` path calls `dynamo_rs` via MEX wrappers (`DYNAMO_dev/rust_bridge/`).
 - **[pyDYNAM-O](https://github.com/preraulab/DYNAM-O_py)** — Python port. Uses `dynamo_rs` via PyO3 bindings.
-- **[DYNAM-O_toolbox](https://github.com/prerau/DYNAM-O_toolbox)** — parent meta-repo that pins all three as git submodules.
+- **[DYNAM-O_toolbox](https://github.com/preraulab/DYNAM-O_toolbox)** — parent meta-repo that pins all three as git submodules.
 
 ---
 
