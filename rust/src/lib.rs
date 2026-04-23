@@ -134,6 +134,27 @@ mod python {
         Ok(out.into_pyarray_bound(py))
     }
 
+    /// matlab_paint_labels(labels) -> int64 labels (same shape)
+    ///
+    /// Port of MATLAB `extractTFPeaks.m:272` + `Ldata2graph.m:233`: for each
+    /// label in ascending order, 8-connectivity 1-pixel dilate its pixels
+    /// and paint the *dense* 1..N cell index into the output. Higher labels
+    /// overwrite lower on overlap (MATLAB-exact). Zero stays background.
+    ///
+    /// This replaces `skimage.segmentation.expand_labels(distance=5)` as
+    /// the border-fill step so that pydynamo's pass-2 count matches
+    /// MATLAB's ~0.8% peak-drift target (instead of skimage's ~+2%).
+    /// Input must be 2D int64 C-contiguous; output is int64 same shape.
+    #[pyfunction]
+    fn matlab_paint_labels<'py>(
+        py: Python<'py>,
+        labels: PyReadonlyArray2<'py, i64>,
+    ) -> PyResult<Bound<'py, PyArray2<i64>>> {
+        let arr = labels.as_array();
+        let out = super::extract_pipeline::matlab_paint_labels_in_order(arr);
+        Ok(out.into_pyarray_bound(py))
+    }
+
     /// compute_baseline(spect, stimes, t_data, baseline_exclude, baseline_range, baseline_ptile)
     /// → (F, 1) float64 baseline
     ///
@@ -516,6 +537,7 @@ mod python {
         m.add_function(wrap_pyfunction!(merge_segment_with_borders, m)?)?;
         m.add_function(wrap_pyfunction!(trim_regions, m)?)?;
         m.add_function(wrap_pyfunction!(matlab_watershed, m)?)?;
+        m.add_function(wrap_pyfunction!(matlab_paint_labels, m)?)?;
         m.add_function(wrap_pyfunction!(compute_baseline, m)?)?;
         m.add_function(wrap_pyfunction!(subtract_baseline, m)?)?;
         m.add_function(wrap_pyfunction!(mask_spectrogram, m)?)?;

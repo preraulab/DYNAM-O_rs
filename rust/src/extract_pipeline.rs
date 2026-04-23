@@ -152,8 +152,7 @@ fn resize_labels_nn(labels: ArrayView2<i64>, oh: usize, ow: usize) -> Array2<i64
 /// CRITICAL: uses DENSE 1..N indexing, matching MATLAB's cell index paint.
 /// If we use sparse original labels from Rust merge, regionprops counts
 /// unique-value-regions differently and produces +/-272 peak-count drift.
-#[allow(dead_code)]
-fn matlab_paint_labels_in_order(labels: ArrayView2<i64>) -> Array2<i64> {
+pub fn matlab_paint_labels_in_order(labels: ArrayView2<i64>) -> Array2<i64> {
     let (h, w) = labels.dim();
     let mut out = Array2::<i64>::zeros((h, w));
     if h == 0 || w == 0 {
