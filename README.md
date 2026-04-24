@@ -18,19 +18,29 @@ This crate is the Rust core shared by:
 
 ## Accuracy vs MATLAB reference
 
-Measured end-to-end against `runDYNAMO('night', 'backend', 'matlab')` on the
-bundled example recording:
+Measured head-to-head on the bundled night recording, 2026-04-24, M-series
+8-core, warm MATLAB R2025b, Rust release build (fat LTO + codegen-units=1):
 
-| Metric | Rust (`dynamo_rs`) | MATLAB (reference) | Δ |
+| Stage | `backend='matlab'` | `backend='rust'` | Speedup |
 |---|---:|---:|---:|
-| Full-night peak count | 34 511 | 34 788 | **−0.80 %** |
-| Full-night wallclock (M3, 8-core) | ~30 s | ~125 s | **4.2× speedup** |
-| SO-power histogram cosine similarity | — | — | **0.999** |
-| SO-phase histogram cosine similarity | — | — | **0.996** |
+| **Total `runDYNAMO('night')`** | **149.86 s** | **36.68 s** | **4.08×** |
+| Combined Rust extract (pass 1 + 2) | 123.87 s | 15.57 s | **7.96×** |
+| Extract pass 1 | 86.71 s | 10.02 s | 8.65× |
+| Extract pass 2 | 37.17 s | 5.54 s | 6.71× |
+| Peak refinement | 3.43 s | 0.30 s | 11.4× |
+| Histogram binning (SO-power + SO-phase) | 0.26 s | 0.23 s | 1.1× (both MEX via `tfpeak_histogram_mex`) |
 
-The remaining −0.8 % peak-count gap is a subtle label-assignment-order
-difference in the merge step (pixel sets of painted regions match 100 %; it
-only shifts ~270 peaks across the bandwidth/duration filter cutoffs).
+| Peak count | `backend='matlab'` | `backend='rust'` | Δ |
+|---|---:|---:|---:|
+| Pass 1 (post-rejection) | 56 503 | 59 473 | Rust +5.3% |
+| **Pass 2 (post-rejection, = final)** | **36 656** | **36 312** | **Rust −0.94%** |
+
+The final **−0.94 % peak-count gap** is the same ~−0.8 % measured historically
+— label-assignment-order in the merge step (pixel sets of painted regions
+match 100 %; differences push a small fraction of peaks across the
+bandwidth/duration filter cutoffs). Pass 1 diverges more because watershed
+border tie-breaking differs between MATLAB IPT and `matlab_watershed.rs`,
+but the pass-2 mask absorbs most of that and the two paths converge.
 
 ### Recent refinements (2026-04-24)
 
