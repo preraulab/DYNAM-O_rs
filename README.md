@@ -19,16 +19,22 @@ This crate is the Rust core shared by:
 ## Accuracy vs MATLAB reference
 
 Measured head-to-head on the bundled night recording, 2026-04-24, M-series
-8-core, warm MATLAB R2025b, Rust release build (fat LTO + codegen-units=1):
+8-core, warm MATLAB R2025b, Rust release build (fat LTO + codegen-units=1).
 
-| Stage | `backend='matlab'` | `backend='rust'` | Speedup |
+**Backend contract:** `backend='matlab'` is a pure-MATLAB reference
+implementation (except for the bundled `multitaper_spectrogram_mex`, which
+predates the rust_bridge work). All four Rust-backed MEX wrappers
+(`extract_tfpeaks_mex`, `mask_spectrogram_mex`, `refine_peaks_mex`,
+`tfpeak_histogram_mex`) are gated behind `backend='rust'`.
+
+| Stage | `backend='matlab'` (pure MATLAB) | `backend='rust'` (MEX) | Speedup |
 |---|---:|---:|---:|
-| **Total `runDYNAMO('night')`** | **149.86 s** | **36.68 s** | **4.08×** |
-| Combined Rust extract (pass 1 + 2) | 123.87 s | 15.57 s | **7.96×** |
-| Extract pass 1 | 86.71 s | 10.02 s | 8.65× |
-| Extract pass 2 | 37.17 s | 5.54 s | 6.71× |
-| Peak refinement | 3.43 s | 0.30 s | 11.4× |
-| Histogram binning (SO-power + SO-phase) | 0.26 s | 0.23 s | 1.1× (both MEX via `tfpeak_histogram_mex`) |
+| **Total `runDYNAMO('night')`** | **~153 s** | **~36.7 s** | **~4.2×** |
+| Combined Rust extract (pass 1 + 2) | 123.9 s | 15.6 s | **~8×** |
+| Extract pass 1 | 86.7 s | 10.0 s | 8.7× |
+| Extract pass 2 | 37.2 s | 5.5 s | 6.7× |
+| Peak refinement | 3.4 s | 0.3 s | 11.4× |
+| Histogram binning (SO-power + SO-phase) | 3.5 s (pure-MATLAB loop) | 0.23 s (MEX) | ~15× |
 
 | Peak count | `backend='matlab'` | `backend='rust'` | Δ |
 |---|---:|---:|---:|
