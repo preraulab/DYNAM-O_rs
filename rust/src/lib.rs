@@ -16,6 +16,7 @@
 //!   weight = max(w_ij, w_ji)
 
 pub mod adjacency;
+pub mod artifacts;
 pub mod baseline;
 pub mod c_api;
 pub mod extract_pipeline;
@@ -300,6 +301,53 @@ mod python {
             a_phase.into_any(), a_times.into_any(), a_stages.into_any(), a_filt.into_any(),
         ]);
         Ok(tup.unbind())
+    }
+
+    /// detect_artifacts(data, fs, hf_pass, hf_crit, bb_pass, bb_crit,
+    ///                   hf_detrend, bb_detrend, zscore_method,
+    ///                   smooth_duration, detrend_duration, buffer_duration)
+    ///   → (N,) bool mask
+    ///
+    /// Port of pydynamo `detect_artifacts(..., slope_test=False)` and the
+    /// corresponding MATLAB detect_artifacts.m (slope-test branch disabled).
+    /// Default params match pydynamo's defaults.
+    #[pyfunction]
+    #[pyo3(signature = (
+        data, fs,
+        hf_pass=35.0, hf_crit=5.5, bb_pass=0.1, bb_crit=5.5,
+        hf_detrend=true, bb_detrend=true, zscore_method="robust",
+        smooth_duration=2.0, detrend_duration=300.0, buffer_duration=0.0,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn detect_artifacts<'py>(
+        py: Python<'py>,
+        data: PyReadonlyArray1<'py, f64>,
+        fs: f64,
+        hf_pass: f64, hf_crit: f64, bb_pass: f64, bb_crit: f64,
+        hf_detrend: bool, bb_detrend: bool,
+        zscore_method: &str,
+        smooth_duration: f64, detrend_duration: f64, buffer_duration: f64,
+    ) -> PyResult<Bound<'py, numpy::PyArray1<bool>>> {
+        use super::artifacts::{detect_artifacts as rs_fn, ArtifactOpts, ZScoreMethod};
+        let zm = match zscore_method.to_ascii_lowercase().as_str() {
+            "robust" => ZScoreMethod::Robust,
+            "standard" => ZScoreMethod::Standard,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "zscore_method must be 'robust' or 'standard', got {:?}",
+                    other
+                )));
+            }
+        };
+        let opts = ArtifactOpts {
+            hf_pass, hf_crit, bb_pass, bb_crit,
+            hf_detrend, bb_detrend,
+            smooth_duration, detrend_duration, buffer_duration,
+            zscore_method: zm,
+        };
+        let vec = data.as_array().to_owned().into_raw_vec();
+        let out = rs_fn(&vec, fs, &opts);
+        Ok(numpy::ndarray::Array1::from(out).into_pyarray_bound(py))
     }
 
     /// build_baseline_exclude(t_data, stage_times, stage_vals, baseline_stages,
@@ -722,6 +770,7 @@ mod python {
         m.add_function(wrap_pyfunction!(so_power_from_spectrogram, m)?)?;
         m.add_function(wrap_pyfunction!(so_phase_from_eeg, m)?)?;
         m.add_function(wrap_pyfunction!(build_baseline_exclude, m)?)?;
+        m.add_function(wrap_pyfunction!(detect_artifacts, m)?)?;
         m.add_function(wrap_pyfunction!(compute_baseline, m)?)?;
         m.add_function(wrap_pyfunction!(subtract_baseline, m)?)?;
         m.add_function(wrap_pyfunction!(mask_spectrogram, m)?)?;
