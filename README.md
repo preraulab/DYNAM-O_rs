@@ -18,8 +18,10 @@ This crate is the Rust core shared by:
 
 ## Accuracy vs MATLAB reference
 
-Measured head-to-head on the bundled night recording, 2026-04-24, M-series
-8-core, warm MATLAB R2025b, Rust release build (fat LTO + codegen-units=1).
+Measured head-to-head on the bundled night recording via
+`benchmark_runDYNAMO` (warm, 3-trial median per backend), 2026-04-24
+on an M3 8-core, MATLAB R2025b, Rust release build (fat LTO +
+codegen-units = 1). Committed JSON at
 
 **Backend contract:** `backend='matlab'` is a pure-MATLAB reference
 implementation (except for the bundled `multitaper_spectrogram_mex`, which
@@ -29,24 +31,27 @@ predates the rust_bridge work). All four Rust-backed MEX wrappers
 
 | Stage | `backend='matlab'` (pure MATLAB) | `backend='rust'` (MEX) | Speedup |
 |---|---:|---:|---:|
-| **Total `runDYNAMO('night')`** | **~153 s** | **~36.7 s** | **~4.2×** |
-| Combined Rust extract (pass 1 + 2) | 123.9 s | 15.6 s | **~8×** |
-| Extract pass 1 | 86.7 s | 10.0 s | 8.7× |
-| Extract pass 2 | 37.2 s | 5.5 s | 6.7× |
-| Peak refinement | 3.4 s | 0.3 s | 11.4× |
-| Histogram binning (SO-power + SO-phase) | 3.5 s (pure-MATLAB loop) | 0.23 s (MEX) | ~15× |
+| **Total `runDYNAMO('night')`** | **163.5 s** | **34.8 s** | **4.70×** |
+| Combined Rust extract (pass 1 + 2) | 144.9 s | 16.1 s | **9.0×** |
+| Extract pass 1 | 100.7 s | 10.2 s | 9.8× |
+| Extract pass 2 | 44.2 s | 5.9 s | 7.5× |
+| Peak refinement | 0.9 s (warm parfor) | 0.3 s | 2.8× |
+| Histogram binning (SO-power + SO-phase) | ~3.5 s (pure-MATLAB loop) | 0.23 s (MEX) | ~15× |
 
 | Peak count | `backend='matlab'` | `backend='rust'` | Δ |
 |---|---:|---:|---:|
-| Pass 1 (post-rejection) | 56 503 | 59 473 | Rust +5.3% |
-| **Pass 2 (post-rejection, = final)** | **36 656** | **36 312** | **Rust −0.94%** |
+| Pass 1 (raw) | 65 829 | 70 115 | Rust +6.5% |
+| **Pass 2 (final, post-rejection)** | **34 788** | **34 579** | **Rust −0.60%** |
 
-The final **−0.94 % peak-count gap** is the same ~−0.8 % measured historically
-— label-assignment-order in the merge step (pixel sets of painted regions
-match 100 %; differences push a small fraction of peaks across the
-bandwidth/duration filter cutoffs). Pass 1 diverges more because watershed
-border tie-breaking differs between MATLAB IPT and `matlab_watershed.rs`,
-but the pass-2 mask absorbs most of that and the two paths converge.
+The final **−0.60 % peak-count gap** is tighter than the historical
+~−0.8 %, reflecting the edge-peak refine + `trim_shift` global-min fixes
+landed 2026-04-24 (both pull Rust toward MATLAB's retention behaviour).
+The remaining gap is watershed border tie-breaking between MATLAB's IPT
+implementation and `matlab_watershed.rs` — pixel sets of painted regions
+match 100 %, but a handful of peaks land on opposite sides of the
+bandwidth/duration filter cutoffs. Pass 1 diverges more (Rust +6.5 %)
+because pass-1 sees raw watershed output; the pass-2 mask absorbs most
+of that, and the two paths converge.
 
 ### Recent refinements (2026-04-24)
 
