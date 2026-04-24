@@ -405,7 +405,7 @@ pub unsafe extern "C" fn dynamo_refine_peaks(
             Some(s) => s,
             None => return ErrorCode::NullPointer.code(),
         };
-        let _pf = match ptr_as_slice::<f64>(peak_freq, n) {
+        let pf = match ptr_as_slice::<f64>(peak_freq, n) {
             Some(s) => s,
             None => return ErrorCode::NullPointer.code(),
         };
@@ -455,10 +455,27 @@ pub unsafe extern "C" fn dynamo_refine_peaks(
             1000,
             true,
         );
+        // Edge-peak exclusion — match MATLAB refinePeakFrequency.m:141
+        // behavior. MATLAB skips peaks whose center is within window_size/2
+        // of data[0] or data[end] (a partial window would need zero-padding
+        // and produce a distorted Hann-PSD → biased refined frequency).
+        // Those peaks are kept at their original (pass-2 bbox-centroid)
+        // PeakFrequency. We mirror that here rather than returning NaN or
+        // the zero-padded Hann refine output.
+        let data_t_end = if n_data > 0 { (n_data - 1) as f64 / fs } else { 0.0 };
+        let edge_margin = window_size * 0.5;
+        let t_lo = edge_margin;                 // t0 = 0.0 (caller pre-shifts)
+        let t_hi = data_t_end - edge_margin;
         for i in 0..n {
-            let v = refined[i];
-            out_freq[i] = v;
-            out_k[i] = if v.is_finite() { 1 } else { 0 };
+            let is_edge = !(pt[i] > t_lo && pt[i] < t_hi);
+            if is_edge {
+                out_freq[i] = pf[i];            // keep original, unrefined
+                out_k[i] = 1;                   // retained (not dropped)
+            } else {
+                let v = refined[i];
+                out_freq[i] = v;
+                out_k[i] = if v.is_finite() { 1 } else { 0 };
+            }
         }
         ErrorCode::Ok.code()
     }));
