@@ -302,6 +302,40 @@ mod python {
         Ok(tup.unbind())
     }
 
+    /// build_baseline_exclude(t_data, stage_times, stage_vals, baseline_stages,
+    ///                        artifacts, user_exclude=None) -> (N,) bool
+    ///
+    /// OR together (explicit_exclude, stage_not_in_baseline_stages, artifacts).
+    /// Matches pydynamo pipeline.py:123-129.
+    #[pyfunction]
+    #[pyo3(signature = (
+        t_data, stage_times, stage_vals, baseline_stages, artifacts,
+        user_exclude=None,
+    ))]
+    fn build_baseline_exclude<'py>(
+        py: Python<'py>,
+        t_data: PyReadonlyArray1<'py, f64>,
+        stage_times: PyReadonlyArray1<'py, f64>,
+        stage_vals: PyReadonlyArray1<'py, f64>,
+        baseline_stages: PyReadonlyArray1<'py, f64>,
+        artifacts: PyReadonlyArray1<'py, bool>,
+        user_exclude: Option<PyReadonlyArray1<'py, bool>>,
+    ) -> PyResult<Bound<'py, numpy::PyArray1<bool>>> {
+        let t = t_data.as_array().to_owned().into_raw_vec();
+        let st = stage_times.as_array().to_owned().into_raw_vec();
+        let sv = stage_vals.as_array().to_owned().into_raw_vec();
+        let bs = baseline_stages.as_array().to_owned().into_raw_vec();
+        let art: Vec<bool> = artifacts.as_array().iter().copied().collect();
+        let ue_vec: Option<Vec<bool>> = user_exclude
+            .as_ref()
+            .map(|ue| ue.as_array().iter().copied().collect());
+        let out = super::baseline::build_baseline_exclude(
+            &t, &st, &sv, &bs, &art, ue_vec.as_deref(),
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        Ok(numpy::ndarray::Array1::from(out).into_pyarray_bound(py))
+    }
+
     /// compute_baseline(spect, stimes, t_data, baseline_exclude, baseline_range, baseline_ptile)
     /// → (F, 1) float64 baseline
     ///
@@ -687,6 +721,7 @@ mod python {
         m.add_function(wrap_pyfunction!(matlab_paint_labels, m)?)?;
         m.add_function(wrap_pyfunction!(so_power_from_spectrogram, m)?)?;
         m.add_function(wrap_pyfunction!(so_phase_from_eeg, m)?)?;
+        m.add_function(wrap_pyfunction!(build_baseline_exclude, m)?)?;
         m.add_function(wrap_pyfunction!(compute_baseline, m)?)?;
         m.add_function(wrap_pyfunction!(subtract_baseline, m)?)?;
         m.add_function(wrap_pyfunction!(mask_spectrogram, m)?)?;
