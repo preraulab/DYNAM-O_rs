@@ -29,6 +29,7 @@ pub mod matlab_watershed;
 pub mod mts;
 pub mod merge;
 pub mod peak_assign;
+pub mod pipeline;
 pub mod refine;
 pub mod signal;
 pub mod so_phase;
