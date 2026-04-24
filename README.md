@@ -1,15 +1,18 @@
 # DYNAM-O_rs
 
-Pure Rust implementation of the hot kernels for [DYNAM-O](https://github.com/preraulab/DYNAM-O) —
-TF-peak extraction (double watershed + merge + MATLAB-paint border + trim +
-Hann refinement), SO-power / SO-phase histograms, artifact-detection
-primitives, and EDF / staging I/O.
+Pure Rust implementation of the DYNAM-O pipeline — TF-peak extraction (double
+watershed + merge + MATLAB-paint border + trim + Hann refinement), SO-power
+and SO-phase time-series + 2D histograms, two-band artifact detection,
+baseline subtraction, peak-stage/SO assignment, and EDF / staging I/O. Ships
+as a library, a C ABI for MATLAB MEX, a PyO3 extension for pydynamo, and a
+standalone `dynamo` CLI binary.
 
 This crate is the Rust core shared by:
 
 - **[DYNAM-O](https://github.com/preraulab/DYNAM-O)** — MATLAB toolbox. The `backend='rust'` path calls `dynamo_rs` via MEX wrappers (`DYNAMO_dev/rust_bridge/`).
 - **[pyDYNAM-O](https://github.com/preraulab/DYNAM-O_py)** — Python port. Uses `dynamo_rs` via PyO3 bindings.
 - **[DYNAM-O_toolbox](https://github.com/preraulab/DYNAM-O_toolbox)** — parent meta-repo that pins all three as git submodules.
+- **Standalone `dynamo` CLI** — native binary, no MATLAB or Python dependency at runtime. See *CLI usage* below.
 
 ---
 
@@ -51,6 +54,7 @@ rust/
   src/
     lib.rs                # Rust API + PyO3 wrappers (behind `python` feature)
     c_api.rs              # extern "C" surface for MEX wrappers + cbindgen
+    pipeline.rs           # top-level run_extract_from_spectrogram + write_stats_csv
     extract_pipeline.rs   # full extract (watershed+merge+paint+trim+stats)
     matlab_watershed.rs   # IPT-compatible watershed port (Vincent-Soille)
     merge.rs              # region adjacency graph + iterative merge
@@ -58,12 +62,18 @@ rust/
     mask.rs               # pass-2 spectrogram masking
     refine.rs             # Hann-window peak-frequency refinement
     histogram.rs          # SO-power / SO-phase 2D histogram accumulator
-    baseline.rs           # percentile-based baseline subtraction
+    baseline.rs           # percentile-based baseline + build_baseline_exclude helper
+    so_power.rs           # SO-power time-series pipeline (post-MTS)
+    so_phase.rs           # SO-phase time-series (filter+hilbert+unwrap)
+    peak_assign.rs        # per-peak stage / SO-power / SO-phase interpolation
+    artifacts.rs          # two-band artifact detection (HF + BB, robust z-score)
+    mts.rs                # thin wrapper around `multitaper_rs` crate
     signal.rs             # sosfiltfilt, hilbert, unwrap, movmean
-    filter_cache.rs       # SOphase SOS cache (.npy) + sci-rs fallback
+    filter_cache.rs       # SOphase SOS cache (.npy) + cheby1 fallback
+    filter_design.rs      # cheby1_sos (ported from scipy.signal.cheby1)
     adjacency.rs          # region adjacency utilities
     io/                   # edf, staging
-    pipeline/             # artifacts, baseline, dpss, spectrogram (WIP)
+    bin/dynamo.rs         # CLI entry point (`cargo build --bin dynamo`)
   include/
     dynamo_rs.h           # cbindgen-generated C header
 data_matlab_filters/      # 43 pre-computed SOphase SOS filters (.npy)
@@ -101,6 +111,29 @@ maturin develop --release --features python
 Produces `dynamo_rs*.whl`. Pydynamo's optional `import dynamo_rs` gate picks
 it up automatically when available.
 
+### As a standalone CLI (no MATLAB or Python needed)
+
+```bash
+cd rust
+cargo build --release --bin dynamo
+./target/release/dynamo extract \
+    --spect  spect.npy  \
+    --stimes stimes.npy \
+    --sfreqs sfreqs.npy \
+    --out    stats.csv
+```
+
+Currently covers the "from-spectrogram" slice: given a pre-computed
+multitaper spectrogram as three `.npy` files, run the watershed / merge /
+trim / region-props / filter pipeline and write a CSV with the same columns
+as MATLAB's `stats_table`. Full EDF-to-CSV (multitaper + baseline + refine +
+histograms) is follow-up work; the library primitives are all in place, the
+CLI just needs stitching.
+
+Defaults match `runDYNAMO`: `seg_time=30`, `downsample=(2,2)`,
+`merge_thresh=11`, `trim_vol=0.8`, `dur_min=0.5`, `bw_min=2`, etc. All
+overridable via flags.
+
 ### Regenerate the C header manually
 
 The `build.rs` script invokes `cbindgen` on every `cargo build`. If you need
@@ -117,8 +150,9 @@ cargo run --bin cbindgen -- --output include/dynamo_rs.h
 | Client | How it links | Entry points |
 |---|---|---|
 | **MATLAB MEX** (`DYNAMO_dev/rust_bridge/`) | Classic-C MEX `.c` files link `-ldynamo_rs` at build, load the dylib at runtime via `dlopen` (macOS embeds rpath) | `dynamo_extract_tfpeaks`, `dynamo_mask_spectrogram`, `dynamo_refine_peaks`, `dynamo_tfpeak_histogram` — in `src/c_api.rs` |
-| **Python** (`pydynamo`) | PyO3 extension (`maturin build --features python`) | `matlab_watershed`, `merge_segment`, `trim_regions`, `mask_spectrogram`, `subtract_baseline`, `hann_event_spectra`, `refine_from_spectra`, `tfpeak_histogram`, … — in `src/lib.rs` under `#[pyfunction]` |
+| **Python** (`pydynamo`) | PyO3 extension (`maturin build --features python`) | `matlab_watershed`, `matlab_paint_labels`, `merge_segment`, `trim_regions`, `mask_spectrogram`, `compute_baseline`, `build_baseline_exclude`, `subtract_baseline`, `so_power_from_spectrogram`, `so_phase_from_eeg`, `detect_artifacts`, `hann_event_spectra`, `refine_from_spectra`, `tfpeak_histogram`, `hilbert`, `sosfiltfilt`, `movmean`, `unwrap`, … — in `src/lib.rs` under `#[pyfunction]` |
 | **Rust** | `Cargo.toml` path or git dep | Public Rust items in `src/lib.rs` |
+| **Standalone CLI** | `cargo build --release --bin dynamo` | `dynamo extract --spect ... --out stats.csv` — in `src/bin/dynamo.rs` |
 
 ---
 
