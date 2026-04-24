@@ -617,15 +617,25 @@ pub unsafe extern "C" fn dynamo_tfpeak_histogram(
             None => return ErrorCode::NullPointer.code(),
         };
 
-        for (i, &v) in out.c_mat.iter().enumerate() {
-            cmat_ptr[i] = v;
+        // MATLAB MEX allocates all 2-D outputs as COLUMN-major
+        // (mxCreateDoubleMatrix). ndarray's Array2 default is row-major,
+        // and `.iter()` walks row-major, so copy via explicit index
+        // transpose. This bug caused striped histograms in TFPeakHistogram.m
+        // (2026-04-24): row-major writes were being read column-major,
+        // scrambling the (num_cbins, num_fbins) grid at period num_fbins.
+        for s in 0..num_cbins {
+            for f in 0..num_fbins {
+                cmat_ptr[f * num_cbins + s] = out.c_mat[[s, f]];
+            }
         }
-        for (i, &v) in out.time_in_bin.iter().enumerate() {
-            tib_ptr[i] = v;
+        // time_in_bin, prop_in_bin: shape (num_cbins, 5) — same fix.
+        for s in 0..num_cbins {
+            for k in 0..5 {
+                tib_ptr[k * num_cbins + s] = out.time_in_bin[[s, k]];
+                pib_ptr[k * num_cbins + s] = out.prop_in_bin[[s, k]];
+            }
         }
-        for (i, &v) in out.prop_in_bin.iter().enumerate() {
-            pib_ptr[i] = v;
-        }
+        // peak_at_freq: 1-D, no layout ambiguity.
         for (i, &v) in out.peak_at_freq.iter().enumerate() {
             paf_ptr[i] = v;
         }
