@@ -29,6 +29,7 @@ pub mod merge;
 pub mod peak_assign;
 pub mod refine;
 pub mod signal;
+pub mod so_phase;
 pub mod so_power;
 pub mod trim;
 
@@ -238,6 +239,65 @@ mod python {
         let tup = pyo3::types::PyTuple::new_bound(py, [
             arr_norm.into_any(), arr_times.into_any(), arr_stages.into_any(),
             ptile_obj.into_bound(py),
+        ]);
+        Ok(tup.unbind())
+    }
+
+    /// so_phase_from_eeg(eeg, eeg_times, isexcluded, sos, stage_times, stage_vals)
+    ///   → (so_phase_unwrapped, so_phase_times, so_phase_stages, filtdata)
+    ///
+    /// Port of computeSOphase.m / pydynamo compute_so_phase. Band-pass SOS
+    /// filter via sosfiltfilt → Hilbert analytic → atan2 → unwrap → NaN mask
+    /// at excluded samples → stage assign (previous-interp). Returns phase
+    /// **unwrapped** (wrapToPi applied downstream during binning).
+    ///
+    /// `sos` is shape (n_sections, 6) float64 in scipy order [b0 b1 b2 a0 a1 a2].
+    /// Use `dynamo_rs.get_sophase_sos(fs, band)` (or scipy's iirdesign) to
+    /// obtain it.
+    #[pyfunction]
+    fn so_phase_from_eeg<'py>(
+        py: Python<'py>,
+        eeg: PyReadonlyArray1<'py, f64>,
+        eeg_times: PyReadonlyArray1<'py, f64>,
+        isexcluded: PyReadonlyArray1<'py, bool>,
+        sos: PyReadonlyArray2<'py, f64>,
+        stage_times: PyReadonlyArray1<'py, f64>,
+        stage_vals: PyReadonlyArray1<'py, f64>,
+    ) -> PyResult<Py<pyo3::types::PyTuple>> {
+        let eeg_vec = eeg.as_array().to_owned().into_raw_vec();
+        let eeg_times_vec = eeg_times.as_array().to_owned().into_raw_vec();
+        let isexcluded_vec: Vec<bool> = isexcluded.as_array().iter().copied().collect();
+        let stage_times_vec = stage_times.as_array().to_owned().into_raw_vec();
+        let stage_vals_vec = stage_vals.as_array().to_owned().into_raw_vec();
+
+        let sos_arr = sos.as_array();
+        let (nsec, ncols) = sos_arr.dim();
+        if ncols != 6 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "sos must have 6 columns (scipy SOS format: [b0 b1 b2 a0 a1 a2]).",
+            ));
+        }
+        let sos_slice: Vec<[f64; 6]> = (0..nsec)
+            .map(|i| {
+                [
+                    sos_arr[[i, 0]], sos_arr[[i, 1]], sos_arr[[i, 2]],
+                    sos_arr[[i, 3]], sos_arr[[i, 4]], sos_arr[[i, 5]],
+                ]
+            })
+            .collect();
+
+        let out = super::so_phase::so_phase_from_eeg(
+            &eeg_vec, &eeg_times_vec, &isexcluded_vec, &sos_slice,
+            &stage_times_vec, &stage_vals_vec,
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+
+        let a_phase = numpy::ndarray::Array1::from(out.so_phase_unwrapped).into_pyarray_bound(py);
+        let a_times = numpy::ndarray::Array1::from(out.so_phase_times).into_pyarray_bound(py);
+        let a_stages = numpy::ndarray::Array1::from(out.so_phase_stages).into_pyarray_bound(py);
+        let a_filt = numpy::ndarray::Array1::from(out.filtdata).into_pyarray_bound(py);
+        let tup = pyo3::types::PyTuple::new_bound(py, [
+            a_phase.into_any(), a_times.into_any(), a_stages.into_any(), a_filt.into_any(),
         ]);
         Ok(tup.unbind())
     }
@@ -626,6 +686,7 @@ mod python {
         m.add_function(wrap_pyfunction!(matlab_watershed, m)?)?;
         m.add_function(wrap_pyfunction!(matlab_paint_labels, m)?)?;
         m.add_function(wrap_pyfunction!(so_power_from_spectrogram, m)?)?;
+        m.add_function(wrap_pyfunction!(so_phase_from_eeg, m)?)?;
         m.add_function(wrap_pyfunction!(compute_baseline, m)?)?;
         m.add_function(wrap_pyfunction!(subtract_baseline, m)?)?;
         m.add_function(wrap_pyfunction!(mask_spectrogram, m)?)?;
