@@ -32,6 +32,39 @@ The remaining −0.8 % peak-count gap is a subtle label-assignment-order
 difference in the merge step (pixel sets of painted regions match 100 %; it
 only shifts ~270 peaks across the bandwidth/duration filter cutoffs).
 
+### Recent refinements (2026-04-24)
+
+Four correctness + perf changes tightened parity and shaved extract time:
+
+1. **`trim_shift` parity** — `runSegmentedData.m` now passes the MATLAB
+   global `min(spect/baseline, [], 'all')` instead of NaN (which routed Rust
+   to its per-segment-min fallback). Both backends see the same shift.
+2. **Edge-peak refine** — peaks within `window_size/2` of data start/end
+   keep their pass-2 bbox-centroid `PeakFrequency` unchanged instead of
+   running the Hann refine on a zero-padded partial window (matches
+   `refinePeakFrequency.m:141`).
+3. **Heap-based merge loop** — `merge.rs` replaces two O(|E|) linear scans
+   per iteration (max-find + retain-filter-on-src) with a `BinaryHeap` +
+   lazy deletion via per-edge generation counters. Tie-break preserved via
+   insertion order (earliest-label-pair wins ties, matches MATLAB's
+   edge-index convention). ~3 % off extract on night.
+4. **`lto = "fat"` + `codegen-units = 1`** in the release profile — ~5 %
+   off extract from full cross-unit inlining + dead-code elim. Dylib
+   shrinks from 1.21 MB → 1.16 MB. Build time 14 s → 28 s.
+
+Net wall-clock on the bundled night fixture: total `runDYNAMO('night')`
+drops from 37.8 s to 36.5 s (−3.4 %); combined Rust extract (passes 1 + 2)
+drops from 15.5 s to 14.3 s (−7.9 %). Peak-count parity vs MATLAB reference
+is unchanged (still ~−0.8 %, dominated by merge tie-breaking not
+`trim_shift`).
+
+A separate fix unrelated to extract: `dynamo_tfpeak_histogram`'s C ABI
+copy-out was writing row-major into MATLAB-column-major buffers, producing
+~1 Hz striped SO-power / SO-phase histograms that crashed downstream
+`fitParamBasis`. Now bit-identical to the pure-MATLAB binning loop
+(`TFPeakHistogram.m`); warm MEX is 21 × faster than the MATLAB loop on
+5 k-peak / 101 c-bin / 151 f-bin fixtures.
+
 ---
 
 ## Crate layout
