@@ -87,6 +87,31 @@ copy-out was writing row-major into MATLAB-column-major buffers, producing
 (`TFPeakHistogram.m`); warm MEX is 21 × faster than the MATLAB loop on
 5 k-peak / 101 c-bin / 151 f-bin fixtures.
 
+### Recommended sampling frequency: 100 Hz
+
+DYNAM-O analyzes 0–30 Hz, so 100 Hz Nyquist covers everything the
+pipeline cares about. The multitaper-spectrogram NFFT is
+`2^nextpow2(Fs / mtm_dsfreqs)` (default `mtm_dsfreqs = 0.1`), so
+**Fs > 102.4 Hz** doubles NFFT and typically pushes the spectrogram
+past CPU L3 cache — every downstream stage (extract / baseline /
+mask / watershed / refine) takes a 2–3× memory-bandwidth hit on top
+of the doubled FFT cost.
+
+| Native Fs | NFFT | Spec stage cost vs 100 Hz |
+|---:|---:|---:|
+| ≤ 100 | 1024 | 1× |
+| 128, 200 | 2048 | ~2.2× |
+| 256 | 4096 | ~4.6× |
+| 500, 512 | 8192 | ~9.3× |
+| 1000 | 16384 | ~18× |
+
+Resample to 100 Hz before feeding `dynamo extract` / `dynamo_extract_tfpeaks`
+for ~2× end-to-end speedup with zero analytical loss for sleep oscillations.
+Empirical: 10.5 h × 128 Hz EDF goes from ~41 s → ~22 s on a 32-core
+Threadripper (Rust backend, full pipeline). The MATLAB FileManager has
+this enabled by default; CLI / pydynamo callers should pass already-
+resampled data. See [`DYNAMO_dev/rust_bridge/benchmarks/README.md`](https://github.com/preraulab/DYNAM-O_dev/blob/rust-bridge/rust_bridge/benchmarks/README.md) for the per-stage scaling analysis.
+
 ---
 
 ## Crate layout
