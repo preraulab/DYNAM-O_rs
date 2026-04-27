@@ -208,12 +208,12 @@ mod python {
             pyo3::exceptions::PyValueError::new_err("so_spect must be C-contiguous")
         })?;
 
-        let stimes_slice = stimes.as_array().to_owned().into_raw_vec();
-        let sfreqs_slice = sfreqs.as_array().to_owned().into_raw_vec();
-        let eeg_times_slice = eeg_times.as_array().to_owned().into_raw_vec();
+        let stimes_slice = stimes.as_array().to_owned().into_raw_vec_and_offset().0;
+        let sfreqs_slice = sfreqs.as_array().to_owned().into_raw_vec_and_offset().0;
+        let eeg_times_slice = eeg_times.as_array().to_owned().into_raw_vec_and_offset().0;
         let isexcluded_slice: Vec<bool> = isexcluded.as_array().iter().copied().collect();
-        let stage_times_slice = stage_times.as_array().to_owned().into_raw_vec();
-        let stage_vals_slice = stage_vals.as_array().to_owned().into_raw_vec();
+        let stage_times_slice = stage_times.as_array().to_owned().into_raw_vec_and_offset().0;
+        let stage_vals_slice = stage_vals.as_array().to_owned().into_raw_vec_and_offset().0;
 
         let nm = NormMethod::parse(norm_method).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
@@ -267,11 +267,11 @@ mod python {
         stage_times: PyReadonlyArray1<'py, f64>,
         stage_vals: PyReadonlyArray1<'py, f64>,
     ) -> PyResult<Py<pyo3::types::PyTuple>> {
-        let eeg_vec = eeg.as_array().to_owned().into_raw_vec();
-        let eeg_times_vec = eeg_times.as_array().to_owned().into_raw_vec();
+        let eeg_vec = eeg.as_array().to_owned().into_raw_vec_and_offset().0;
+        let eeg_times_vec = eeg_times.as_array().to_owned().into_raw_vec_and_offset().0;
         let isexcluded_vec: Vec<bool> = isexcluded.as_array().iter().copied().collect();
-        let stage_times_vec = stage_times.as_array().to_owned().into_raw_vec();
-        let stage_vals_vec = stage_vals.as_array().to_owned().into_raw_vec();
+        let stage_times_vec = stage_times.as_array().to_owned().into_raw_vec_and_offset().0;
+        let stage_vals_vec = stage_vals.as_array().to_owned().into_raw_vec_and_offset().0;
 
         let sos_arr = sos.as_array();
         let (nsec, ncols) = sos_arr.dim();
@@ -347,7 +347,7 @@ mod python {
             smooth_duration, detrend_duration, buffer_duration,
             zscore_method: zm,
         };
-        let vec = data.as_array().to_owned().into_raw_vec();
+        let vec = data.as_array().to_owned().into_raw_vec_and_offset().0;
         let out = rs_fn(&vec, fs, &opts);
         Ok(numpy::ndarray::Array1::from(out).into_pyarray_bound(py))
     }
@@ -371,10 +371,10 @@ mod python {
         artifacts: PyReadonlyArray1<'py, bool>,
         user_exclude: Option<PyReadonlyArray1<'py, bool>>,
     ) -> PyResult<Bound<'py, numpy::PyArray1<bool>>> {
-        let t = t_data.as_array().to_owned().into_raw_vec();
-        let st = stage_times.as_array().to_owned().into_raw_vec();
-        let sv = stage_vals.as_array().to_owned().into_raw_vec();
-        let bs = baseline_stages.as_array().to_owned().into_raw_vec();
+        let t = t_data.as_array().to_owned().into_raw_vec_and_offset().0;
+        let st = stage_times.as_array().to_owned().into_raw_vec_and_offset().0;
+        let sv = stage_vals.as_array().to_owned().into_raw_vec_and_offset().0;
+        let bs = baseline_stages.as_array().to_owned().into_raw_vec_and_offset().0;
         let art: Vec<bool> = artifacts.as_array().iter().copied().collect();
         let ue_vec: Option<Vec<bool>> = user_exclude
             .as_ref()

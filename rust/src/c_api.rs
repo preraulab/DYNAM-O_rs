@@ -31,7 +31,7 @@
 //! See [`ErrorCode`]. Zero = success; negative integers are well-defined
 //! errors. We never return positive codes.
 
-use ndarray::{Array2, ArrayView1, ArrayView2};
+use ndarray::{ArrayView1, ArrayView2};
 use std::os::raw::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::NonNull;
@@ -333,7 +333,7 @@ pub unsafe extern "C" fn dynamo_extract_tfpeaks(
         output.bounding_box = leak_vec_f64(peaks.bbox);
 
         // Concatenated (F, T) row-major label image, 1-based peak indices.
-        let labels_vec: Vec<i64> = labels.into_raw_vec();
+        let labels_vec: Vec<i64> = labels.into_raw_vec_and_offset().0;
         let n_label = labels_vec.len();
         output.labels = leak_vec_i64(labels_vec);
         output.n_label_elems = n_label;
