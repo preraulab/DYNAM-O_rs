@@ -29,7 +29,7 @@ function export_validation_segment(out_dir)
     %     full 4-arg signature (which returns timings as the 9th output).
     %     The 'segment' shortcut path routes through runExampleData which
     %     only returns 8 outputs. ---
-    % Force the DYNAMO_dev copy — there are other example_data.mat files
+    % Force the DYNAM-O_dev copy — there are other example_data.mat files
     % on the user's MATLAB path (e.g. TF_sigma_peaks_SLEEP2021) that use
     % different variable names (EEG/stages vs data/stage_vals).
     here = fileparts(which('runDYNAMO'));
