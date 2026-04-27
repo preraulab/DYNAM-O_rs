@@ -90,6 +90,15 @@ typedef struct ExtractTfpeaksIn {
  * Zero = background. Per-segment label images are stitched column-wise
  * with a running offset and then renumbered after the post-filter so
  * that surviving labels span `1..=n_peaks` densely.
+ *
+ * Variable-length per-peak data (`height_data`, `boundaries_xy`) is
+ * flattened with a CSR-style offset array of length `n_peaks + 1`:
+ *   * `height_data[height_data_offsets[i] .. height_data_offsets[i+1]]`
+ *     are the spectrogram values inside peak i (one per pixel).
+ *   * `boundaries_xy[2*boundary_offsets[i] .. 2*boundary_offsets[i+1]]`
+ *     are interleaved (time, freq) pairs along peak i's perimeter.
+ * Both offset arrays have length `n_peaks + 1` (always; even when n_peaks
+ * is 0 the array is `[0]`).
  */
 typedef struct ExtractTfpeaksOut {
   uintptr_t n_peaks;
@@ -103,6 +112,34 @@ typedef struct ExtractTfpeaksOut {
   double *bounding_box;
   int64_t *labels;
   uintptr_t n_label_elems;
+  /**
+   * Time-frequency area per peak (sec*Hz). Length n_peaks.
+   */
+  double *area;
+  /**
+   * Peakiness = Area * Height / Volume per peak. Length n_peaks.
+   */
+  double *peakiness;
+  /**
+   * Flattened per-peak pixel values; length `n_height_data_elems`.
+   */
+  double *height_data;
+  uintptr_t n_height_data_elems;
+  /**
+   * CSR offsets into `height_data`, length `n_peaks + 1`.
+   */
+  uint64_t *height_data_offsets;
+  /**
+   * Flattened per-peak boundary coords, interleaved (t, f). Length
+   * `2 * n_boundary_pixels`.
+   */
+  double *boundaries_xy;
+  uintptr_t n_boundary_pixels;
+  /**
+   * CSR offsets into `boundaries_xy` in PIXEL units (each pixel is two
+   * f64s). Length `n_peaks + 1`.
+   */
+  uint64_t *boundary_offsets;
 } ExtractTfpeaksOut;
 
 #ifdef __cplusplus
@@ -233,6 +270,12 @@ void dynamo_free_buffer_i64(int64_t *ptr, uintptr_t len);
  * See [`dynamo_free_buffer_f64`].
  */
 void dynamo_free_buffer_u8(uint8_t *ptr, uintptr_t len);
+
+/**
+ * See [`dynamo_free_buffer_f64`]. Used for the CSR offset arrays
+ * (`height_data_offsets`, `boundary_offsets`) returned in `ExtractTfpeaksOut`.
+ */
+void dynamo_free_buffer_u64(uint64_t *ptr, uintptr_t len);
 
 #ifdef __cplusplus
 }  // extern "C"

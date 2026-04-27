@@ -137,6 +137,15 @@ pub struct ExtractTfpeaksIn {
 /// Zero = background. Per-segment label images are stitched column-wise
 /// with a running offset and then renumbered after the post-filter so
 /// that surviving labels span `1..=n_peaks` densely.
+///
+/// Variable-length per-peak data (`height_data`, `boundaries_xy`) is
+/// flattened with a CSR-style offset array of length `n_peaks + 1`:
+///   * `height_data[height_data_offsets[i] .. height_data_offsets[i+1]]`
+///     are the spectrogram values inside peak i (one per pixel).
+///   * `boundaries_xy[2*boundary_offsets[i] .. 2*boundary_offsets[i+1]]`
+///     are interleaved (time, freq) pairs along peak i's perimeter.
+/// Both offset arrays have length `n_peaks + 1` (always; even when n_peaks
+/// is 0 the array is `[0]`).
 #[repr(C)]
 pub struct ExtractTfpeaksOut {
     pub n_peaks: usize,
@@ -150,6 +159,22 @@ pub struct ExtractTfpeaksOut {
     pub bounding_box: *mut f64, // n_peaks * 4
     pub labels: *mut i64,       // (n_freqs, n_times) row-major; 1-based peak indices
     pub n_label_elems: usize,   // = n_freqs * n_times (0 if spect was empty)
+    /// Time-frequency area per peak (sec*Hz). Length n_peaks.
+    pub area: *mut f64,
+    /// Peakiness = Area * Height / Volume per peak. Length n_peaks.
+    pub peakiness: *mut f64,
+    /// Flattened per-peak pixel values; length `n_height_data_elems`.
+    pub height_data: *mut f64,
+    pub n_height_data_elems: usize,
+    /// CSR offsets into `height_data`, length `n_peaks + 1`.
+    pub height_data_offsets: *mut u64,
+    /// Flattened per-peak boundary coords, interleaved (t, f). Length
+    /// `2 * n_boundary_pixels`.
+    pub boundaries_xy: *mut f64,
+    pub n_boundary_pixels: usize,
+    /// CSR offsets into `boundaries_xy` in PIXEL units (each pixel is two
+    /// f64s). Length `n_peaks + 1`.
+    pub boundary_offsets: *mut u64,
 }
 
 // -------------------------------------------------------------------------
@@ -172,6 +197,12 @@ fn leak_vec_i64(v: Vec<i64>) -> *mut i64 {
 }
 
 #[inline]
+fn leak_vec_u64(v: Vec<u64>) -> *mut u64 {
+    let boxed: Box<[u64]> = v.into_boxed_slice();
+    Box::into_raw(boxed) as *mut u64
+}
+
+#[inline]
 #[allow(dead_code)] // used by tests / future u8 outputs; kept alongside i64/f64 variants
 fn leak_vec_u8(v: Vec<u8>) -> *mut u8 {
     let boxed: Box<[u8]> = v.into_boxed_slice();
@@ -188,6 +219,13 @@ unsafe fn drop_leaked_f64(ptr: *mut f64, len: usize) {
 }
 
 unsafe fn drop_leaked_i64(ptr: *mut i64, len: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    let _ = Box::from_raw(slice::from_raw_parts_mut(ptr, len));
+}
+
+unsafe fn drop_leaked_u64(ptr: *mut u64, len: usize) {
     if ptr.is_null() {
         return;
     }
@@ -338,6 +376,43 @@ pub unsafe extern "C" fn dynamo_extract_tfpeaks(
         output.labels = leak_vec_i64(labels_vec);
         output.n_label_elems = n_label;
 
+        // Area, Peakiness — scalar per peak.
+        output.area = leak_vec_f64(peaks.area);
+        output.peakiness = leak_vec_f64(peaks.peakiness);
+
+        // HeightData: flatten Vec<Vec<f64>> into one buffer + CSR offsets.
+        let mut hd_offsets: Vec<u64> = Vec::with_capacity(np + 1);
+        hd_offsets.push(0);
+        let mut hd_total: usize = 0;
+        for v in &peaks.height_data {
+            hd_total += v.len();
+        }
+        let mut hd_flat: Vec<f64> = Vec::with_capacity(hd_total);
+        for v in peaks.height_data.into_iter() {
+            hd_flat.extend_from_slice(&v);
+            hd_offsets.push(hd_flat.len() as u64);
+        }
+        output.n_height_data_elems = hd_flat.len();
+        output.height_data = leak_vec_f64(hd_flat);
+        output.height_data_offsets = leak_vec_u64(hd_offsets);
+
+        // Boundaries: each Vec<f64> already interleaves (t, f) pairs. Offset
+        // unit is one *pair*, i.e., divide flat-len by 2.
+        let mut b_offsets: Vec<u64> = Vec::with_capacity(np + 1);
+        b_offsets.push(0);
+        let mut b_total: usize = 0;
+        for v in &peaks.boundaries_xy {
+            b_total += v.len();
+        }
+        let mut b_flat: Vec<f64> = Vec::with_capacity(b_total);
+        for v in peaks.boundaries_xy.into_iter() {
+            b_flat.extend_from_slice(&v);
+            b_offsets.push((b_flat.len() / 2) as u64);
+        }
+        output.n_boundary_pixels = b_flat.len() / 2;
+        output.boundaries_xy = leak_vec_f64(b_flat);
+        output.boundary_offsets = leak_vec_u64(b_offsets);
+
         ErrorCode::Ok.code()
     }));
 
@@ -360,6 +435,14 @@ fn empty_extract_out() -> ExtractTfpeaksOut {
         bounding_box: std::ptr::null_mut(),
         labels: std::ptr::null_mut(),
         n_label_elems: 0,
+        area: std::ptr::null_mut(),
+        peakiness: std::ptr::null_mut(),
+        height_data: std::ptr::null_mut(),
+        n_height_data_elems: 0,
+        height_data_offsets: std::ptr::null_mut(),
+        boundaries_xy: std::ptr::null_mut(),
+        n_boundary_pixels: 0,
+        boundary_offsets: std::ptr::null_mut(),
     }
 }
 
@@ -763,6 +846,13 @@ pub unsafe extern "C" fn dynamo_free_buffer_u8(ptr: *mut u8, len: usize) {
     drop_leaked_u8(ptr, len);
 }
 
+/// See [`dynamo_free_buffer_f64`]. Used for the CSR offset arrays
+/// (`height_data_offsets`, `boundary_offsets`) returned in `ExtractTfpeaksOut`.
+#[no_mangle]
+pub unsafe extern "C" fn dynamo_free_buffer_u64(ptr: *mut u64, len: usize) {
+    drop_leaked_u64(ptr, len);
+}
+
 // -------------------------------------------------------------------------
 // Tests
 // -------------------------------------------------------------------------
@@ -804,6 +894,14 @@ pub unsafe extern "C" fn dynamo_free_buffer_u8(ptr: *mut u8, len: usize) {
 //     bounding_box: std::ptr::null_mut(),
 //     labels: std::ptr::null_mut(),
 //     n_label_elems: 0,
+//     area: std::ptr::null_mut(),
+//     peakiness: std::ptr::null_mut(),
+//     height_data: std::ptr::null_mut(),
+//     n_height_data_elems: 0,
+//     height_data_offsets: std::ptr::null_mut(),
+//     boundaries_xy: std::ptr::null_mut(),
+//     n_boundary_pixels: 0,
+//     boundary_offsets: std::ptr::null_mut(),
 // };
 // unsafe {
 //     let rc = dynamo_extract_tfpeaks(&in_, &mut out);
@@ -818,6 +916,12 @@ pub unsafe extern "C" fn dynamo_free_buffer_u8(ptr: *mut u8, len: usize) {
 //     dynamo_free_buffer_f64(out.segment_num,  out.n_peaks);
 //     dynamo_free_buffer_f64(out.bounding_box, out.n_peaks * 4);
 //     dynamo_free_buffer_i64(out.labels,       out.n_label_elems);
+//     dynamo_free_buffer_f64(out.area,         out.n_peaks);
+//     dynamo_free_buffer_f64(out.peakiness,    out.n_peaks);
+//     dynamo_free_buffer_f64(out.height_data,  out.n_height_data_elems);
+//     dynamo_free_buffer_u64(out.height_data_offsets, out.n_peaks + 1);
+//     dynamo_free_buffer_f64(out.boundaries_xy, out.n_boundary_pixels * 2);
+//     dynamo_free_buffer_u64(out.boundary_offsets, out.n_peaks + 1);
 // }
 // ```
 
