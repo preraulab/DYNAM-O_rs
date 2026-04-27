@@ -321,8 +321,14 @@ const MOORE_NEW_C_DIR: [usize; 8] = [6, 6, 0, 0, 2, 2, 4, 4];
 /// are 8-adjacent, so plot()-as-polyline draws a closed perimeter rather
 /// than the sawtooth that column-major scan order produces.
 ///
-/// Jacob's stopping criterion: stop when we revisit `start` with the same
-/// backtrack as the initial. Includes a step cap as a safety net.
+/// Stopping rule (Pavlidis / Jacob's, "about to repeat first move"):
+/// after entering the loop we record the very first move taken from start;
+/// thereafter, whenever we're back at start AND the next move would equal
+/// the first-recorded move, we've completed a full circuit. This handles
+/// concave shapes (L, U, …) correctly — a naive "same backtrack on revisit"
+/// check fails on those because the trace can revisit start with a
+/// different c_dir mid-circuit, then run away. A `max_steps` cap is kept
+/// as a defense-in-depth net.
 fn moore_trace(
     labels: ArrayView2<i64>,
     lbl: i64,
@@ -343,35 +349,49 @@ fn moore_trace(
     }
 
     let mut b = s;
-    let mut c_dir: usize = 0; // West
-    let initial_c_dir = c_dir;
+    let mut c_dir: usize = 0; // West (guaranteed OOR for column-major-first start)
 
-    // Cap = perimeter length × small constant. 8 * area is a generous bound
-    // (perimeter ≤ 4·side ≤ 4·sqrt(area), but skinny shapes can have
-    // perimeter ≈ 2·area; 8·area still safe).
-    let max_steps = h.saturating_mul(w).saturating_mul(8) + 16;
-    for _ in 0..max_steps {
-        // Scan 8 neighbors clockwise starting one past the backtrack.
-        let mut move_idx: Option<usize> = None;
+    // Find the first in-region neighbor scanning clockwise from c_dir+1.
+    let scan = |b: (i32, i32), c_dir: usize| -> Option<usize> {
         for k in 1..=8 {
             let idx = (c_dir + k) % 8;
             let (dr, dc) = MOORE_DIRS[idx];
             if in_rgn(b.0 + dr, b.1 + dc) {
-                move_idx = Some(idx);
-                break;
+                return Some(idx);
             }
         }
-        let m = match move_idx {
+        None
+    };
+
+    let first_move = match scan(b, c_dir) {
+        Some(i) => i,
+        None => return out,
+    };
+    // Take the first move outside the main loop; otherwise the Pavlidis
+    // stop ("at start AND scan would equal first_move") fires immediately
+    // on iteration 0 and we never leave the start pixel.
+    let (mdr, mdc) = MOORE_DIRS[first_move];
+    b = (b.0 + mdr, b.1 + mdc);
+    c_dir = MOORE_NEW_C_DIR[first_move];
+    out.push((b.0 as usize, b.1 as usize));
+
+    // Step bound: each unique (pixel, backtrack_dir) state is visited at
+    // most once before the algorithm closes, so 8·h·w is a safe upper
+    // bound. Fine-tuning the bound doesn't matter — we should always exit
+    // via the natural Pavlidis stop in correct runs.
+    let max_steps = h.saturating_mul(w).saturating_mul(8) + 16;
+    for _ in 0..max_steps {
+        let m = match scan(b, c_dir) {
             Some(i) => i,
-            None => break, // unreachable for a labeled region with neighbors
+            None => break,
         };
+        // Stop: at start AND about to repeat the first move.
+        if b == s && m == first_move {
+            break;
+        }
         let (mdr, mdc) = MOORE_DIRS[m];
         b = (b.0 + mdr, b.1 + mdc);
         c_dir = MOORE_NEW_C_DIR[m];
-        // Jacob's stop: revisit start with original backtrack.
-        if b == s && c_dir == initial_c_dir {
-            break;
-        }
         out.push((b.0 as usize, b.1 as usize));
     }
     out
@@ -895,9 +915,9 @@ mod tests {
     #[test]
     fn moore_trace_3x3_square() {
         // 3x3 solid square at rows 1..=3, cols 1..=3 in a 5x5 image.
-        // Expected perimeter: 8 pixels (corners + edges, interior excluded).
-        // Clockwise from leftmost-topmost (1,1): (1,1)→(1,2)→(1,3)→(2,3)→
-        //                                        (3,3)→(3,2)→(3,1)→(2,1) [→back to (1,1)]
+        // Perimeter: 8 pixels clockwise from top-left, then a closing
+        // repeat of (1,1) so plot()-as-polyline draws the closing edge
+        // for free.
         let mut lab = Array2::<i64>::zeros((5, 5));
         for r in 1..=3 {
             for c in 1..=3 {
@@ -906,8 +926,8 @@ mod tests {
         }
         let t = moore_trace(lab.view(), 7, 1, 1);
         assert_eq!(t,
-            vec![(1,1),(1,2),(1,3),(2,3),(3,3),(3,2),(3,1),(2,1)],
-            "Moore-trace of 3x3 square should be 8 perimeter pixels clockwise from top-left"
+            vec![(1,1),(1,2),(1,3),(2,3),(3,3),(3,2),(3,1),(2,1),(1,1)],
+            "Moore-trace of 3x3 square should be 8 clockwise + closing repeat"
         );
         // Successive pixels are 8-adjacent.
         for w in t.windows(2) {
@@ -925,6 +945,65 @@ mod tests {
         lab[[1, 1]] = 1;
         let t = moore_trace(lab.view(), 1, 1, 1);
         assert_eq!(t, vec![(1, 1)]);
+    }
+
+    #[test]
+    fn moore_trace_l_shape_terminates() {
+        // L-shape (5 pixels, concave). Naive same-backtrack-on-revisit
+        // stop diverges here; Pavlidis-first-move stop closes the trace.
+        //   . X X
+        //   . X .
+        //   X X .
+        let mut lab = Array2::<i64>::zeros((3, 3));
+        lab[[0, 1]] = 9;
+        lab[[0, 2]] = 9;
+        lab[[1, 1]] = 9;
+        lab[[2, 0]] = 9;
+        lab[[2, 1]] = 9;
+        // Column-major first pixel: scan column 0 → (2, 0).
+        let t = moore_trace(lab.view(), 9, 2, 0);
+        // Trace must be small and end at start (closing edge for plot).
+        assert!(
+            t.len() <= 16,
+            "L-shape trace exploded ({} pixels, expected <16)",
+            t.len()
+        );
+        assert_eq!(t.first().copied(), Some((2, 0)));
+        // Each step must be 8-adjacent.
+        for w in t.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let dr = (a.0 as i32 - b.0 as i32).abs();
+            let dc = (a.1 as i32 - b.1 as i32).abs();
+            assert!(
+                dr <= 1 && dc <= 1 && (dr + dc) >= 1,
+                "non-adjacent step {:?} -> {:?} in trace {:?}",
+                a, b, t
+            );
+        }
+    }
+
+    #[test]
+    fn moore_trace_u_shape_terminates() {
+        // U-shape (concave with a bigger notch).
+        //   X . X
+        //   X . X
+        //   X X X
+        let mut lab = Array2::<i64>::zeros((3, 3));
+        for r in 0..3 { lab[[r, 0]] = 5; lab[[r, 2]] = 5; }
+        for c in 0..3 { lab[[2, c]] = 5; }
+        // Column-major first: column 0 has rows 0,1,2 in region. First = (0,0).
+        let t = moore_trace(lab.view(), 5, 0, 0);
+        assert!(
+            t.len() <= 32,
+            "U-shape trace exploded ({} pixels, expected <32)",
+            t.len()
+        );
+        for w in t.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let dr = (a.0 as i32 - b.0 as i32).abs();
+            let dc = (a.1 as i32 - b.1 as i32).abs();
+            assert!(dr <= 1 && dc <= 1 && (dr + dc) >= 1);
+        }
     }
 
     #[test]
