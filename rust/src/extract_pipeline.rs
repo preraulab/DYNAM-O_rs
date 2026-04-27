@@ -30,6 +30,13 @@ use rayon::prelude::*;
 use std::collections::{HashMap, VecDeque};
 
 /// Per-segment peak table (one row per surviving label).
+///
+/// `area`, `height_data`, `boundaries_xy`, `peakiness` mirror the MATLAB
+/// `computePeakStatsTable` columns of the same names. `boundaries_xy[i]`
+/// is interleaved `[t1, f1, t2, f2, ...]` with one (t, f) pair per
+/// boundary pixel of peak i (8-connectivity perimeter, in physical units).
+/// `height_data[i]` is the spectrogram values at every interior pixel of
+/// peak i. `peakiness = Area·Height/Volume`.
 #[derive(Default)]
 pub struct SegmentPeaks {
     pub peak_time: Vec<f64>,
@@ -40,6 +47,10 @@ pub struct SegmentPeaks {
     pub volume: Vec<f64>,
     pub segment_num: Vec<f64>,
     pub bbox: Vec<f64>, // 4 * n (t_tl, f_tl, width_s, height_Hz) in pydynamo format
+    pub area: Vec<f64>, // sec*Hz per peak (pixel_count * d_time * d_freq)
+    pub peakiness: Vec<f64>, // area * height / volume
+    pub height_data: Vec<Vec<f64>>, // pixel values per peak (interior, NaN-excluded)
+    pub boundaries_xy: Vec<Vec<f64>>, // interleaved (t, f) pairs per peak
 }
 
 impl SegmentPeaks {
@@ -56,6 +67,10 @@ impl SegmentPeaks {
         self.volume.append(&mut other.volume);
         self.segment_num.append(&mut other.segment_num);
         self.bbox.append(&mut other.bbox);
+        self.area.append(&mut other.area);
+        self.peakiness.append(&mut other.peakiness);
+        self.height_data.append(&mut other.height_data);
+        self.boundaries_xy.append(&mut other.boundaries_xy);
     }
 }
 
@@ -261,6 +276,9 @@ struct Accum {
     r_max: usize,
     c_min: usize,
     c_max: usize,
+    pixel_count: usize,
+    pixel_values: Vec<f64>,    // matches MATLAB regionprops PixelValues
+    boundary_xy: Vec<f64>,     // interleaved (t, f) per boundary pixel
 }
 
 fn compute_peak_props_from_trim(
@@ -282,16 +300,28 @@ fn compute_peak_props_from_trim(
     let t0 = stimes[0];
     let f0 = sfreqs[0];
 
+    // 8-connectivity neighbor offsets for boundary detection.
+    const DRC8: [(i32, i32); 8] = [
+        (-1, -1), (-1, 0), (-1, 1),
+        ( 0, -1),          ( 0, 1),
+        ( 1, -1), ( 1, 0), ( 1, 1),
+    ];
+
     let mut map: HashMap<i64, Accum> = HashMap::new();
     for r in 0..h {
         for c in 0..w {
             let lbl = trim_labels[[r, c]];
             if lbl <= 0 { continue; }
             let v = spect[[r, c]];
+            // Skip NaN pixels — matches MATLAB `Ldata(regions{ii}(~isnan(data(...))))`.
+            if v.is_nan() { continue; }
             let e = map.entry(lbl).or_insert(Accum {
                 sum_v: 0.0, sum_v_r: 0.0, sum_v_c: 0.0,
                 min_v: f64::INFINITY, max_v: f64::NEG_INFINITY,
                 r_min: r, r_max: r, c_min: c, c_max: c,
+                pixel_count: 0,
+                pixel_values: Vec::new(),
+                boundary_xy: Vec::new(),
             });
             e.sum_v += v;
             e.sum_v_r += v * (r as f64);
@@ -302,6 +332,30 @@ fn compute_peak_props_from_trim(
             if r > e.r_max { e.r_max = r; }
             if c < e.c_min { e.c_min = c; }
             if c > e.c_max { e.c_max = c; }
+            e.pixel_count += 1;
+            e.pixel_values.push(v);
+            // Boundary check: 8-connectivity perimeter — matches MATLAB
+            // `bwperim` semantics. A pixel is a boundary if any 8-neighbor
+            // has a different label or is out of bounds.
+            let mut is_boundary = false;
+            for &(dr, dc) in &DRC8 {
+                let nr = r as i32 + dr;
+                let nc = c as i32 + dc;
+                if nr < 0 || nc < 0 || nr >= h as i32 || nc >= w as i32 {
+                    is_boundary = true;
+                    break;
+                }
+                if trim_labels[[nr as usize, nc as usize]] != lbl {
+                    is_boundary = true;
+                    break;
+                }
+            }
+            if is_boundary {
+                let t = c as f64 * d_time + t0;
+                let f = r as f64 * d_freq + f0;
+                e.boundary_xy.push(t);
+                e.boundary_xy.push(f);
+            }
         }
     }
     // Sort by label id for determinism.
@@ -324,6 +378,12 @@ fn compute_peak_props_from_trim(
         let bandwidth = n_f * d_freq;
         let height = a.max_v - a.min_v;
         let volume = a.sum_v * d_time * d_freq;
+        let area = (a.pixel_count as f64) * d_time * d_freq;
+        // peakiness = Area·Height/Volume. Pre-baseline-divided spectrogram
+        // pixels are positive in practice, but a degenerate region with
+        // volume=0 would produce ±inf — let it propagate so downstream
+        // filters can decide.
+        let peakiness = area * height / volume;
         // BoundingBox in pydynamo format: (time_tl, freq_tl, width_s, height_Hz).
         let t_tl = (a.c_min as f64) * d_time + t0;
         let f_tl = (a.r_min as f64) * d_freq + f0;
@@ -341,6 +401,10 @@ fn compute_peak_props_from_trim(
         out.bbox.push(f_tl);
         out.bbox.push(w_s);
         out.bbox.push(h_hz);
+        out.area.push(area);
+        out.peakiness.push(peakiness);
+        out.height_data.push(a.pixel_values.clone());
+        out.boundaries_xy.push(a.boundary_xy.clone());
     }
     out
 }
@@ -672,6 +736,10 @@ fn take_indices(p: &SegmentPeaks, idx: &[usize]) -> SegmentPeaks {
     out.volume.reserve(idx.len());
     out.segment_num.reserve(idx.len());
     out.bbox.reserve(idx.len() * 4);
+    out.area.reserve(idx.len());
+    out.peakiness.reserve(idx.len());
+    out.height_data.reserve(idx.len());
+    out.boundaries_xy.reserve(idx.len());
     for &i in idx {
         out.peak_time.push(p.peak_time[i]);
         out.peak_freq.push(p.peak_freq[i]);
@@ -684,6 +752,10 @@ fn take_indices(p: &SegmentPeaks, idx: &[usize]) -> SegmentPeaks {
         out.bbox.push(p.bbox[i * 4 + 1]);
         out.bbox.push(p.bbox[i * 4 + 2]);
         out.bbox.push(p.bbox[i * 4 + 3]);
+        out.area.push(p.area[i]);
+        out.peakiness.push(p.peakiness[i]);
+        out.height_data.push(p.height_data[i].clone());
+        out.boundaries_xy.push(p.boundaries_xy[i].clone());
     }
     out
 }
@@ -737,6 +809,10 @@ mod tests {
         p.height.push(100.0);  p.volume.push(1.0);
         p.segment_num.push(1.0);
         p.bbox.extend_from_slice(&[0.0, 0.0, 0.0, 0.0]);
+        p.area.push(5.0);
+        p.peakiness.push(5.0 * 100.0 / 1.0); // area * height / volume
+        p.height_data.push(vec![1.0, 2.0]);
+        p.boundaries_xy.push(vec![0.0, 10.0]);
         let params = ExtractParams {
             seg_time: 30.0, downsample_f: 1, downsample_t: 1,
             merge_thresh: 8.0, max_merges: f64::INFINITY, trim_vol_thresh: 0.8,

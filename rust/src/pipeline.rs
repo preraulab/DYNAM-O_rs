@@ -64,15 +64,16 @@ pub fn default_extract_params() -> ExtractParams {
 
 /// Write a `SegmentPeaks` to a CSV file in the same column layout as the
 /// MATLAB `stats_table` (headers: PeakTime, PeakFrequency, Duration,
-/// Bandwidth, Height, Volume, SegmentNum, bbox_tl_s, bbox_tl_Hz,
-/// bbox_width_s, bbox_height_Hz).
+/// Bandwidth, Height, Volume, SegmentNum, Area, Peakiness, bbox_tl_s,
+/// bbox_tl_Hz, bbox_width_s, bbox_height_Hz). Variable-length columns
+/// (HeightData, Boundaries) are intentionally omitted from CSV.
 pub fn write_stats_csv(peaks: &SegmentPeaks, path: &std::path::Path) -> std::io::Result<()> {
     use std::io::Write;
     let f = std::fs::File::create(path)?;
     let mut w = std::io::BufWriter::new(f);
     writeln!(
         w,
-        "PeakTime,PeakFrequency,Duration,Bandwidth,Height,Volume,SegmentNum,bbox_tl_s,bbox_tl_Hz,bbox_width_s,bbox_height_Hz"
+        "PeakTime,PeakFrequency,Duration,Bandwidth,Height,Volume,SegmentNum,Area,Peakiness,bbox_tl_s,bbox_tl_Hz,bbox_width_s,bbox_height_Hz"
     )?;
     for i in 0..peaks.len() {
         let b0 = peaks.bbox[i * 4];
@@ -81,7 +82,7 @@ pub fn write_stats_csv(peaks: &SegmentPeaks, path: &std::path::Path) -> std::io:
         let b3 = peaks.bbox[i * 4 + 3];
         writeln!(
             w,
-            "{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{}",
             peaks.peak_time[i],
             peaks.peak_freq[i],
             peaks.duration[i],
@@ -89,6 +90,8 @@ pub fn write_stats_csv(peaks: &SegmentPeaks, path: &std::path::Path) -> std::io:
             peaks.height[i],
             peaks.volume[i],
             peaks.segment_num[i],
+            peaks.area[i],
+            peaks.peakiness[i],
             b0, b1, b2, b3,
         )?;
     }
