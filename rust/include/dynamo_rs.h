@@ -117,7 +117,7 @@ typedef struct ExtractTfpeaksOut {
    */
   double *area;
   /**
-   * Peakiness = Area * Height / Volume per peak. Length n_peaks.
+   * Peakiness = log10(Area * Height / Volume) per peak. Length n_peaks.
    */
   double *peakiness;
   /**
