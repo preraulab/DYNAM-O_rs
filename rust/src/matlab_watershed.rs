@@ -12,7 +12,6 @@
 //!
 
 use ndarray::{Array2, ArrayView2};
-use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 /// Regional minima of a 2D image, 8-connectivity.
