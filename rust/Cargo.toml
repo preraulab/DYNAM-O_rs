@@ -27,12 +27,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Pure-Rust multitaper spectrogram. Path is relative so any checkout that
-# sits alongside DYNAMO_dev (the standard layout under DYNAM-O_toolbox)
+# sits alongside DYNAM-O_dev (the standard layout under DYNAM-O_toolbox)
 # resolves without the user editing Cargo.toml.
 # Layout assumption:
 #   ~/.../toolboxes/DYNAM-O_rs/rust/Cargo.toml            <-- this file
-#   ~/.../toolboxes/DYNAMO_dev/toolbox/helper_functions/multitaper_spectrogram/rust
-multitaper_rs = { path = "../../DYNAMO_dev/toolbox/helper_functions/multitaper_spectrogram/rust", default-features = false }
+#   ~/.../toolboxes/DYNAM-O_dev/toolbox/helper_functions/multitaper_spectrogram/rust
+multitaper_rs = { path = "../../DYNAM-O_dev/toolbox/helper_functions/multitaper_spectrogram/rust", default-features = false }
 
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"], optional = true }
 numpy = { version = "0.22", optional = true }

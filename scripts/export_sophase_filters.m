@@ -7,7 +7,7 @@ function export_sophase_filters(src_mat, dst_dir)
 %       export_sophase_filters()
 %       export_sophase_filters('/path/to/SOphase_filters.mat', '/path/to/data_matlab_filters')
 %
-%   Source file:  DYNAMO_dev/toolbox/SOpowphase_functions/SOphase_filters.mat
+%   Source file:  DYNAM-O_dev/toolbox/SOpowphase_functions/SOphase_filters.mat
 %   Destination:  DYNAM-O_rs/data_matlab_filters/
 %
 %   Each variable named `filter_<Fs>Hz_<loDot>_<hiDot>` (e.g.
@@ -19,7 +19,7 @@ function export_sophase_filters(src_mat, dst_dir)
     if nargin < 1 || isempty(src_mat)
         this_dir = fileparts(mfilename('fullpath'));        % DYNAM-O_rs/scripts
         repo_root = fileparts(this_dir);                    % DYNAM-O_rs
-        toolbox_root = fullfile(repo_root, '..', 'DYNAMO_dev');
+        toolbox_root = fullfile(repo_root, '..', 'DYNAM-O_dev');
         src_mat = fullfile(toolbox_root, 'toolbox', ...
                            'SOpowphase_functions', 'SOphase_filters.mat');
     end
