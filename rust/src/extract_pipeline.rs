@@ -36,7 +36,11 @@ use std::collections::{HashMap, VecDeque};
 /// is interleaved `[t1, f1, t2, f2, ...]` with one (t, f) pair per
 /// boundary pixel of peak i (8-connectivity perimeter, in physical units).
 /// `height_data[i]` is the spectrogram values at every interior pixel of
-/// peak i. `peakiness = Area·Height/Volume`.
+/// peak i. `peakiness = log10(Area·Height/Volume)`.
+///
+/// Pixel order inside `height_data[i]` and `boundaries_xy[i]` matches
+/// MATLAB's `regionprops` / `trimWshedRegions` column-major scan so the
+/// per-peak vectors are bit-comparable across backends.
 #[derive(Default)]
 pub struct SegmentPeaks {
     pub peak_time: Vec<f64>,
@@ -48,7 +52,7 @@ pub struct SegmentPeaks {
     pub segment_num: Vec<f64>,
     pub bbox: Vec<f64>, // 4 * n (t_tl, f_tl, width_s, height_Hz) in pydynamo format
     pub area: Vec<f64>, // sec*Hz per peak (pixel_count * d_time * d_freq)
-    pub peakiness: Vec<f64>, // area * height / volume
+    pub peakiness: Vec<f64>, // log10(area * height / volume)
     pub height_data: Vec<Vec<f64>>, // pixel values per peak (interior, NaN-excluded)
     pub boundaries_xy: Vec<Vec<f64>>, // interleaved (t, f) pairs per peak
 }
@@ -300,16 +304,17 @@ fn compute_peak_props_from_trim(
     let t0 = stimes[0];
     let f0 = sfreqs[0];
 
-    // 8-connectivity neighbor offsets for boundary detection.
-    const DRC8: [(i32, i32); 8] = [
-        (-1, -1), (-1, 0), (-1, 1),
-        ( 0, -1),          ( 0, 1),
-        ( 1, -1), ( 1, 0), ( 1, 1),
-    ];
-
+    // Column-major iteration to match MATLAB's regionprops scan order, so
+    // pixel_values and boundary_xy come out in the same order MATLAB writes
+    // PixelValues and find(bnd_mask) (column-major linear scan).
+    //
+    // 4-connectivity boundary check matches trimWshedRegions.m:226 — a pixel
+    // is a boundary iff at least one of its (up, down, left, right) neighbors
+    // is NOT in the same region (or is out of bounds, which MATLAB models via
+    // its zero-padding before the AND-of-shifted-masks).
     let mut map: HashMap<i64, Accum> = HashMap::new();
-    for r in 0..h {
-        for c in 0..w {
+    for c in 0..w {
+        for r in 0..h {
             let lbl = trim_labels[[r, c]];
             if lbl <= 0 { continue; }
             let v = spect[[r, c]];
@@ -334,23 +339,13 @@ fn compute_peak_props_from_trim(
             if c > e.c_max { e.c_max = c; }
             e.pixel_count += 1;
             e.pixel_values.push(v);
-            // Boundary check: 8-connectivity perimeter — matches MATLAB
-            // `bwperim` semantics. A pixel is a boundary if any 8-neighbor
-            // has a different label or is out of bounds.
-            let mut is_boundary = false;
-            for &(dr, dc) in &DRC8 {
-                let nr = r as i32 + dr;
-                let nc = c as i32 + dc;
-                if nr < 0 || nc < 0 || nr >= h as i32 || nc >= w as i32 {
-                    is_boundary = true;
-                    break;
-                }
-                if trim_labels[[nr as usize, nc as usize]] != lbl {
-                    is_boundary = true;
-                    break;
-                }
-            }
-            if is_boundary {
+            // 4-conn perimeter: any of (up, down, left, right) outside region
+            // (out-of-bounds OR different label) makes this a boundary pixel.
+            let up_diff    = r == 0       || trim_labels[[r - 1, c]] != lbl;
+            let down_diff  = r + 1 >= h   || trim_labels[[r + 1, c]] != lbl;
+            let left_diff  = c == 0       || trim_labels[[r, c - 1]] != lbl;
+            let right_diff = c + 1 >= w   || trim_labels[[r, c + 1]] != lbl;
+            if up_diff || down_diff || left_diff || right_diff {
                 let t = c as f64 * d_time + t0;
                 let f = r as f64 * d_freq + f0;
                 e.boundary_xy.push(t);
@@ -379,11 +374,11 @@ fn compute_peak_props_from_trim(
         let height = a.max_v - a.min_v;
         let volume = a.sum_v * d_time * d_freq;
         let area = (a.pixel_count as f64) * d_time * d_freq;
-        // peakiness = Area·Height/Volume. Pre-baseline-divided spectrogram
-        // pixels are positive in practice, but a degenerate region with
-        // volume=0 would produce ±inf — let it propagate so downstream
-        // filters can decide.
-        let peakiness = area * height / volume;
+        // peakiness = log10(Area·Height/Volume). Pre-baseline-divided
+        // spectrogram pixels are positive in practice; degenerate regions
+        // (height=0 → log10(0) = -∞, or volume=0 → log10(±∞) = ±∞) propagate
+        // their sentinel so downstream filters can decide.
+        let peakiness = (area * height / volume).log10();
         // BoundingBox in pydynamo format: (time_tl, freq_tl, width_s, height_Hz).
         let t_tl = (a.c_min as f64) * d_time + t0;
         let f_tl = (a.r_min as f64) * d_freq + f0;
@@ -810,7 +805,7 @@ mod tests {
         p.segment_num.push(1.0);
         p.bbox.extend_from_slice(&[0.0, 0.0, 0.0, 0.0]);
         p.area.push(5.0);
-        p.peakiness.push(5.0 * 100.0 / 1.0); // area * height / volume
+        p.peakiness.push((5.0_f64 * 100.0 / 1.0).log10()); // log10(area * height / volume)
         p.height_data.push(vec![1.0, 2.0]);
         p.boundaries_xy.push(vec![0.0, 10.0]);
         let params = ExtractParams {
