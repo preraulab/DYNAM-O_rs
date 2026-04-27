@@ -36,11 +36,16 @@ use std::collections::{HashMap, VecDeque};
 /// is interleaved `[t1, f1, t2, f2, ...]` with one (t, f) pair per
 /// boundary pixel of peak i (8-connectivity perimeter, in physical units).
 /// `height_data[i]` is the spectrogram values at every interior pixel of
-/// peak i. `peakiness = log10(Area·Height/Volume)`.
+/// peak i, in MATLAB regionprops column-major order (bit-comparable across
+/// backends). `peakiness = log10(Area·Height/Volume)`.
 ///
-/// Pixel order inside `height_data[i]` and `boundaries_xy[i]` matches
-/// MATLAB's `regionprops` / `trimWshedRegions` column-major scan so the
-/// per-peak vectors are bit-comparable across backends.
+/// `boundaries_xy[i]` is the perimeter in **clockwise traversal order**
+/// (Moore-neighbor trace). This deliberately diverges from MATLAB's pure
+/// path, which stores perimeter pixels in column-major scan order and so
+/// can't be plotted as a polyline without a separate trace pass — see
+/// trimWshedRegions.m:229 (`find(bnd_mask)`). Storing them traversal-
+/// ordered means downstream plot() of `Boundaries{i}(:, 1:2)` draws a
+/// closed perimeter directly.
 #[derive(Default)]
 pub struct SegmentPeaks {
     pub peak_time: Vec<f64>,
@@ -282,7 +287,94 @@ struct Accum {
     c_max: usize,
     pixel_count: usize,
     pixel_values: Vec<f64>,    // matches MATLAB regionprops PixelValues
-    boundary_xy: Vec<f64>,     // interleaved (t, f) per boundary pixel
+    /// First column-major-encountered in-region pixel (smallest col, then
+    /// smallest row within that col). Guaranteed boundary pixel and
+    /// guaranteed to have West/N/NW as out-of-region neighbors — so it's a
+    /// safe Moore-neighbor trace start with initial backtrack = West.
+    start_r: usize,
+    start_c: usize,
+}
+
+// Moore-neighbor 8-conn offsets, clockwise starting from West.
+// Index: 0=W, 1=NW, 2=N, 3=NE, 4=E, 5=SE, 6=S, 7=SW.
+const MOORE_DIRS: [(i32, i32); 8] = [
+    ( 0, -1), (-1, -1), (-1, 0), (-1,  1),
+    ( 0,  1), ( 1,  1), ( 1, 0), ( 1, -1),
+];
+
+// After moving in direction `move_idx`, the new backtrack ("where we came
+// from") is at this MOORE_DIRS index from the new position. Derived once
+// algebraically: the OOR pixel just before `move_idx` in the clockwise
+// scan is at MOORE_DIRS[(move_idx+7)%8] from the OLD position; its
+// position relative to the NEW position is MOORE_DIRS[(move_idx+7)%8]
+// minus MOORE_DIRS[move_idx], which always lands on one of {N, E, S, W}.
+const MOORE_NEW_C_DIR: [usize; 8] = [6, 6, 0, 0, 2, 2, 4, 4];
+
+/// Moore-neighbor boundary trace (Pavlidis-style, 8-conn, clockwise).
+///
+/// Walks the perimeter of the connected region with label `lbl` starting
+/// at `(start_r, start_c)` (must be a boundary pixel; conventionally the
+/// column-major-first in-region pixel, which guarantees W is OOR so we
+/// can use West as the initial backtrack).
+///
+/// Returns pixel coords in clockwise traversal order — consecutive entries
+/// are 8-adjacent, so plot()-as-polyline draws a closed perimeter rather
+/// than the sawtooth that column-major scan order produces.
+///
+/// Jacob's stopping criterion: stop when we revisit `start` with the same
+/// backtrack as the initial. Includes a step cap as a safety net.
+fn moore_trace(
+    labels: ArrayView2<i64>,
+    lbl: i64,
+    start_r: usize,
+    start_c: usize,
+) -> Vec<(usize, usize)> {
+    let (h, w) = labels.dim();
+    let in_rgn = |r: i32, c: i32| -> bool {
+        r >= 0 && c >= 0 && r < h as i32 && c < w as i32
+            && labels[[r as usize, c as usize]] == lbl
+    };
+    let s = (start_r as i32, start_c as i32);
+    let mut out: Vec<(usize, usize)> = vec![(start_r, start_c)];
+
+    // Single-isolated-pixel region: nothing to trace.
+    if !MOORE_DIRS.iter().any(|&(dr, dc)| in_rgn(s.0 + dr, s.1 + dc)) {
+        return out;
+    }
+
+    let mut b = s;
+    let mut c_dir: usize = 0; // West
+    let initial_c_dir = c_dir;
+
+    // Cap = perimeter length × small constant. 8 * area is a generous bound
+    // (perimeter ≤ 4·side ≤ 4·sqrt(area), but skinny shapes can have
+    // perimeter ≈ 2·area; 8·area still safe).
+    let max_steps = h.saturating_mul(w).saturating_mul(8) + 16;
+    for _ in 0..max_steps {
+        // Scan 8 neighbors clockwise starting one past the backtrack.
+        let mut move_idx: Option<usize> = None;
+        for k in 1..=8 {
+            let idx = (c_dir + k) % 8;
+            let (dr, dc) = MOORE_DIRS[idx];
+            if in_rgn(b.0 + dr, b.1 + dc) {
+                move_idx = Some(idx);
+                break;
+            }
+        }
+        let m = match move_idx {
+            Some(i) => i,
+            None => break, // unreachable for a labeled region with neighbors
+        };
+        let (mdr, mdc) = MOORE_DIRS[m];
+        b = (b.0 + mdr, b.1 + mdc);
+        c_dir = MOORE_NEW_C_DIR[m];
+        // Jacob's stop: revisit start with original backtrack.
+        if b == s && c_dir == initial_c_dir {
+            break;
+        }
+        out.push((b.0 as usize, b.1 as usize));
+    }
+    out
 }
 
 fn compute_peak_props_from_trim(
@@ -305,13 +397,19 @@ fn compute_peak_props_from_trim(
     let f0 = sfreqs[0];
 
     // Column-major iteration to match MATLAB's regionprops scan order, so
-    // pixel_values and boundary_xy come out in the same order MATLAB writes
-    // PixelValues and find(bnd_mask) (column-major linear scan).
+    // pixel_values comes out in the same order MATLAB writes PixelValues
+    // (column-major linear scan).
     //
-    // 4-connectivity boundary check matches trimWshedRegions.m:226 — a pixel
-    // is a boundary iff at least one of its (up, down, left, right) neighbors
-    // is NOT in the same region (or is out of bounds, which MATLAB models via
-    // its zero-padding before the AND-of-shifted-masks).
+    // The first in-region pixel encountered for a given label is its
+    // column-major-first pixel (smallest col, then smallest row within
+    // that col). That pixel is recorded as `start_r`/`start_c` and used
+    // post-loop as the Moore-trace start: West is guaranteed OOR, so the
+    // trace is well-formed with West as the initial backtrack.
+    //
+    // Boundary pixels themselves are NOT collected during this pass —
+    // unordered perimeter pixels can't be plotted as a polyline (column-
+    // major scan would produce sawtooth crossing lines). They're emitted
+    // post-loop in clockwise traversal order via `moore_trace`.
     let mut map: HashMap<i64, Accum> = HashMap::new();
     for c in 0..w {
         for r in 0..h {
@@ -326,7 +424,7 @@ fn compute_peak_props_from_trim(
                 r_min: r, r_max: r, c_min: c, c_max: c,
                 pixel_count: 0,
                 pixel_values: Vec::new(),
-                boundary_xy: Vec::new(),
+                start_r: r, start_c: c,
             });
             e.sum_v += v;
             e.sum_v_r += v * (r as f64);
@@ -339,18 +437,6 @@ fn compute_peak_props_from_trim(
             if c > e.c_max { e.c_max = c; }
             e.pixel_count += 1;
             e.pixel_values.push(v);
-            // 4-conn perimeter: any of (up, down, left, right) outside region
-            // (out-of-bounds OR different label) makes this a boundary pixel.
-            let up_diff    = r == 0       || trim_labels[[r - 1, c]] != lbl;
-            let down_diff  = r + 1 >= h   || trim_labels[[r + 1, c]] != lbl;
-            let left_diff  = c == 0       || trim_labels[[r, c - 1]] != lbl;
-            let right_diff = c + 1 >= w   || trim_labels[[r, c + 1]] != lbl;
-            if up_diff || down_diff || left_diff || right_diff {
-                let t = c as f64 * d_time + t0;
-                let f = r as f64 * d_freq + f0;
-                e.boundary_xy.push(t);
-                e.boundary_xy.push(f);
-            }
         }
     }
     // Sort by label id for determinism.
@@ -385,6 +471,16 @@ fn compute_peak_props_from_trim(
         let w_s = n_t * d_time;
         let h_hz = n_f * d_freq;
 
+        // Moore-neighbor trace from the column-major-first in-region pixel
+        // — produces clockwise-ordered perimeter coords suitable for direct
+        // plot()-as-polyline (interleaved t, f).
+        let trace = moore_trace(trim_labels, k, a.start_r, a.start_c);
+        let mut bxy: Vec<f64> = Vec::with_capacity(trace.len() * 2);
+        for (tr, tc) in trace {
+            bxy.push(tc as f64 * d_time + t0);
+            bxy.push(tr as f64 * d_freq + f0);
+        }
+
         out.peak_time.push(peak_time);
         out.peak_freq.push(peak_freq);
         out.duration.push(duration);
@@ -399,7 +495,7 @@ fn compute_peak_props_from_trim(
         out.area.push(area);
         out.peakiness.push(peakiness);
         out.height_data.push(a.pixel_values.clone());
-        out.boundaries_xy.push(a.boundary_xy.clone());
+        out.boundaries_xy.push(bxy);
     }
     out
 }
@@ -794,6 +890,41 @@ mod tests {
         assert_eq!(out[[1, 1]], 1);
         assert_eq!(out[[1, 3]], 2);
         assert_eq!(out[[1, 4]], 2);
+    }
+
+    #[test]
+    fn moore_trace_3x3_square() {
+        // 3x3 solid square at rows 1..=3, cols 1..=3 in a 5x5 image.
+        // Expected perimeter: 8 pixels (corners + edges, interior excluded).
+        // Clockwise from leftmost-topmost (1,1): (1,1)→(1,2)→(1,3)→(2,3)→
+        //                                        (3,3)→(3,2)→(3,1)→(2,1) [→back to (1,1)]
+        let mut lab = Array2::<i64>::zeros((5, 5));
+        for r in 1..=3 {
+            for c in 1..=3 {
+                lab[[r, c]] = 7;
+            }
+        }
+        let t = moore_trace(lab.view(), 7, 1, 1);
+        assert_eq!(t,
+            vec![(1,1),(1,2),(1,3),(2,3),(3,3),(3,2),(3,1),(2,1)],
+            "Moore-trace of 3x3 square should be 8 perimeter pixels clockwise from top-left"
+        );
+        // Successive pixels are 8-adjacent.
+        for w in t.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let dr = (a.0 as i32 - b.0 as i32).abs();
+            let dc = (a.1 as i32 - b.1 as i32).abs();
+            assert!(dr <= 1 && dc <= 1 && (dr + dc) >= 1,
+                "non-adjacent step {:?} -> {:?}", a, b);
+        }
+    }
+
+    #[test]
+    fn moore_trace_single_pixel() {
+        let mut lab = Array2::<i64>::zeros((3, 3));
+        lab[[1, 1]] = 1;
+        let t = moore_trace(lab.view(), 1, 1, 1);
+        assert_eq!(t, vec![(1, 1)]);
     }
 
     #[test]
