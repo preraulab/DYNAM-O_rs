@@ -16,14 +16,24 @@
 //!   weight = max(w_ij, w_ji)
 
 pub mod adjacency;
+pub mod artifacts;
 pub mod baseline;
+pub mod c_api;
+pub mod extract_pipeline;
+pub mod filter_cache;
+pub mod filter_design;
 pub mod histogram;
 pub mod io;
 pub mod mask;
 pub mod matlab_watershed;
+pub mod mts;
 pub mod merge;
+pub mod peak_assign;
+pub mod pipeline;
 pub mod refine;
 pub mod signal;
+pub mod so_phase;
+pub mod so_power;
 pub mod trim;
 
 #[cfg(feature = "python")]
@@ -129,6 +139,251 @@ mod python {
         let arr = data.as_array();
         let out = super::matlab_watershed::matlab_watershed_2d(arr);
         Ok(out.into_pyarray_bound(py))
+    }
+
+    /// matlab_paint_labels(labels) -> int64 labels (same shape)
+    ///
+    /// Port of MATLAB `extractTFPeaks.m:272` + `Ldata2graph.m:233`: for each
+    /// label in ascending order, 8-connectivity 1-pixel dilate its pixels
+    /// and paint the *dense* 1..N cell index into the output. Higher labels
+    /// overwrite lower on overlap (MATLAB-exact). Zero stays background.
+    ///
+    /// This replaces `skimage.segmentation.expand_labels(distance=5)` as
+    /// the border-fill step so that pydynamo's pass-2 count matches
+    /// MATLAB's ~0.8% peak-drift target (instead of skimage's ~+2%).
+    /// Input must be 2D int64 C-contiguous; output is int64 same shape.
+    #[pyfunction]
+    fn matlab_paint_labels<'py>(
+        py: Python<'py>,
+        labels: PyReadonlyArray2<'py, i64>,
+    ) -> PyResult<Bound<'py, PyArray2<i64>>> {
+        let arr = labels.as_array();
+        let out = super::extract_pipeline::matlab_paint_labels_in_order(arr);
+        Ok(out.into_pyarray_bound(py))
+    }
+
+    /// so_power_from_spectrogram(so_spect, stimes, sfreqs, eeg_times, isexcluded,
+    ///                           stage_times, stage_vals, time_range,
+    ///                           outlier_threshold, norm_method, retain_fs)
+    ///   → (so_power_norm, so_power_times, so_power_stages, ptile)
+    ///
+    /// Post-spectrogram SO-power pipeline — port of computeSOpower.m steps
+    /// 3–8 and pydynamo soph/sopower.py lines ~93–164. Takes the
+    /// already-computed multitaper spectrogram over the SO band, emits the
+    /// normalized SO-power time series on either the window-center grid
+    /// (`retain_fs=False`) or upsampled back to `eeg_times` (`retain_fs=True`).
+    ///
+    /// `ptile` is:
+    ///   * None for norm_method='none'/'absolute' or the degenerate all-NaN path
+    ///   * float for p{N}shift{S} (the ptile-th percentile used as the shift)
+    ///   * (float, float) for 'percent' (p1, p99)
+    #[pyfunction]
+    #[pyo3(signature = (
+        so_spect, stimes, sfreqs, eeg_times, isexcluded,
+        stage_times, stage_vals, time_range,
+        outlier_threshold=3.0, norm_method="p2shift1234",
+        retain_fs=true,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn so_power_from_spectrogram<'py>(
+        py: Python<'py>,
+        so_spect: PyReadonlyArray2<'py, f64>,
+        stimes: PyReadonlyArray1<'py, f64>,
+        sfreqs: PyReadonlyArray1<'py, f64>,
+        eeg_times: PyReadonlyArray1<'py, f64>,
+        isexcluded: PyReadonlyArray1<'py, bool>,
+        stage_times: PyReadonlyArray1<'py, f64>,
+        stage_vals: PyReadonlyArray1<'py, f64>,
+        time_range: (f64, f64),
+        outlier_threshold: f64,
+        norm_method: &str,
+        retain_fs: bool,
+    ) -> PyResult<Py<pyo3::types::PyTuple>> {
+        use super::so_power::{so_power_from_spectrogram as rs_fn, NormMethod, PtileUsed};
+
+        let spect_arr = so_spect.as_array();
+        let (nf, nt) = spect_arr.dim();
+        let spect_contig = spect_arr.to_owned();
+        let spect_slice = spect_contig.as_slice().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("so_spect must be C-contiguous")
+        })?;
+
+        let stimes_slice = stimes.as_array().to_owned().into_raw_vec_and_offset().0;
+        let sfreqs_slice = sfreqs.as_array().to_owned().into_raw_vec_and_offset().0;
+        let eeg_times_slice = eeg_times.as_array().to_owned().into_raw_vec_and_offset().0;
+        let isexcluded_slice: Vec<bool> = isexcluded.as_array().iter().copied().collect();
+        let stage_times_slice = stage_times.as_array().to_owned().into_raw_vec_and_offset().0;
+        let stage_vals_slice = stage_vals.as_array().to_owned().into_raw_vec_and_offset().0;
+
+        let nm = NormMethod::parse(norm_method).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "unrecognized norm_method {:?}",
+                norm_method
+            ))
+        })?;
+
+        let out = rs_fn(
+            spect_slice, nf, nt,
+            &stimes_slice, &sfreqs_slice,
+            &eeg_times_slice, &isexcluded_slice,
+            &stage_times_slice, &stage_vals_slice,
+            time_range, outlier_threshold, &nm, retain_fs,
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+
+        let arr_norm = numpy::ndarray::Array1::from(out.so_power_norm).into_pyarray_bound(py);
+        let arr_times = numpy::ndarray::Array1::from(out.so_power_times).into_pyarray_bound(py);
+        let arr_stages = numpy::ndarray::Array1::from(out.so_power_stages).into_pyarray_bound(py);
+        let ptile_obj: PyObject = match out.ptile {
+            None => py.None(),
+            Some(PtileUsed::Single(p)) => p.into_py(py),
+            Some(PtileUsed::Pair(a, b)) => (a, b).into_py(py),
+        };
+        let tup = pyo3::types::PyTuple::new_bound(py, [
+            arr_norm.into_any(), arr_times.into_any(), arr_stages.into_any(),
+            ptile_obj.into_bound(py),
+        ]);
+        Ok(tup.unbind())
+    }
+
+    /// so_phase_from_eeg(eeg, eeg_times, isexcluded, sos, stage_times, stage_vals)
+    ///   → (so_phase_unwrapped, so_phase_times, so_phase_stages, filtdata)
+    ///
+    /// Port of computeSOphase.m / pydynamo compute_so_phase. Band-pass SOS
+    /// filter via sosfiltfilt → Hilbert analytic → atan2 → unwrap → NaN mask
+    /// at excluded samples → stage assign (previous-interp). Returns phase
+    /// **unwrapped** (wrapToPi applied downstream during binning).
+    ///
+    /// `sos` is shape (n_sections, 6) float64 in scipy order [b0 b1 b2 a0 a1 a2].
+    /// Use `dynamo_rs.get_sophase_sos(fs, band)` (or scipy's iirdesign) to
+    /// obtain it.
+    #[pyfunction]
+    fn so_phase_from_eeg<'py>(
+        py: Python<'py>,
+        eeg: PyReadonlyArray1<'py, f64>,
+        eeg_times: PyReadonlyArray1<'py, f64>,
+        isexcluded: PyReadonlyArray1<'py, bool>,
+        sos: PyReadonlyArray2<'py, f64>,
+        stage_times: PyReadonlyArray1<'py, f64>,
+        stage_vals: PyReadonlyArray1<'py, f64>,
+    ) -> PyResult<Py<pyo3::types::PyTuple>> {
+        let eeg_vec = eeg.as_array().to_owned().into_raw_vec_and_offset().0;
+        let eeg_times_vec = eeg_times.as_array().to_owned().into_raw_vec_and_offset().0;
+        let isexcluded_vec: Vec<bool> = isexcluded.as_array().iter().copied().collect();
+        let stage_times_vec = stage_times.as_array().to_owned().into_raw_vec_and_offset().0;
+        let stage_vals_vec = stage_vals.as_array().to_owned().into_raw_vec_and_offset().0;
+
+        let sos_arr = sos.as_array();
+        let (nsec, ncols) = sos_arr.dim();
+        if ncols != 6 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "sos must have 6 columns (scipy SOS format: [b0 b1 b2 a0 a1 a2]).",
+            ));
+        }
+        let sos_slice: Vec<[f64; 6]> = (0..nsec)
+            .map(|i| {
+                [
+                    sos_arr[[i, 0]], sos_arr[[i, 1]], sos_arr[[i, 2]],
+                    sos_arr[[i, 3]], sos_arr[[i, 4]], sos_arr[[i, 5]],
+                ]
+            })
+            .collect();
+
+        let out = super::so_phase::so_phase_from_eeg(
+            &eeg_vec, &eeg_times_vec, &isexcluded_vec, &sos_slice,
+            &stage_times_vec, &stage_vals_vec,
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+
+        let a_phase = numpy::ndarray::Array1::from(out.so_phase_unwrapped).into_pyarray_bound(py);
+        let a_times = numpy::ndarray::Array1::from(out.so_phase_times).into_pyarray_bound(py);
+        let a_stages = numpy::ndarray::Array1::from(out.so_phase_stages).into_pyarray_bound(py);
+        let a_filt = numpy::ndarray::Array1::from(out.filtdata).into_pyarray_bound(py);
+        let tup = pyo3::types::PyTuple::new_bound(py, [
+            a_phase.into_any(), a_times.into_any(), a_stages.into_any(), a_filt.into_any(),
+        ]);
+        Ok(tup.unbind())
+    }
+
+    /// detect_artifacts(data, fs, hf_pass, hf_crit, bb_pass, bb_crit,
+    ///                   hf_detrend, bb_detrend, zscore_method,
+    ///                   smooth_duration, detrend_duration, buffer_duration)
+    ///   → (N,) bool mask
+    ///
+    /// Port of pydynamo `detect_artifacts(..., slope_test=False)` and the
+    /// corresponding MATLAB detect_artifacts.m (slope-test branch disabled).
+    /// Default params match pydynamo's defaults.
+    #[pyfunction]
+    #[pyo3(signature = (
+        data, fs,
+        hf_pass=35.0, hf_crit=5.5, bb_pass=0.1, bb_crit=5.5,
+        hf_detrend=true, bb_detrend=true, zscore_method="robust",
+        smooth_duration=2.0, detrend_duration=300.0, buffer_duration=0.0,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn detect_artifacts<'py>(
+        py: Python<'py>,
+        data: PyReadonlyArray1<'py, f64>,
+        fs: f64,
+        hf_pass: f64, hf_crit: f64, bb_pass: f64, bb_crit: f64,
+        hf_detrend: bool, bb_detrend: bool,
+        zscore_method: &str,
+        smooth_duration: f64, detrend_duration: f64, buffer_duration: f64,
+    ) -> PyResult<Bound<'py, numpy::PyArray1<bool>>> {
+        use super::artifacts::{detect_artifacts as rs_fn, ArtifactOpts, ZScoreMethod};
+        let zm = match zscore_method.to_ascii_lowercase().as_str() {
+            "robust" => ZScoreMethod::Robust,
+            "standard" => ZScoreMethod::Standard,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "zscore_method must be 'robust' or 'standard', got {:?}",
+                    other
+                )));
+            }
+        };
+        let opts = ArtifactOpts {
+            hf_pass, hf_crit, bb_pass, bb_crit,
+            hf_detrend, bb_detrend,
+            smooth_duration, detrend_duration, buffer_duration,
+            zscore_method: zm,
+        };
+        let vec = data.as_array().to_owned().into_raw_vec_and_offset().0;
+        let out = rs_fn(&vec, fs, &opts);
+        Ok(numpy::ndarray::Array1::from(out).into_pyarray_bound(py))
+    }
+
+    /// build_baseline_exclude(t_data, stage_times, stage_vals, baseline_stages,
+    ///                        artifacts, user_exclude=None) -> (N,) bool
+    ///
+    /// OR together (explicit_exclude, stage_not_in_baseline_stages, artifacts).
+    /// Matches pydynamo pipeline.py:123-129.
+    #[pyfunction]
+    #[pyo3(signature = (
+        t_data, stage_times, stage_vals, baseline_stages, artifacts,
+        user_exclude=None,
+    ))]
+    fn build_baseline_exclude<'py>(
+        py: Python<'py>,
+        t_data: PyReadonlyArray1<'py, f64>,
+        stage_times: PyReadonlyArray1<'py, f64>,
+        stage_vals: PyReadonlyArray1<'py, f64>,
+        baseline_stages: PyReadonlyArray1<'py, f64>,
+        artifacts: PyReadonlyArray1<'py, bool>,
+        user_exclude: Option<PyReadonlyArray1<'py, bool>>,
+    ) -> PyResult<Bound<'py, numpy::PyArray1<bool>>> {
+        let t = t_data.as_array().to_owned().into_raw_vec_and_offset().0;
+        let st = stage_times.as_array().to_owned().into_raw_vec_and_offset().0;
+        let sv = stage_vals.as_array().to_owned().into_raw_vec_and_offset().0;
+        let bs = baseline_stages.as_array().to_owned().into_raw_vec_and_offset().0;
+        let art: Vec<bool> = artifacts.as_array().iter().copied().collect();
+        let ue_vec: Option<Vec<bool>> = user_exclude
+            .as_ref()
+            .map(|ue| ue.as_array().iter().copied().collect());
+        let out = super::baseline::build_baseline_exclude(
+            &t, &st, &sv, &bs, &art, ue_vec.as_deref(),
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        Ok(numpy::ndarray::Array1::from(out).into_pyarray_bound(py))
     }
 
     /// compute_baseline(spect, stimes, t_data, baseline_exclude, baseline_range, baseline_ptile)
@@ -513,6 +768,11 @@ mod python {
         m.add_function(wrap_pyfunction!(merge_segment_with_borders, m)?)?;
         m.add_function(wrap_pyfunction!(trim_regions, m)?)?;
         m.add_function(wrap_pyfunction!(matlab_watershed, m)?)?;
+        m.add_function(wrap_pyfunction!(matlab_paint_labels, m)?)?;
+        m.add_function(wrap_pyfunction!(so_power_from_spectrogram, m)?)?;
+        m.add_function(wrap_pyfunction!(so_phase_from_eeg, m)?)?;
+        m.add_function(wrap_pyfunction!(build_baseline_exclude, m)?)?;
+        m.add_function(wrap_pyfunction!(detect_artifacts, m)?)?;
         m.add_function(wrap_pyfunction!(compute_baseline, m)?)?;
         m.add_function(wrap_pyfunction!(subtract_baseline, m)?)?;
         m.add_function(wrap_pyfunction!(mask_spectrogram, m)?)?;

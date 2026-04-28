@@ -219,6 +219,56 @@ fn hazen_via_quickselect(mut vals: Vec<f64>, q_pct: f64) -> f64 {
     a + (b - a) * frac
 }
 
+/// Build the per-EEG-sample baseline-exclude mask from stages + artifacts +
+/// any explicit user-provided exclusion.
+///
+/// Port of pydynamo `pipeline.py` lines 123–129:
+///   stage_at_data = interp1d(stage_times, stage_vals, kind='previous',
+///                            fill_value=0.0)(t_data)
+///   stage_exclude = ~isin(stage_at_data, baseline_stages)
+///   baseline_exclude = user_exclude | stage_exclude | artifacts
+///
+/// `user_exclude` may be empty (treated as all-false).
+/// `baseline_stages` typically = `[1, 2, 3, 4, 5]` (NREM + REM + Wake; only
+/// stage 0 / unknown + 6 / artifact are excluded by default).
+pub fn build_baseline_exclude(
+    t_data: &[f64],
+    stage_times: &[f64],
+    stage_vals: &[f64],
+    baseline_stages: &[f64],
+    artifacts: &[bool],
+    user_exclude: Option<&[bool]>,
+) -> Result<Vec<bool>, String> {
+    let n = t_data.len();
+    if artifacts.len() != n {
+        return Err(format!("artifacts length {} != t_data length {}", artifacts.len(), n));
+    }
+    if let Some(ue) = user_exclude {
+        if ue.len() != n {
+            return Err(format!("user_exclude length {} != t_data length {}", ue.len(), n));
+        }
+    }
+
+    // Previous-neighbor stage interp onto t_data, fill=0 outside the range
+    // (pydynamo uses fill_value=0.0, NOT NaN, for this specific call).
+    let stage_at_data = crate::peak_assign::interp_previous(
+        stage_times,
+        stage_vals,
+        t_data,
+        0.0,
+    );
+
+    let mut out = vec![false; n];
+    for i in 0..n {
+        let in_baseline_stages = baseline_stages
+            .iter()
+            .any(|&bs| (bs - stage_at_data[i]).abs() < f64::EPSILON);
+        let explicit = user_exclude.map_or(false, |ue| ue[i]);
+        out[i] = explicit || !in_baseline_stages || artifacts[i];
+    }
+    Ok(out)
+}
+
 /// Divide spectrogram by baseline (column broadcast).
 pub fn subtract_baseline(
     spect: ArrayView2<f64>,
@@ -297,6 +347,30 @@ mod tests {
         assert_eq!(bl.dim(), (2, 1));
         assert!((bl[[0, 0]] - 20.0).abs() < 1e-12);
         assert!((bl[[1, 0]] - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn baseline_exclude_combines_stages_and_artifacts() {
+        // t_data = 0..10, stages = [0, 5] → vals [2, 6] (N2 then Artifact/excluded)
+        // baseline_stages = [1,2,3,4,5]; so stage 6 samples are excluded.
+        let t_data: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        let stage_times = vec![0.0, 5.0];
+        let stage_vals = vec![2.0, 6.0];
+        let baseline_stages = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let mut artifacts = vec![false; 10];
+        artifacts[7] = true;
+        let out = build_baseline_exclude(
+            &t_data, &stage_times, &stage_vals, &baseline_stages, &artifacts, None
+        ).unwrap();
+        // Samples 0..5 → stage 2 (in baseline_stages, not artifact) → keep.
+        // Samples 5..10 → stage 6 (NOT in baseline_stages) → exclude.
+        // Sample 7 also artifact → exclude (already excluded anyway).
+        for i in 0..5 {
+            assert!(!out[i], "sample {} should be included", i);
+        }
+        for i in 5..10 {
+            assert!(out[i], "sample {} should be excluded", i);
+        }
     }
 
     #[test]

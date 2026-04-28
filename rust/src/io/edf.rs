@@ -4,9 +4,11 @@
 //! by 256 bytes of per-signal header per signal, and then int16 data records.
 //! Digital samples are linearly mapped to physical units:
 //!
-//!     scale  = (physical_max - physical_min) / (digital_max - digital_min)
-//!     offset = physical_min - digital_min * scale
-//!     phys   = raw_i16 * scale + offset
+//! ```text
+//! scale  = (physical_max - physical_min) / (digital_max - digital_min)
+//! offset = physical_min - digital_min * scale
+//! phys   = raw_i16 * scale + offset
+//! ```
 //!
 //! Channel selection matches labels case-insensitively after trimming
 //! surrounding spaces and NUL bytes. "ChA-ChB" requests a rereferenced
