@@ -1,159 +1,268 @@
-# DYNAM-O_py
+# DYNAM-O_rs
 
-Python + Rust port of [DYNAM-O](https://github.com/preraulab/DYNAM-O): TF-peak
-extraction (double watershed + merge + trim + Hann refinement), SO-power /
-SO-phase histograms, and a MATLAB-style summary figure.
+Pure Rust implementation of the DYNAM-O pipeline — TF-peak extraction (double
+watershed + merge + MATLAB-paint border + trim + Hann refinement), SO-power
+and SO-phase time-series + 2D histograms, two-band artifact detection,
+baseline subtraction, peak-stage/SO assignment, and EDF / staging I/O. Ships
+as a library, a C ABI for MATLAB MEX, a PyO3 extension for pydynamo, and a
+standalone `dynamo` CLI binary.
 
-The Rust crate `dynamo_rs` (in `rust/`) accelerates the hot paths:
-- `matlab_watershed` — bit-identical to MATLAB IPT `watershed` (Vincent-Soille
-  + FIFO priority)
-- `merge_segment` — port of `mergeWshedSegment` with the symmetric
-  `edgeWeightEqual` rule
-- `trim_regions` — port of `trimWshedRegions`
+This crate is the Rust core shared by:
 
-Multitaper spectrogram delegates to the existing
-[`multitaper_rs`](https://github.com/preraulab/multitaper_toolbox) crate.
+- **[DYNAM-O](https://github.com/preraulab/DYNAM-O)** — MATLAB toolbox. The `backend='rust'` path calls `dynamo_rs` via MEX wrappers (`DYNAM-O_dev/rust_bridge/`).
+- **[pyDYNAM-O](https://github.com/preraulab/DYNAM-O_py)** — Python port. Uses `dynamo_rs` via PyO3 bindings.
+- **[DYNAM-O_toolbox](https://github.com/preraulab/DYNAM-O_toolbox)** — parent meta-repo that pins all three as git submodules.
+- **Standalone `dynamo` CLI** — native binary, no MATLAB or Python dependency at runtime. See *CLI usage* below.
+
+---
 
 ## Accuracy vs MATLAB reference
 
-Validated end-to-end against `runDYNAMO` on the bundled example EEG, using the
-real MATLAB pipeline defaults (`detection_opts()`, `baseline_opts()`,
-`SOpowerphasehist_opts()`). Per-stage intermediates are compared via
-`scripts/bisect/*.py` against ground-truth `.mat` files exported by
-`scripts/export_*.m`.
+Measured head-to-head on the bundled night recording via
+`benchmark_runDYNAMO` (warm, 3-trial median per backend), 2026-04-24
+on an M3 8-core, MATLAB R2025b, Rust release build (fat LTO +
+codegen-units = 1). Committed JSON at
 
-| dataset | pydynamo peaks | MATLAB peaks | diff | **SOpower cos** | **SOphase cos** |
-|---|---:|---:|---:|---:|---:|
-| segment (~84 min) | 5 785 | 5 738 | **+0.8 %** | **0.9958** | **0.9822** |
-| full night (~8.4 h) | 34 911 | 34 788 | **+0.4 %** | **0.9973** | **0.9960** |
+**Backend contract:** `backend='matlab'` is a pure-MATLAB reference
+implementation (except for the bundled `multitaper_spectrogram_mex`, which
+predates the rust_bridge work). All four Rust-backed MEX wrappers
+(`extract_tfpeaks_mex`, `mask_spectrogram_mex`, `refine_peaks_mex`,
+`tfpeak_histogram_mex`) are gated behind `backend='rust'`.
 
-Stage-by-stage verification:
-
-| stage | agreement vs MATLAB |
-|---|---|
-| multitaper spectrogram | max_rel ≈ 5e-5 (FFT-library floor) |
-| artifacts | 99.99 % sample agreement |
-| baseline (hazen prctile) | max_rel ≈ 1e-7 (bit-identical) |
-| spect / baseline division | exact |
-| watershed | bit-identical to MATLAB IPT |
-| merge (post-merge region counts) | +0.1 % |
-| pass-2 mask (interior − 1-px perimeter) | matches `maskSpectrogram` exactly |
-| SOpower timeseries | cos = 1.0000 |
-| SOphase timeseries (MATLAB-exact SOS filter) | cos ≈ 0.987 (edge transient); mid-90 % bit-identical (0.0006 rad median) |
-| SOpower / SOphase histogram binning | bit-identical given same stats table |
-
-## Runtime (full night, 8.4 h recording, macOS x86_64)
-
-| stage | pydynamo | MATLAB | speedup |
+| Stage | `backend='matlab'` (pure MATLAB) | `backend='rust'` (MEX) | Speedup |
 |---|---:|---:|---:|
-| **total end-to-end** | **101 s** | **146 s** | **1.45×** |
-| extract pass-1 | 20 s | 84 s | 4.2× |
-| extract pass-2 | 21 s | 32 s | 1.5× |
+| **Total `runDYNAMO('night')`** | **163.5 s** | **34.8 s** | **4.70×** |
+| Combined Rust extract (pass 1 + 2) | 144.9 s | 16.1 s | **9.0×** |
+| Extract pass 1 | 100.7 s | 10.2 s | 9.8× |
+| Extract pass 2 | 44.2 s | 5.9 s | 7.5× |
+| Peak refinement | 0.9 s (warm parfor) | 0.3 s | 2.8× |
+| Histogram binning (SO-power + SO-phase) | ~3.5 s (pure-MATLAB loop) | 0.23 s (MEX) | ~15× |
 
-## Install from scratch
+| Peak count | `backend='matlab'` | `backend='rust'` | Δ |
+|---|---:|---:|---:|
+| Pass 1 (raw) | 65 829 | 70 115 | Rust +6.5% |
+| **Pass 2 (final, post-rejection)** | **34 788** | **34 579** | **Rust −0.60%** |
 
-### Prerequisites
+The final **−0.60 % peak-count gap** is tighter than the historical
+~−0.8 %, reflecting the edge-peak refine + `trim_shift` global-min fixes
+landed 2026-04-24 (both pull Rust toward MATLAB's retention behaviour).
+The remaining gap is watershed border tie-breaking between MATLAB's IPT
+implementation and `matlab_watershed.rs` — pixel sets of painted regions
+match 100 %, but a handful of peaks land on opposite sides of the
+bandwidth/duration filter cutoffs. Pass 1 diverges more (Rust +6.5 %)
+because pass-1 sees raw watershed output; the pass-2 mask absorbs most
+of that, and the two paths converge.
 
-- **Python ≥ 3.9**
-- **Rust toolchain** (`cargo`, `rustc`) — install via [rustup](https://rustup.rs/):
-  ```bash
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-  ```
-- **maturin** — builds the Rust extensions against CPython:
-  ```bash
-  pip install maturin
-  ```
-- **MATLAB is NOT required** to run the pipeline. It is only needed to
-  regenerate ground-truth `.mat` intermediates under `data_cache/` (the
-  `scripts/export_*.m` files). Accuracy benchmarking against MATLAB uses
-  those exported files, which can be produced once and reused.
+### Recent refinements (2026-04-24)
 
-### Install
+Four correctness + perf changes tightened parity and shaved extract time:
+
+1. **`trim_shift` parity** — `runSegmentedData.m` now passes the MATLAB
+   global `min(spect/baseline, [], 'all')` instead of NaN (which routed Rust
+   to its per-segment-min fallback). Both backends see the same shift.
+2. **Edge-peak refine** — peaks within `window_size/2` of data start/end
+   keep their pass-2 bbox-centroid `PeakFrequency` unchanged instead of
+   running the Hann refine on a zero-padded partial window (matches
+   `refinePeakFrequency.m:141`).
+3. **Heap-based merge loop** — `merge.rs` replaces two O(|E|) linear scans
+   per iteration (max-find + retain-filter-on-src) with a `BinaryHeap` +
+   lazy deletion via per-edge generation counters. Tie-break preserved via
+   insertion order (earliest-label-pair wins ties, matches MATLAB's
+   edge-index convention). ~3 % off extract on night.
+4. **`lto = "fat"` + `codegen-units = 1`** in the release profile — ~5 %
+   off extract from full cross-unit inlining + dead-code elim. Dylib
+   shrinks from 1.21 MB → 1.16 MB. Build time 14 s → 28 s.
+
+Net wall-clock on the bundled night fixture: total `runDYNAMO('night')`
+drops from 37.8 s to 36.5 s (−3.4 %); combined Rust extract (passes 1 + 2)
+drops from 15.5 s to 14.3 s (−7.9 %). Peak-count parity vs MATLAB reference
+is unchanged (still ~−0.8 %, dominated by merge tie-breaking not
+`trim_shift`).
+
+A separate fix unrelated to extract: `dynamo_tfpeak_histogram`'s C ABI
+copy-out was writing row-major into MATLAB-column-major buffers, producing
+~1 Hz striped SO-power / SO-phase histograms that crashed downstream
+`fitParamBasis`. Now bit-identical to the pure-MATLAB binning loop
+(`TFPeakHistogram.m`); warm MEX is 21 × faster than the MATLAB loop on
+5 k-peak / 101 c-bin / 151 f-bin fixtures.
+
+### Recommended sampling frequency: 100 Hz
+
+DYNAM-O analyzes 0–30 Hz, so 100 Hz Nyquist covers everything the
+pipeline cares about. The multitaper-spectrogram NFFT is
+`2^nextpow2(Fs / mtm_dsfreqs)` (default `mtm_dsfreqs = 0.1`), so
+**Fs > 102.4 Hz** doubles NFFT and typically pushes the spectrogram
+past CPU L3 cache — every downstream stage (extract / baseline /
+mask / watershed / refine) takes a 2–3× memory-bandwidth hit on top
+of the doubled FFT cost.
+
+| Native Fs | NFFT | Spec stage cost vs 100 Hz |
+|---:|---:|---:|
+| ≤ 100 | 1024 | 1× |
+| 128, 200 | 2048 | ~2.2× |
+| 256 | 4096 | ~4.6× |
+| 500, 512 | 8192 | ~9.3× |
+| 1000 | 16384 | ~18× |
+
+Resample to 100 Hz before feeding `dynamo extract` / `dynamo_extract_tfpeaks`
+for ~2× end-to-end speedup with zero analytical loss for sleep oscillations.
+Empirical: 10.5 h × 128 Hz EDF goes from ~41 s → ~22 s on a 32-core
+Threadripper (Rust backend, full pipeline). The MATLAB FileManager has
+this enabled by default; CLI / pydynamo callers should pass already-
+resampled data. See [`DYNAM-O_dev/rust_bridge/benchmarks/README.md`](https://github.com/preraulab/DYNAM-O_dev/blob/rust-bridge/rust_bridge/benchmarks/README.md) for the per-stage scaling analysis.
+
+---
+
+## Crate layout
+
+Triple-target `cdylib` / `staticlib` / `rlib` with an optional `python`
+feature for PyO3 bindings:
+
+```toml
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+default = []
+python  = ["dep:pyo3", "dep:numpy"]
+```
+
+```
+rust/
+  Cargo.toml
+  src/
+    lib.rs                # Rust API + PyO3 wrappers (behind `python` feature)
+    c_api.rs              # extern "C" surface for MEX wrappers + cbindgen
+    pipeline.rs           # top-level run_extract_from_spectrogram + write_stats_csv
+    extract_pipeline.rs   # full extract (watershed+merge+paint+trim+stats)
+    matlab_watershed.rs   # IPT-compatible watershed port (Vincent-Soille)
+    merge.rs              # region adjacency graph + iterative merge
+    trim.rs               # volume-based region trimming
+    mask.rs               # pass-2 spectrogram masking
+    refine.rs             # Hann-window peak-frequency refinement
+    histogram.rs          # SO-power / SO-phase 2D histogram accumulator
+    baseline.rs           # percentile-based baseline + build_baseline_exclude helper
+    so_power.rs           # SO-power time-series pipeline (post-MTS)
+    so_phase.rs           # SO-phase time-series (filter+hilbert+unwrap)
+    peak_assign.rs        # per-peak stage / SO-power / SO-phase interpolation
+    artifacts.rs          # two-band artifact detection (HF + BB, robust z-score)
+    mts.rs                # thin wrapper around `multitaper_rs` crate
+    signal.rs             # sosfiltfilt, hilbert, unwrap, movmean
+    filter_cache.rs       # SOphase SOS cache (.npy) + cheby1 fallback
+    filter_design.rs      # cheby1_sos (ported from scipy.signal.cheby1)
+    adjacency.rs          # region adjacency utilities
+    io/                   # edf, staging
+    bin/dynamo.rs         # CLI entry point (`cargo build --bin dynamo`)
+  include/
+    dynamo_rs.h           # cbindgen-generated C header
+data_matlab_filters/      # 43 pre-computed SOphase SOS filters (.npy)
+```
+
+---
+
+## Build
+
+### As a Rust library / C library (for MEX consumers)
 
 ```bash
-git clone git@github.com:preraulab/DYNAM-O_py.git
-cd DYNAM-O_py
-
-# (recommended) fresh virtualenv
-python -m venv .venv && source .venv/bin/activate
-pip install --upgrade pip maturin
-
-# Build + install the Rust merge / trim / watershed extension (dynamo_rs)
-maturin develop --release -m rust/pyproject.toml
-
-# Build + install the multitaper spectrogram Rust extension (multitaper_rs)
-# from its own repo — it's a sibling dependency, not on PyPI yet:
-git clone git@github.com:preraulab/multitaper_toolbox.git
-maturin develop --release -m multitaper_toolbox/src/python/rust/pyproject.toml
-
-# Install the Python package
-pip install -e .
-
-# (optional) test dependencies
-pip install -e '.[test]'
+cd rust
+cargo build --release
 ```
 
-Python runtime deps (installed automatically by `pip install -e .`):
-numpy ≥ 1.24, scipy ≥ 1.11, scikit-image ≥ 0.22, matplotlib ≥ 3.7, pandas ≥ 2.0,
-joblib ≥ 1.3, tqdm ≥ 4.65, colorcet ≥ 3.0.
+Produces:
+- `target/release/libdynamo_rs.{dylib,so,a}` (macOS / Linux; `.dll` + `.dll.lib` on Windows).
+- `include/dynamo_rs.h` — regenerated on each build via `build.rs` + `cbindgen`.
 
-## Usage
+MATLAB MEX wrappers live in `DYNAM-O_dev/rust_bridge/` and link against these
+artifacts. See
+[`rust_bridge/README.md`](https://github.com/preraulab/DYNAM-O/blob/main/rust_bridge/README.md)
+in the MATLAB repo for the end-to-end build recipe.
 
-```python
-import scipy.io as sio
-from pydynamo import run_dynamo
-
-m = sio.loadmat("example_data.mat", simplify_cells=True)
-out = run_dynamo(
-    m["data"].ravel(),
-    float(m["Fs"]),
-    m["stage_times"],
-    m["stage_vals"],
-    # MATLAB runExampleData.m 'segment' overrides (omit for full-night defaults)
-    time_range=(8420.0, 13446.0),
-    min_time_in_bin=5,
-    min_peak_at_freq=10,
-)
-print(out.stats_table.head())       # per-peak stats
-print(out.SOPHs.SOpower_mat.shape)  # (freq_bins, SOpower_bins)
-```
-
-## Stage convention
-
-DYNAM-O uses `1=N3, 2=N2, 3=N1, 4=REM, 5=Wake` — reversed from most EDF
-stagers. Pass stages in this convention or histograms will be empty or
-inverted.
-
-## Side-by-side figures
-
-`scripts/compare_matlab_vs_pydynamo.py` renders MATLAB's output and
-pydynamo's output through the identical `summary_plot` code, so any visual
-difference is pure data difference (not color scaling or layout).
-
-![segment comparison](data_cache/compare_segment_sidebyside.png)
-
-![night comparison](data_cache/compare_night_sidebyside.png)
-
-## Validation data
-
-All ground-truth comparison uses `runDYNAMO` output from the DYNAM-O repo's
-bundled example EEG (`example_data.mat`). Regenerate MATLAB intermediates
-once from the DYNAM-O repo root:
-
-```matlab
-run('<path-to-DYNAM-O_py>/scripts/export_bisect_intermediates.m')
-run('<path-to-DYNAM-O_py>/scripts/export_merge_diagnostics.m')
-run('<path-to-DYNAM-O_py>/scripts/export_pass1_diagnostics.m')
-```
-
-These populate `data_cache/` with `.mat` / `.csv` files (not version-controlled).
-
-## Tests
+### As a Python extension (for pydynamo)
 
 ```bash
-pytest tests/
+cd rust
+maturin build --release --features python
+# or, for in-place development:
+maturin develop --release --features python
 ```
 
-Smoke + unit coverage for spectrogram, artifacts, baseline, SOpower timeseries,
-SOpower histogram binning from MATLAB peaks, slope_test, watershed-vs-MATLAB
-equivalence, and an end-to-end run.
+Produces `dynamo_rs*.whl`. Pydynamo's optional `import dynamo_rs` gate picks
+it up automatically when available.
+
+### As a standalone CLI (no MATLAB or Python needed)
+
+```bash
+cd rust
+cargo build --release --bin dynamo
+./target/release/dynamo extract \
+    --spect  spect.npy  \
+    --stimes stimes.npy \
+    --sfreqs sfreqs.npy \
+    --out    stats.csv
+```
+
+Currently covers the "from-spectrogram" slice: given a pre-computed
+multitaper spectrogram as three `.npy` files, run the watershed / merge /
+trim / region-props / filter pipeline and write a CSV with the same columns
+as MATLAB's `stats_table`. Full EDF-to-CSV (multitaper + baseline + refine +
+histograms) is follow-up work; the library primitives are all in place, the
+CLI just needs stitching.
+
+Defaults match `runDYNAMO`: `seg_time=30`, `downsample=(2,2)`,
+`merge_thresh=11`, `trim_vol=0.8`, `dur_min=0.5`, `bw_min=2`, etc. All
+overridable via flags.
+
+### Regenerate the C header manually
+
+The `build.rs` script invokes `cbindgen` on every `cargo build`. If you need
+to regenerate manually:
+
+```bash
+cargo run --bin cbindgen -- --output include/dynamo_rs.h
+```
+
+---
+
+## Consumers at a glance
+
+| Client | How it links | Entry points |
+|---|---|---|
+| **MATLAB MEX** (`DYNAM-O_dev/rust_bridge/`) | Classic-C MEX `.c` files link `-ldynamo_rs` at build, load the dylib at runtime via `dlopen` (macOS embeds rpath) | `dynamo_extract_tfpeaks`, `dynamo_mask_spectrogram`, `dynamo_refine_peaks`, `dynamo_tfpeak_histogram` — in `src/c_api.rs` |
+| **Python** (`pydynamo`) | PyO3 extension (`maturin build --features python`) | `matlab_watershed`, `matlab_paint_labels`, `merge_segment`, `trim_regions`, `mask_spectrogram`, `compute_baseline`, `build_baseline_exclude`, `subtract_baseline`, `so_power_from_spectrogram`, `so_phase_from_eeg`, `detect_artifacts`, `hann_event_spectra`, `refine_from_spectra`, `tfpeak_histogram`, `hilbert`, `sosfiltfilt`, `movmean`, `unwrap`, … — in `src/lib.rs` under `#[pyfunction]` |
+| **Rust** | `Cargo.toml` path or git dep | Public Rust items in `src/lib.rs` |
+| **Standalone CLI** | `cargo build --release --bin dynamo` | `dynamo extract --spect ... --out stats.csv` — in `src/bin/dynamo.rs` |
+
+---
+
+## Border-handling: `matlab_paint_labels_in_order` (default)
+
+The Rust extract pipeline supports two modes for filling watershed 0-lines
+between merged regions. Controlled by `ExtractParams.expand_labels_distance`:
+
+- **`0` (default)** → `matlab_paint_labels_in_order` — matches MATLAB's
+  `Ldata(rgn{ii}) = ii` paint-in-label-order semantics (8-conn 1-px dilation
+  per label, higher cell indices overwrite lower on shared borders). This is
+  the mode the MATLAB backend expects and is what closes the previously
+  +1.96 % peak-count gap to −0.8 %.
+
+- **`N > 0`** → `expand_labels_bfs(distance=N)` — skimage-style distance-based
+  BFS fill with lower-label-wins ties. Historical pydynamo default (5). Kept
+  for backward compatibility; produces ~1–2 % more peaks than MATLAB.
+
+See `src/extract_pipeline.rs::extract_tfpeaks_segment` for the call site.
+
+---
+
+## Branches
+
+- `rust-bridge` — active development line for the three-repo restructure. MATLAB-paint default, matlab_watershed, c_api with `expand_labels_distance`.
+- `main` — historical hybrid layout (Python + Rust + MATLAB shims together). Use only for archaeology.
+
+Tag releases as `v0.x.y-<feature>` when cutting consumer-pinnable snapshots.
+
+---
+
+## License
+
+BSD 3-Clause.
