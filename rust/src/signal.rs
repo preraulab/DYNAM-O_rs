@@ -39,6 +39,7 @@ fn sosfilt_single_section(sec: &[f64; 6], x: &mut [f64], mut z0: f64, mut z1: f6
 
 /// Forward lfilter across all sections. Mutates `x` in place. Initial state
 /// per section defaults to zeros unless `zi` is given.
+#[allow(dead_code)]
 fn sosfilt(sos: &[[f64; 6]], x: &mut [f64], zi: Option<&[[f64; 2]]>) {
     for (i, sec) in sos.iter().enumerate() {
         let (z0, z1) = zi.map(|z| (z[i][0], z[i][1])).unwrap_or((0.0, 0.0));
@@ -73,8 +74,7 @@ fn sosfilt_zi(sos: &[[f64; 6]]) -> Vec<[f64; 2]> {
         let rhs0 = b1 - a1 * b0;
         let rhs1 = b2 - a2 * b0;
         let z0 = (rhs0 + rhs1) / det;
-        let z1 = a2 * z0 - rhs1; // from row 2: z1 = a2*z0 - (b2 - a2*b0)
-        // Actually row 2: a2*z0 + z1 = rhs1 → z1 = rhs1 - a2*z0
+        // row 2: a2*z0 + z1 = rhs1 → z1 = rhs1 - a2*z0
         let z1 = rhs1 - a2 * z0;
         out.push([scale * z0, scale * z1]);
         // DC gain of this section: (b0+b1+b2)/(1+a1+a2)

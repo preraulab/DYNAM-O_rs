@@ -16,10 +16,6 @@ use realfft::num_complex::Complex64;
 
 type C = Complex64;
 
-fn cplx(re: f64, im: f64) -> C {
-    C::new(re, im)
-}
-
 /// Chebyshev Type I analog lowpass prototype (Wn=1 rad/s).
 /// Returns (zeros, poles, gain). Zeros is always empty (all-pole).
 fn cheb1ap(n: usize, rp: f64) -> (Vec<C>, Vec<C>, f64) {
@@ -35,18 +31,13 @@ fn cheb1ap(n: usize, rp: f64) -> (Vec<C>, Vec<C>, f64) {
         let theta = std::f64::consts::PI * (2.0 * k as f64 - 1.0) / (2.0 * n as f64);
         poles.push(C::new(-sinh_mu * theta.sin(), cosh_mu * theta.cos()));
     }
-    // Gain: scipy's cheb1ap does gain = prod(-poles).real, and for even n
-    // divides by sqrt(1+eps^2) (to compensate for gain at DC of Type I).
-    let mut gain = 1.0;
-    for &p in &poles {
-        gain *= (-p).re; // imaginary parts cancel in conj pairs → final product is real
-    }
-    // Account for imaginary parts via full complex product (safer):
+    // Gain: scipy's cheb1ap does prod(-poles).real, then divides by
+    // sqrt(1+eps^2) for even n (to compensate for Type I DC gain).
     let mut g = C::new(1.0, 0.0);
     for &p in &poles {
         g *= -p;
     }
-    gain = g.re;
+    let mut gain = g.re;
     if n % 2 == 0 {
         gain /= (1.0 + eps * eps).sqrt();
     }
