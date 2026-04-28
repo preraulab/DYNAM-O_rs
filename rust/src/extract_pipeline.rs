@@ -37,7 +37,7 @@ use std::collections::{HashMap, VecDeque};
 /// boundary pixel of peak i (8-connectivity perimeter, in physical units).
 /// `height_data[i]` is the spectrogram values at every interior pixel of
 /// peak i, in MATLAB regionprops column-major order (bit-comparable across
-/// backends). `peakiness = log10(Area·Height/Volume)`.
+/// backends). `peakiness = 10*log10(Area·Height/Volume)` (dB).
 ///
 /// `boundaries_xy[i]` is the perimeter in **clockwise traversal order**
 /// (Moore-neighbor trace). This deliberately diverges from MATLAB's pure
@@ -57,7 +57,7 @@ pub struct SegmentPeaks {
     pub segment_num: Vec<f64>,
     pub bbox: Vec<f64>, // 4 * n (t_tl, f_tl, width_s, height_Hz) in pydynamo format
     pub area: Vec<f64>, // sec*Hz per peak (pixel_count * d_time * d_freq)
-    pub peakiness: Vec<f64>, // log10(area * height / volume)
+    pub peakiness: Vec<f64>, // 10*log10(area * height / volume), dB
     pub height_data: Vec<Vec<f64>>, // pixel values per peak (interior, NaN-excluded)
     pub boundaries_xy: Vec<Vec<f64>>, // interleaved (t, f) pairs per peak
 }
@@ -480,11 +480,11 @@ fn compute_peak_props_from_trim(
         let height = a.max_v - a.min_v;
         let volume = a.sum_v * d_time * d_freq;
         let area = (a.pixel_count as f64) * d_time * d_freq;
-        // peakiness = log10(Area·Height/Volume). Pre-baseline-divided
+        // peakiness = 10*log10(Area·Height/Volume), in dB. Pre-baseline-divided
         // spectrogram pixels are positive in practice; degenerate regions
         // (height=0 → log10(0) = -∞, or volume=0 → log10(±∞) = ±∞) propagate
         // their sentinel so downstream filters can decide.
-        let peakiness = (area * height / volume).log10();
+        let peakiness = 10.0 * (area * height / volume).log10();
         // BoundingBox in pydynamo format: (time_tl, freq_tl, width_s, height_Hz).
         let t_tl = (a.c_min as f64) * d_time + t0;
         let f_tl = (a.r_min as f64) * d_freq + f0;
@@ -1015,7 +1015,7 @@ mod tests {
         p.segment_num.push(1.0);
         p.bbox.extend_from_slice(&[0.0, 0.0, 0.0, 0.0]);
         p.area.push(5.0);
-        p.peakiness.push((5.0_f64 * 100.0 / 1.0).log10()); // log10(area * height / volume)
+        p.peakiness.push(10.0 * (5.0_f64 * 100.0 / 1.0).log10()); // 10*log10(area * height / volume), dB
         p.height_data.push(vec![1.0, 2.0]);
         p.boundaries_xy.push(vec![0.0, 10.0]);
         let params = ExtractParams {
