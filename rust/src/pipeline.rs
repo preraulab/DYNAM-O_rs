@@ -65,7 +65,7 @@ pub fn default_extract_params() -> ExtractParams {
 /// Write a `SegmentPeaks` to a CSV file in the same column layout as the
 /// MATLAB `stats_table` (headers: PeakTime, PeakFrequency, Duration,
 /// Bandwidth, Height, Volume, SegmentNum, Area, Peakiness — where
-/// Peakiness = log10(Area·Height/Volume) — bbox_tl_s, bbox_tl_Hz,
+/// Peakiness = 10*log10(Area·Height/Volume), in dB — bbox_tl_s, bbox_tl_Hz,
 /// bbox_width_s, bbox_height_Hz). Variable-length columns (HeightData,
 /// Boundaries) are intentionally omitted from CSV.
 pub fn write_stats_csv(peaks: &SegmentPeaks, path: &std::path::Path) -> std::io::Result<()> {

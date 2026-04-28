@@ -161,7 +161,7 @@ pub struct ExtractTfpeaksOut {
     pub n_label_elems: usize,   // = n_freqs * n_times (0 if spect was empty)
     /// Time-frequency area per peak (sec*Hz). Length n_peaks.
     pub area: *mut f64,
-    /// Peakiness = log10(Area * Height / Volume) per peak. Length n_peaks.
+    /// Peakiness = 10*log10(Area * Height / Volume) per peak, in dB. Length n_peaks.
     pub peakiness: *mut f64,
     /// Flattened per-peak pixel values; length `n_height_data_elems`.
     pub height_data: *mut f64,
