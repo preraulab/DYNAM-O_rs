@@ -142,6 +142,53 @@ typedef struct ExtractTfpeaksOut {
   uint64_t *boundary_offsets;
 } ExtractTfpeaksOut;
 
+/**
+ * Input descriptor for [`dynamo_multitaper_spectrogram`].
+ *
+ * `data_ptr` is a length-`n_data` f64 vector. `tapers_ptr` is the
+ * pre-computed DPSS taper bank (caller supplies; we don't reimplement
+ * `dpss` in Rust), row-major (n_tapers × winsize) so element (k, i) is
+ * at `tapers_ptr[k * winsize + i]`. Caller MUST guarantee
+ * `winsize == round(window_size_s * fs)` — the underlying compute
+ * validates and returns ShapeMismatch otherwise.
+ *
+ * `eigen_ptr` is required iff `weighting == 1` (Eigen). Pass null
+ * (and `weighting = 0`) for unity weighting (the DYNAM-O default).
+ */
+typedef struct MtsIn {
+  const double *data_ptr;
+  uintptr_t n_data;
+  double fs;
+  const double *tapers_ptr;
+  uintptr_t n_tapers;
+  uintptr_t winsize;
+  const double *eigen_ptr;
+  uintptr_t eigen_len;
+  double freq_min;
+  double freq_max;
+  double window_size_s;
+  double window_step_s;
+  uintptr_t nfft;
+  uint32_t detrend;
+  uint32_t weighting;
+} MtsIn;
+
+/**
+ * Output descriptor for [`dynamo_multitaper_spectrogram`].
+ *
+ * `spect_ptr` points to a row-major (n_freqs_out × n_windows) f64 buffer.
+ * All three pointers come from `Box::leak` and must be released with
+ * `dynamo_free_buffer_f64(ptr, len)` where `len` is the matching
+ * `n_freqs_out`, `n_windows`, or `n_freqs_out * n_windows` count.
+ */
+typedef struct MtsOut {
+  double *spect_ptr;
+  uintptr_t n_freqs_out;
+  uintptr_t n_windows;
+  double *stimes_ptr;
+  double *sfreqs_ptr;
+} MtsOut;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -248,6 +295,21 @@ int dynamo_mask_spectrogram(const double *spect_2s,
                             uintptr_t n_times_2,
                             uintptr_t n_times_1,
                             double *out_masked);
+
+/**
+ * Compute a multitaper spectrogram via the `multitaper_rs` crate.
+ *
+ * Wraps `multitaper_rs::compute_spectrogram` with a C ABI matching the
+ * shape of the other dynamo_rs ABI entries. f64 throughout — the MATLAB
+ * Coder MEX uses f32, so callers swapping over should expect f32-roundoff
+ * (~1e-7 relative) drift in output.
+ *
+ * # Safety
+ * `in_` must point to a valid `MtsIn`. `out` must point to a valid
+ * (uninitialized or zeroed) `MtsOut`. Array pointers must be non-null
+ * for the lengths declared (data_ptr, tapers_ptr, eigen_ptr if used).
+ */
+int dynamo_multitaper_spectrogram(const struct MtsIn *in_, struct MtsOut *out);
 
 /**
  * Free a buffer previously returned via one of the callee-allocated output
