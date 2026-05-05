@@ -818,6 +818,176 @@ pub unsafe extern "C" fn dynamo_mask_spectrogram(
 }
 
 // -------------------------------------------------------------------------
+// 5. dynamo_multitaper_spectrogram: in/out structs
+// -------------------------------------------------------------------------
+
+/// Input descriptor for [`dynamo_multitaper_spectrogram`].
+///
+/// `data_ptr` is a length-`n_data` f64 vector. `tapers_ptr` is the
+/// pre-computed DPSS taper bank (caller supplies; we don't reimplement
+/// `dpss` in Rust), row-major (n_tapers × winsize) so element (k, i) is
+/// at `tapers_ptr[k * winsize + i]`. Caller MUST guarantee
+/// `winsize == round(window_size_s * fs)` — the underlying compute
+/// validates and returns ShapeMismatch otherwise.
+///
+/// `eigen_ptr` is required iff `weighting == 1` (Eigen). Pass null
+/// (and `weighting = 0`) for unity weighting (the DYNAM-O default).
+#[repr(C)]
+pub struct MtsIn {
+    pub data_ptr:        *const f64,
+    pub n_data:          usize,
+    pub fs:              f64,
+
+    pub tapers_ptr:      *const f64,
+    pub n_tapers:        usize,
+    pub winsize:         usize,
+    pub eigen_ptr:       *const f64, // null if unity
+    pub eigen_len:       usize,      // 0 if unity
+
+    pub freq_min:        f64,
+    pub freq_max:        f64,
+    pub window_size_s:   f64,
+    pub window_step_s:   f64,
+    pub nfft:            usize,
+    pub detrend:         u32,        // 0=none, 1=linear, 2=constant
+    pub weighting:       u32,        // 0=unity, 1=eigen
+}
+
+/// Output descriptor for [`dynamo_multitaper_spectrogram`].
+///
+/// `spect_ptr` points to a row-major (n_freqs_out × n_windows) f64 buffer.
+/// All three pointers come from `Box::leak` and must be released with
+/// `dynamo_free_buffer_f64(ptr, len)` where `len` is the matching
+/// `n_freqs_out`, `n_windows`, or `n_freqs_out * n_windows` count.
+#[repr(C)]
+pub struct MtsOut {
+    pub spect_ptr:    *mut f64,
+    pub n_freqs_out:  usize,
+    pub n_windows:    usize,
+    pub stimes_ptr:   *mut f64,
+    pub sfreqs_ptr:   *mut f64,
+}
+
+fn empty_mts_out() -> MtsOut {
+    MtsOut {
+        spect_ptr:   std::ptr::null_mut(),
+        n_freqs_out: 0,
+        n_windows:   0,
+        stimes_ptr:  std::ptr::null_mut(),
+        sfreqs_ptr:  std::ptr::null_mut(),
+    }
+}
+
+/// Compute a multitaper spectrogram via the `multitaper_rs` crate.
+///
+/// Wraps `multitaper_rs::compute_spectrogram` with a C ABI matching the
+/// shape of the other dynamo_rs ABI entries. f64 throughout — the MATLAB
+/// Coder MEX uses f32, so callers swapping over should expect f32-roundoff
+/// (~1e-7 relative) drift in output.
+///
+/// # Safety
+/// `in_` must point to a valid `MtsIn`. `out` must point to a valid
+/// (uninitialized or zeroed) `MtsOut`. Array pointers must be non-null
+/// for the lengths declared (data_ptr, tapers_ptr, eigen_ptr if used).
+#[no_mangle]
+pub unsafe extern "C" fn dynamo_multitaper_spectrogram(
+    in_: *const MtsIn,
+    out: *mut MtsOut,
+) -> c_int {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let input = match NonNull::new(in_ as *mut MtsIn) {
+            Some(p) => &*p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let output = match NonNull::new(out) {
+            Some(p) => &mut *p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+
+        if input.n_data == 0 || input.n_tapers == 0 || input.winsize == 0 || input.nfft == 0 {
+            *output = empty_mts_out();
+            return ErrorCode::InvalidArgument.code();
+        }
+
+        let data_slice = match ptr_as_slice::<f64>(input.data_ptr, input.n_data) {
+            Some(s) => s,
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let tapers_slice = match ptr_as_slice::<f64>(
+            input.tapers_ptr,
+            input.n_tapers * input.winsize,
+        ) {
+            Some(s) => s,
+            None => return ErrorCode::NullPointer.code(),
+        };
+
+        let data_view = ArrayView1::from(data_slice);
+        let tapers_view = match ArrayView2::from_shape((input.n_tapers, input.winsize), tapers_slice) {
+            Ok(v) => v,
+            Err(_) => return ErrorCode::ShapeMismatch.code(),
+        };
+
+        // Eigen weights are optional — only consumed when weighting=Eigen.
+        let eigen_storage: Option<Vec<f64>> = if input.weighting == 1 {
+            if input.eigen_ptr.is_null() || input.eigen_len != input.n_tapers {
+                return ErrorCode::InvalidArgument.code();
+            }
+            Some(slice::from_raw_parts(input.eigen_ptr, input.eigen_len).to_vec())
+        } else {
+            None
+        };
+        let eigen_view = eigen_storage.as_ref().map(|v| ArrayView1::from(v.as_slice()));
+
+        let detrend_mode = match input.detrend {
+            0 => crate::mts::DetrendMode::Off,
+            1 => crate::mts::DetrendMode::Linear,
+            2 => crate::mts::DetrendMode::Constant,
+            _ => return ErrorCode::InvalidArgument.code(),
+        };
+        let weighting = match input.weighting {
+            0 => crate::mts::Weighting::Unity,
+            1 => crate::mts::Weighting::Eigen,
+            _ => return ErrorCode::InvalidArgument.code(),
+        };
+
+        let params = crate::mts::SpectrogramParams {
+            fs: input.fs,
+            frequency_range: (input.freq_min, input.freq_max),
+            window_params: (input.window_size_s, input.window_step_s),
+            nfft: input.nfft,
+            detrend: detrend_mode,
+            weighting,
+        };
+
+        let mts_out = match crate::mts::compute_spectrogram(data_view, tapers_view, eigen_view, &params) {
+            Ok(o) => o,
+            Err(_) => return ErrorCode::KernelError.code(),
+        };
+
+        let n_freqs_out = mts_out.sfreqs.len();
+        let n_windows = mts_out.stimes.len();
+
+        // mt_spectrogram comes back as Array2 with shape (n_freqs_out, n_windows).
+        // Box::leak via a row-major Vec<f64> produced by .into_raw_vec_and_offset().
+        // ndarray's into_raw_vec preserves layout; .as_standard_layout() ensures
+        // the elements are contiguous row-major before we pull out the Vec.
+        let spect_std = mts_out.mt_spectrogram.as_standard_layout().to_owned();
+        let spect_vec: Vec<f64> = spect_std.into_raw_vec_and_offset().0;
+        let stimes_vec: Vec<f64> = mts_out.stimes.to_vec();
+        let sfreqs_vec: Vec<f64> = mts_out.sfreqs.to_vec();
+
+        output.spect_ptr   = leak_vec_f64(spect_vec);
+        output.n_freqs_out = n_freqs_out;
+        output.n_windows   = n_windows;
+        output.stimes_ptr  = leak_vec_f64(stimes_vec);
+        output.sfreqs_ptr  = leak_vec_f64(sfreqs_vec);
+
+        ErrorCode::Ok.code()
+    }));
+    result.unwrap_or(ErrorCode::Panic.code())
+}
+
+// -------------------------------------------------------------------------
 // 4. buffer-free helpers
 // -------------------------------------------------------------------------
 
