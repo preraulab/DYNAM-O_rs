@@ -12,14 +12,19 @@ name = "dynamo_rs"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
-default = []
+default = ["parallel"]
 # Gated so plain `cargo build` / `cargo test` works without libpython in the link step.
 python = ["dep:pyo3", "dep:numpy"]
+# Data-parallelism via rayon — on by default for native builds; turn off
+# with `--no-default-features` for WASM targets (rayon has no native
+# WASM support since WASM has no threads). When off, `src/parallel.rs`
+# provides sequential drop-in shims so call sites stay unchanged.
+parallel = ["dep:rayon", "ndarray/rayon"]
 
 [dependencies]
-ndarray = { version = "0.16", features = ["rayon"] }
+ndarray = { version = "0.16", default-features = false }
 ndarray-npy = "0.9"
-rayon = "1"
+rayon = { version = "1", optional = true }
 realfft = "3"
 rustfft = "6"
 clap = { version = "4", features = ["derive"] }
@@ -38,6 +43,15 @@ pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"], optiona
 numpy = { version = "0.22", optional = true }
 
 log = "0.4"
+
+# WASM-only: faer's `rand` chain transitively requires `getrandom`, which
+# refuses to compile for `wasm32-unknown-unknown` unless the `wasm_js`
+# backend is enabled. This dep activates it for that target *only* — it
+# has zero impact on native builds (the section is gated by `cfg`). The
+# matching `--cfg getrandom_backend="wasm_js"` is set in
+# `.cargo/config.toml` so the active backend resolves at link time.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [build-dependencies]
 cbindgen = "0.27"

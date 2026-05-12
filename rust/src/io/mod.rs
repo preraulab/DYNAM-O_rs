@@ -7,4 +7,5 @@
 //! `staging` ports `read_staging.m`'s delimited-text sleep-stage parser.
 
 pub mod edf;
+pub mod expr;
 pub mod staging;

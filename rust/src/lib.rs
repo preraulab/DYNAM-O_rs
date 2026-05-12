@@ -28,6 +28,7 @@ pub mod mask;
 pub mod matlab_watershed;
 pub mod mts;
 pub mod merge;
+pub mod parallel;
 pub mod peak_assign;
 pub mod pipeline;
 pub mod refine;

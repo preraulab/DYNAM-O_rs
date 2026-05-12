@@ -988,6 +988,530 @@ pub unsafe extern "C" fn dynamo_multitaper_spectrogram(
 }
 
 // -------------------------------------------------------------------------
+// dynamo_dpss — DPSS (Slepian) taper generation
+// -------------------------------------------------------------------------
+
+/// Generate K DPSS tapers of length N with time-half-bandwidth NW.
+///
+/// Caller-allocated outputs:
+///   `tapers_out`  — row-major (K, N) double, total K*N elements.
+///                   Row k is the k-th Slepian sequence, unit L²-norm.
+///   `ratios_out`  — length-K double, concentration ratios in (0, 1].
+///
+/// Matches MATLAB R2025a `dpss(N, NW, K)` and
+/// `scipy.signal.windows.dpss(N, NW, K, return_ratios=True)` after the
+/// scipy/MATLAB sign convention (even-index tapers have positive sum;
+/// odd-index tapers have positive central derivative). Validated to
+/// ≤1e-8 elementwise on (N=128, NW=2, K=3) and (N=1024, NW=4, K=7).
+///
+/// # Safety
+/// `tapers_out` must point to at least `k * n` writable f64s.
+/// `ratios_out` must point to at least `k` writable f64s.
+#[no_mangle]
+pub unsafe extern "C" fn dynamo_dpss(
+    n: usize,
+    nw: f64,
+    k: usize,
+    tapers_out: *mut f64,
+    ratios_out: *mut f64,
+) -> c_int {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if tapers_out.is_null() || ratios_out.is_null() {
+            return ErrorCode::NullPointer.code();
+        }
+        if n == 0 || k == 0 || k > n || !nw.is_finite() || nw <= 0.0 {
+            return ErrorCode::InvalidArgument.code();
+        }
+
+        let (tapers, ratios) = match multitaper_rs::dpss(n, nw, k) {
+            Ok(p) => p,
+            Err(_) => return ErrorCode::KernelError.code(),
+        };
+
+        // Tapers come back as (K, N); ensure standard (row-major) layout
+        // before copying.
+        let tapers_std = tapers.as_standard_layout().to_owned();
+        let tapers_slice = tapers_std.as_slice().unwrap_or(&[]);
+        if tapers_slice.len() != k * n {
+            return ErrorCode::ShapeMismatch.code();
+        }
+        let ratios_slice = match ratios.as_slice() {
+            Some(s) => s,
+            None => return ErrorCode::ShapeMismatch.code(),
+        };
+        if ratios_slice.len() != k {
+            return ErrorCode::ShapeMismatch.code();
+        }
+
+        std::ptr::copy_nonoverlapping(tapers_slice.as_ptr(), tapers_out, k * n);
+        std::ptr::copy_nonoverlapping(ratios_slice.as_ptr(), ratios_out, k);
+
+        ErrorCode::Ok.code()
+    }));
+    result.unwrap_or(ErrorCode::Panic.code())
+}
+
+// -------------------------------------------------------------------------
+// dynamo_detect_artifacts — band-detection iter-zscore artifact mask
+// -------------------------------------------------------------------------
+
+/// Plain-C mirror of `crate::artifacts::ArtifactOpts`. Mirrors the field
+/// order of the Rust struct so `cbindgen` lays it out identically.
+#[repr(C)]
+pub struct ArtifactOptsFFI {
+    pub hf_pass:          f64,
+    pub hf_crit:          f64,
+    pub bb_pass:          f64,
+    pub bb_crit:          f64,
+    pub hf_detrend:       u8,      // 0/1
+    pub bb_detrend:       u8,      // 0/1
+    pub smooth_duration:  f64,
+    pub detrend_duration: f64,
+    pub buffer_duration:  f64,
+    pub zscore_method:    u32,     // 0=Robust, 1=Standard
+}
+
+impl ArtifactOptsFFI {
+    fn to_rust(&self) -> Option<crate::artifacts::ArtifactOpts> {
+        let zm = match self.zscore_method {
+            0 => crate::artifacts::ZScoreMethod::Robust,
+            1 => crate::artifacts::ZScoreMethod::Standard,
+            _ => return None,
+        };
+        Some(crate::artifacts::ArtifactOpts {
+            hf_pass: self.hf_pass,
+            hf_crit: self.hf_crit,
+            bb_pass: self.bb_pass,
+            bb_crit: self.bb_crit,
+            hf_detrend: self.hf_detrend != 0,
+            bb_detrend: self.bb_detrend != 0,
+            smooth_duration: self.smooth_duration,
+            detrend_duration: self.detrend_duration,
+            buffer_duration: self.buffer_duration,
+            zscore_method: zm,
+        })
+    }
+}
+
+/// Band-detection artifact mask. **Does NOT include the slope-test
+/// branch** — that needs the multitaper spectrogram and is left to the
+/// caller (the MATLAB `detect_artifacts.m` ORs the slope mask in
+/// separately). The Rust path here matches `detect_artifacts.m` with
+/// `'slope_test', false` to within ≤30 samples on the synthetic-EEG
+/// fixture battery; validated end-to-end in the upstream
+/// `preraulab/artifact_detection` PR #1 and now MEX-bridged here.
+///
+/// Caller-allocated output `mask_out` is length `n`; 1 = artifact.
+///
+/// # Safety
+/// `data` must point to `n` readable f64s; `opts` must point to a valid
+/// `ArtifactOptsFFI`; `mask_out` must point to `n` writable u8s.
+#[no_mangle]
+pub unsafe extern "C" fn dynamo_detect_artifacts(
+    data: *const f64,
+    n: usize,
+    fs: f64,
+    opts: *const ArtifactOptsFFI,
+    mask_out: *mut u8,
+) -> c_int {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if mask_out.is_null() || opts.is_null() {
+            return ErrorCode::NullPointer.code();
+        }
+        if n == 0 || !fs.is_finite() || fs <= 0.0 {
+            return ErrorCode::InvalidArgument.code();
+        }
+        let data_slice = match ptr_as_slice::<f64>(data, n) {
+            Some(s) => s,
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let opts_ref = &*opts;
+        let opts_rust = match opts_ref.to_rust() {
+            Some(o) => o,
+            None => return ErrorCode::InvalidArgument.code(),
+        };
+
+        let mask = crate::artifacts::detect_artifacts(data_slice, fs, &opts_rust);
+        if mask.len() != n {
+            return ErrorCode::ShapeMismatch.code();
+        }
+        let mask_u8: Vec<u8> = mask.iter().map(|&b| b as u8).collect();
+        std::ptr::copy_nonoverlapping(mask_u8.as_ptr(), mask_out, n);
+        ErrorCode::Ok.code()
+    }));
+    result.unwrap_or(ErrorCode::Panic.code())
+}
+
+// -------------------------------------------------------------------------
+// dynamo_compute_baseline — per-frequency percentile baseline
+// -------------------------------------------------------------------------
+
+/// Compute the per-frequency baseline used in TFpeak extraction.
+///
+/// Inputs (all row-major):
+///   `spect`           — shape (n_freqs, n_times) double; baseline is the
+///                       `baseline_ptile`-th percentile over the valid
+///                       columns of each row (zeros treated as NaN).
+///   `stimes`          — length n_times; window-center times.
+///   `t_data`          — length n_data; the EEG time grid that the
+///                       `baseline_exclude` mask is defined on.
+///   `baseline_exclude` — length n_data u8 (1 = exclude); nearest-neighbor
+///                       interpolated onto `stimes` columns.
+///   `baseline_range_lo` / `baseline_range_hi` — time-range trimming
+///                       applied to `stimes`.
+///   `baseline_ptile`  — percentile in [0, 100] (Hyndman-Fan #5, matching
+///                       MATLAB `prctile(..., baseline_ptile, 2)`).
+///
+/// Caller-allocated output `baseline_out` is length `n_freqs`.
+///
+/// # Safety
+/// All input pointers must point to readable buffers of the declared
+/// lengths. `baseline_out` must be writable for `n_freqs` f64s.
+#[no_mangle]
+pub unsafe extern "C" fn dynamo_compute_baseline(
+    spect: *const f64,
+    n_freqs: usize,
+    n_times: usize,
+    stimes: *const f64,
+    t_data: *const f64,
+    n_data: usize,
+    baseline_exclude: *const u8,
+    baseline_range_lo: f64,
+    baseline_range_hi: f64,
+    baseline_ptile: f64,
+    baseline_out: *mut f64,
+) -> c_int {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if baseline_out.is_null() {
+            return ErrorCode::NullPointer.code();
+        }
+        if n_freqs == 0 || n_times == 0 || n_data == 0 {
+            return ErrorCode::InvalidArgument.code();
+        }
+        let spect_slice = match ptr_as_slice::<f64>(spect, n_freqs * n_times) {
+            Some(s) => s,
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let stimes_slice = match ptr_as_slice::<f64>(stimes, n_times) {
+            Some(s) => s,
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let t_data_slice = match ptr_as_slice::<f64>(t_data, n_data) {
+            Some(s) => s,
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let excl_slice = match ptr_as_slice::<u8>(baseline_exclude, n_data) {
+            Some(s) => s,
+            None => return ErrorCode::NullPointer.code(),
+        };
+
+        let spect_view = match ArrayView2::from_shape((n_freqs, n_times), spect_slice) {
+            Ok(v) => v,
+            Err(_) => return ErrorCode::ShapeMismatch.code(),
+        };
+        let stimes_view = ArrayView1::from(stimes_slice);
+        let t_data_view = ArrayView1::from(t_data_slice);
+        let excl_vec: Vec<bool> = excl_slice.iter().map(|&b| b != 0).collect();
+
+        let baseline = match crate::baseline::compute_baseline(
+            spect_view, stimes_view, t_data_view,
+            &excl_vec, (baseline_range_lo, baseline_range_hi), baseline_ptile,
+        ) {
+            Ok(b) => b,
+            Err(_) => return ErrorCode::KernelError.code(),
+        };
+
+        // Shape is (F, 1); flatten and copy.
+        if baseline.nrows() != n_freqs || baseline.ncols() != 1 {
+            return ErrorCode::ShapeMismatch.code();
+        }
+        let std_baseline = baseline.as_standard_layout().to_owned();
+        let baseline_slice = std_baseline.as_slice().unwrap_or(&[]);
+        if baseline_slice.len() != n_freqs {
+            return ErrorCode::ShapeMismatch.code();
+        }
+        std::ptr::copy_nonoverlapping(baseline_slice.as_ptr(), baseline_out, n_freqs);
+        ErrorCode::Ok.code()
+    }));
+    result.unwrap_or(ErrorCode::Panic.code())
+}
+
+// -------------------------------------------------------------------------
+// dynamo_so_power — SO-power time-series from a pre-computed spectrogram
+// -------------------------------------------------------------------------
+
+#[repr(C)]
+pub struct SoPowerIn {
+    pub spect_ptr:          *const f64,
+    pub n_freqs:            usize,
+    pub n_times:            usize,
+    pub stimes_ptr:         *const f64,    // len n_times
+    pub sfreqs_ptr:         *const f64,    // len n_freqs
+    pub eeg_times_ptr:      *const f64,    // len n_data
+    pub n_data:             usize,
+    pub isexcluded_ptr:     *const u8,     // len n_data (0/1)
+    pub stage_times_ptr:    *const f64,    // len n_stages (may be 0)
+    pub stage_vals_ptr:     *const f64,    // len n_stages
+    pub n_stages:           usize,
+    pub time_range_lo:      f64,
+    pub time_range_hi:      f64,
+    pub outlier_threshold:  f64,
+    pub retain_fs:          u8,            // 0/1
+    /// Null-terminated ASCII norm method spec: e.g. "p2shift1234",
+    /// "percent", "none". Same parser as `NormMethod::parse`.
+    pub norm_method_ptr:    *const u8,
+    pub norm_method_len:    usize,
+}
+
+#[repr(C)]
+pub struct SoPowerOut {
+    pub so_power_norm_ptr:    *mut f64,
+    pub so_power_times_ptr:   *mut f64,
+    pub so_power_stages_ptr:  *mut f64,
+    /// Output length (matches all three arrays above).
+    pub n_out:                usize,
+    /// ptile result: 0 = none, 1 = single (`ptile_value[0]`),
+    /// 2 = pair (`ptile_value[0]`, `ptile_value[1]`).
+    pub ptile_kind:           u32,
+    pub ptile_value:          [f64; 2],
+}
+
+fn empty_so_power_out() -> SoPowerOut {
+    SoPowerOut {
+        so_power_norm_ptr:   std::ptr::null_mut(),
+        so_power_times_ptr:  std::ptr::null_mut(),
+        so_power_stages_ptr: std::ptr::null_mut(),
+        n_out: 0,
+        ptile_kind: 0,
+        ptile_value: [0.0, 0.0],
+    }
+}
+
+/// Compute the SO-power time series and stage / outlier-masked
+/// normalization. Mirrors `crate::so_power::so_power_from_spectrogram`
+/// (and pydynamo `compute_so_power`); MATLAB analog is `computeSOpower.m`.
+///
+/// Output pointers are `Box::leak`-allocated; caller frees with
+/// `dynamo_free_buffer_f64(ptr, n_out)` for each of the three arrays.
+///
+/// # Safety
+/// `in_` and `out` must be valid. All array pointers must back the
+/// declared lengths.
+#[no_mangle]
+pub unsafe extern "C" fn dynamo_so_power(
+    in_: *const SoPowerIn,
+    out: *mut SoPowerOut,
+) -> c_int {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let input = match NonNull::new(in_ as *mut SoPowerIn) {
+            Some(p) => &*p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let output = match NonNull::new(out) {
+            Some(p) => &mut *p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        *output = empty_so_power_out();
+
+        if input.n_freqs == 0 || input.n_times == 0 || input.n_data == 0 {
+            return ErrorCode::InvalidArgument.code();
+        }
+        let spect_slice = match ptr_as_slice::<f64>(input.spect_ptr, input.n_freqs * input.n_times) {
+            Some(s) => s,
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let stimes = match ptr_as_slice::<f64>(input.stimes_ptr, input.n_times) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let sfreqs = match ptr_as_slice::<f64>(input.sfreqs_ptr, input.n_freqs) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let eeg_times = match ptr_as_slice::<f64>(input.eeg_times_ptr, input.n_data) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let excl_u8 = match ptr_as_slice::<u8>(input.isexcluded_ptr, input.n_data) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let isexcluded: Vec<bool> = excl_u8.iter().map(|&b| b != 0).collect();
+        let stage_times = match ptr_as_slice::<f64>(input.stage_times_ptr, input.n_stages) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let stage_vals = match ptr_as_slice::<f64>(input.stage_vals_ptr, input.n_stages) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+
+        let nm_bytes = match ptr_as_slice::<u8>(input.norm_method_ptr, input.norm_method_len) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let nm_str = match std::str::from_utf8(nm_bytes) {
+            Ok(s) => s, Err(_) => return ErrorCode::InvalidArgument.code(),
+        };
+        let nm = match crate::so_power::NormMethod::parse(nm_str) {
+            Some(n) => n, None => return ErrorCode::InvalidArgument.code(),
+        };
+
+        let kernel_out = match crate::so_power::so_power_from_spectrogram(
+            spect_slice, input.n_freqs, input.n_times,
+            stimes, sfreqs, eeg_times, &isexcluded,
+            stage_times, stage_vals,
+            (input.time_range_lo, input.time_range_hi),
+            input.outlier_threshold,
+            &nm,
+            input.retain_fs != 0,
+        ) {
+            Ok(o) => o,
+            Err(_) => return ErrorCode::KernelError.code(),
+        };
+
+        output.n_out = kernel_out.so_power_norm.len();
+        if kernel_out.so_power_times.len() != output.n_out
+            || kernel_out.so_power_stages.len() != output.n_out
+        {
+            return ErrorCode::ShapeMismatch.code();
+        }
+        output.so_power_norm_ptr   = leak_vec_f64(kernel_out.so_power_norm);
+        output.so_power_times_ptr  = leak_vec_f64(kernel_out.so_power_times);
+        output.so_power_stages_ptr = leak_vec_f64(kernel_out.so_power_stages);
+        match kernel_out.ptile {
+            None => {
+                output.ptile_kind = 0;
+            }
+            Some(crate::so_power::PtileUsed::Single(p)) => {
+                output.ptile_kind = 1;
+                output.ptile_value[0] = p;
+            }
+            Some(crate::so_power::PtileUsed::Pair(a, b)) => {
+                output.ptile_kind = 2;
+                output.ptile_value[0] = a;
+                output.ptile_value[1] = b;
+            }
+        }
+        ErrorCode::Ok.code()
+    }));
+    result.unwrap_or(ErrorCode::Panic.code())
+}
+
+// -------------------------------------------------------------------------
+// dynamo_so_phase — SO-phase time-series from raw EEG
+// -------------------------------------------------------------------------
+
+#[repr(C)]
+pub struct SoPhaseIn {
+    pub eeg_ptr:           *const f64,
+    pub eeg_times_ptr:     *const f64,
+    pub isexcluded_ptr:    *const u8,
+    pub n_data:            usize,
+    /// SOS filter coefficients, scipy layout: (n_sections, 6) flattened
+    /// row-major [b0 b1 b2 a0 a1 a2] per section.
+    pub sos_ptr:           *const f64,
+    pub n_sections:        usize,
+    pub stage_times_ptr:   *const f64,
+    pub stage_vals_ptr:    *const f64,
+    pub n_stages:          usize,
+}
+
+#[repr(C)]
+pub struct SoPhaseOut {
+    pub so_phase_ptr:        *mut f64,    // length n_data; unwrapped, NaN at excluded
+    pub so_phase_times_ptr:  *mut f64,    // length n_data (echo of eeg_times)
+    pub so_phase_stages_ptr: *mut f64,    // length n_data
+    pub filtdata_ptr:        *mut f64,    // length n_data; filtered EEG with NaN at excluded
+    pub n_out:               usize,
+}
+
+fn empty_so_phase_out() -> SoPhaseOut {
+    SoPhaseOut {
+        so_phase_ptr:        std::ptr::null_mut(),
+        so_phase_times_ptr:  std::ptr::null_mut(),
+        so_phase_stages_ptr: std::ptr::null_mut(),
+        filtdata_ptr:        std::ptr::null_mut(),
+        n_out: 0,
+    }
+}
+
+/// Compute unwrapped SO-phase from raw EEG via SOS bandpass + Hilbert +
+/// atan2 + unwrap + NaN-at-excluded + stage interp. Mirrors pydynamo
+/// `compute_so_phase`; MATLAB analog is `computeSOphase.m`.
+///
+/// All four output arrays are length `n_data` and `Box::leak`-allocated.
+/// Caller frees with `dynamo_free_buffer_f64(ptr, n_data)` each.
+///
+/// `sos_ptr` must point to `n_sections * 6` f64s in scipy layout
+/// `[b0 b1 b2 a0 a1 a2]` per section.
+///
+/// # Safety
+/// All declared array pointers must back the corresponding lengths.
+#[no_mangle]
+pub unsafe extern "C" fn dynamo_so_phase(
+    in_: *const SoPhaseIn,
+    out: *mut SoPhaseOut,
+) -> c_int {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let input = match NonNull::new(in_ as *mut SoPhaseIn) {
+            Some(p) => &*p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let output = match NonNull::new(out) {
+            Some(p) => &mut *p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        *output = empty_so_phase_out();
+
+        if input.n_data == 0 || input.n_sections == 0 {
+            return ErrorCode::InvalidArgument.code();
+        }
+        let eeg = match ptr_as_slice::<f64>(input.eeg_ptr, input.n_data) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let eeg_times = match ptr_as_slice::<f64>(input.eeg_times_ptr, input.n_data) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let excl_u8 = match ptr_as_slice::<u8>(input.isexcluded_ptr, input.n_data) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let isexcluded: Vec<bool> = excl_u8.iter().map(|&b| b != 0).collect();
+        let sos_flat = match ptr_as_slice::<f64>(input.sos_ptr, input.n_sections * 6) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let sos: Vec<[f64; 6]> = (0..input.n_sections)
+            .map(|i| {
+                let b = i * 6;
+                [sos_flat[b], sos_flat[b+1], sos_flat[b+2], sos_flat[b+3], sos_flat[b+4], sos_flat[b+5]]
+            })
+            .collect();
+        let stage_times = match ptr_as_slice::<f64>(input.stage_times_ptr, input.n_stages) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let stage_vals = match ptr_as_slice::<f64>(input.stage_vals_ptr, input.n_stages) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+
+        let kernel_out = match crate::so_phase::so_phase_from_eeg(
+            eeg, eeg_times, &isexcluded, &sos, stage_times, stage_vals,
+        ) {
+            Ok(o) => o,
+            Err(_) => return ErrorCode::KernelError.code(),
+        };
+
+        if kernel_out.so_phase_unwrapped.len() != input.n_data
+            || kernel_out.so_phase_times.len()  != input.n_data
+            || kernel_out.so_phase_stages.len() != input.n_data
+            || kernel_out.filtdata.len()        != input.n_data
+        {
+            return ErrorCode::ShapeMismatch.code();
+        }
+
+        output.n_out               = input.n_data;
+        output.so_phase_ptr        = leak_vec_f64(kernel_out.so_phase_unwrapped);
+        output.so_phase_times_ptr  = leak_vec_f64(kernel_out.so_phase_times);
+        output.so_phase_stages_ptr = leak_vec_f64(kernel_out.so_phase_stages);
+        output.filtdata_ptr        = leak_vec_f64(kernel_out.filtdata);
+        ErrorCode::Ok.code()
+    }));
+    result.unwrap_or(ErrorCode::Panic.code())
+}
+
+// -------------------------------------------------------------------------
 // 4. buffer-free helpers
 // -------------------------------------------------------------------------
 
