@@ -1,0 +1,9 @@
+# Per-target build flags. Only takes effect when invoked from this
+# crate's directory (or a parent that doesn't override).
+
+# WebAssembly: `getrandom` 0.3 ships multiple backends; for
+# `wasm32-unknown-unknown` it refuses to compile unless we explicitly
+# pick the JS backend. The matching `wasm_js` feature is enabled via a
+# `[target.'cfg(...)'.dependencies]` block in Cargo.toml.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

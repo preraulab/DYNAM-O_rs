@@ -106,10 +106,16 @@ fn movmean(x: &[f64], win: usize) -> Vec<f64> {
     out
 }
 
-/// MATLAB `movmedian(x, win)` — centered moving median with shrinking window.
-/// O(n * win log win) naive implementation; good enough for our use (win ~= 30k
-/// on a 300 s window at 100 Hz, called twice per artifact run). Matches
-/// pydynamo `_movmedian` at every sample.
+/// MATLAB `movmedian(x, win)` — centered moving median with shrinking
+/// window at the endpoints. O(n log² n) via a Fenwick-tree (BIT) over
+/// the rank-sorted index: pre-sort once, slide the window by
+/// rank-add/rank-remove, query median by `select(k)` (binary descent
+/// down the BIT). Matches pydynamo `_movmedian` at every sample.
+///
+/// Critically faster than the naive per-window sort, which is
+/// O(n · win · log win). For win ≈ 30 000 on a 300 s detrend window at
+/// 100 Hz the naive variant becomes the dominant cost of artifact
+/// detection.
 fn movmedian(x: &[f64], win: usize) -> Vec<f64> {
     let n = x.len();
     if win <= 1 || n == 0 {
@@ -117,19 +123,81 @@ fn movmedian(x: &[f64], win: usize) -> Vec<f64> {
     }
     let half_l = (win - 1) / 2;
     let half_r = win / 2;
+
+    // 1) Rank-sort x: rank[i] = i's position in sorted order.
+    //    sorted_vals[r] gives the r-th smallest value.
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&a, &b| {
+        x[a].partial_cmp(&x[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    let mut rank = vec![0usize; n];
+    for (r, &i) in idx.iter().enumerate() {
+        rank[i] = r;
+    }
+    let sorted_vals: Vec<f64> = idx.iter().map(|&i| x[i]).collect();
+
+    // 2) Fenwick tree over [0, n] (1-indexed). `bit[k]` counts how many
+    //    live indices sit at ranks ≤ k.
+    let mut bit = vec![0i32; n + 1];
+    fn bit_add(bit: &mut [i32], mut i: usize, delta: i32) {
+        while i < bit.len() {
+            bit[i] += delta;
+            i += i & i.wrapping_neg();
+        }
+    }
+    // `select(k)`: return the smallest 1-based rank whose prefix-sum ≥ k.
+    fn bit_select(bit: &[i32], k_target: i32) -> usize {
+        let n = bit.len() - 1;
+        let mut pos = 0_usize;
+        let mut k = k_target;
+        let mut step = 1_usize;
+        while step * 2 <= n {
+            step *= 2;
+        }
+        while step > 0 {
+            let next = pos + step;
+            if next <= n && bit[next] < k {
+                pos = next;
+                k -= bit[next];
+            }
+            step >>= 1;
+        }
+        pos + 1
+    }
+
     let mut out = Vec::with_capacity(n);
-    let mut scratch: Vec<f64> = Vec::with_capacity(win);
+
+    // 3) Seed window for i = 0.
+    let init_a = 0_usize;
+    let init_b = (half_r + 1).min(n);
+    for j in init_a..init_b {
+        bit_add(&mut bit, rank[j] + 1, 1);
+    }
+    let mut a = init_a;
+    let mut b = init_b;
+
     for i in 0..n {
-        let a = i.saturating_sub(half_l);
-        let b = (i + half_r + 1).min(n);
-        scratch.clear();
-        scratch.extend_from_slice(&x[a..b]);
-        scratch.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let m = scratch.len();
+        let new_a = i.saturating_sub(half_l);
+        let new_b = (i + half_r + 1).min(n);
+        // Add newly-arriving samples on the right.
+        while b < new_b {
+            bit_add(&mut bit, rank[b] + 1, 1);
+            b += 1;
+        }
+        // Remove departed samples on the left.
+        while a < new_a {
+            bit_add(&mut bit, rank[a] + 1, -1);
+            a += 1;
+        }
+        let m = (new_b - new_a) as i32;
         let med = if m % 2 == 1 {
-            scratch[m / 2]
+            sorted_vals[bit_select(&bit, m / 2 + 1) - 1]
         } else {
-            0.5 * (scratch[m / 2 - 1] + scratch[m / 2])
+            let lo = sorted_vals[bit_select(&bit, m / 2) - 1];
+            let hi = sorted_vals[bit_select(&bit, m / 2 + 1) - 1];
+            0.5 * (lo + hi)
         };
         out.push(med);
     }

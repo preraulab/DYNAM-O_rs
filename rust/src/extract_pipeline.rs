@@ -26,7 +26,7 @@
 //!   - `Volume    = sum(v) * d_time * d_freq`
 
 use ndarray::{Array2, ArrayView1, ArrayView2};
-use rayon::prelude::*;
+use crate::parallel::*;
 use std::collections::{HashMap, VecDeque};
 
 /// Per-segment peak table (one row per surviving label).
