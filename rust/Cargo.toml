@@ -30,6 +30,10 @@ rustfft = "6"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Pure-Rust matrix algebra for the tensor-product B-spline LSQ (small
+# Cholesky on the Gram matrices). WASM-clean.
+nalgebra = { version = "0.34", default-features = false, features = ["std"] }
+levenberg-marquardt = "0.15"
 
 # Pure-Rust multitaper spectrogram. Path is relative so any checkout that
 # sits alongside DYNAM-O_dev (the standard layout under DYNAM-O_toolbox)

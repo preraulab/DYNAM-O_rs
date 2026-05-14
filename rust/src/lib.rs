@@ -33,8 +33,10 @@ pub mod peak_assign;
 pub mod pipeline;
 pub mod refine;
 pub mod signal;
+pub mod paramfit;
 pub mod so_phase;
 pub mod so_power;
+pub mod spline_basis;
 pub mod trim;
 
 #[cfg(feature = "python")]
