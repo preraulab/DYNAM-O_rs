@@ -1548,6 +1548,367 @@ pub unsafe extern "C" fn dynamo_free_buffer_u64(ptr: *mut u64, len: usize) {
 }
 
 // -------------------------------------------------------------------------
+// spline_basis FFI
+// -------------------------------------------------------------------------
+
+/// Input descriptor for [`dynamo_spline_basis_fit`].
+///
+/// Layout mirrors MATLAB `spline_basis.m` semantics:
+///   * `soph` is `(n_x, n_y)` row-major, where `n_x = feat_bins.len()` and
+///     `n_y = freq_bins.len()`. This is the **transposed** orientation of
+///     the canonical SOPH (the MATLAB-side wrapper does the transpose).
+///   * `internal_knots_x`/`y` are the pre-`augknt` knot vectors.
+///   * `order = 4` and `boundary_multiplicity = 3` reproduce DYNAM-O.
+#[repr(C)]
+pub struct SplineBasisIn {
+    pub soph_ptr:               *const f64,
+    pub n_x:                    usize,
+    pub n_y:                    usize,
+    pub feat_bins_ptr:          *const f64,
+    pub freq_bins_ptr:          *const f64,
+    pub internal_knots_x_ptr:   *const f64,
+    pub n_internal_knots_x:     usize,
+    pub internal_knots_y_ptr:   *const f64,
+    pub n_internal_knots_y:     usize,
+    pub order:                  u32,
+    pub boundary_multiplicity:  u32,
+}
+
+#[repr(C)]
+pub struct SplineBasisOut {
+    /// `(m_y, m_x)` row-major. Matches MATLAB `squeeze(spline_obj.coefs)'`.
+    pub coefs_ptr:        *mut f64,
+    pub m_y:              usize,
+    pub m_x:              usize,
+    /// `(n_x, n_y)` row-major. Matches MATLAB `splinefit` (= `size(SOPH')`).
+    pub splinefit_ptr:    *mut f64,
+    /// Augmented knot vectors.
+    pub knots_x_aug_ptr:  *mut f64,
+    pub n_knots_x_aug:    usize,
+    pub knots_y_aug_ptr:  *mut f64,
+    pub n_knots_y_aug:    usize,
+}
+
+fn empty_spline_basis_out() -> SplineBasisOut {
+    SplineBasisOut {
+        coefs_ptr:       std::ptr::null_mut(),
+        m_y: 0, m_x: 0,
+        splinefit_ptr:   std::ptr::null_mut(),
+        knots_x_aug_ptr: std::ptr::null_mut(),
+        n_knots_x_aug:   0,
+        knots_y_aug_ptr: std::ptr::null_mut(),
+        n_knots_y_aug:   0,
+    }
+}
+
+/// Fit a bivariate tensor-product B-spline on a regular grid.
+///
+/// Parity-tested against MATLAB `spap2` to f64 round-off (see
+/// `tests/spline_basis_parity.rs`).
+///
+/// All four output arrays are `Box::leak`-allocated. Caller frees with
+/// `dynamo_free_buffer_f64`:
+///   * `coefs_ptr`       length `m_y * m_x`
+///   * `splinefit_ptr`   length `n_x * n_y`
+///   * `knots_x_aug_ptr` length `n_knots_x_aug`
+///   * `knots_y_aug_ptr` length `n_knots_y_aug`
+///
+/// # Safety
+/// All declared array pointers must back the corresponding lengths.
+#[no_mangle]
+pub unsafe extern "C" fn dynamo_spline_basis_fit(
+    in_: *const SplineBasisIn,
+    out: *mut SplineBasisOut,
+) -> c_int {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let input = match NonNull::new(in_ as *mut SplineBasisIn) {
+            Some(p) => &*p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let output = match NonNull::new(out) {
+            Some(p) => &mut *p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        *output = empty_spline_basis_out();
+
+        if input.n_x == 0 || input.n_y == 0
+            || input.n_internal_knots_x == 0 || input.n_internal_knots_y == 0
+        {
+            return ErrorCode::InvalidArgument.code();
+        }
+
+        let soph_flat = match ptr_as_slice::<f64>(input.soph_ptr, input.n_x * input.n_y) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let feat_bins = match ptr_as_slice::<f64>(input.feat_bins_ptr, input.n_x) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let freq_bins = match ptr_as_slice::<f64>(input.freq_bins_ptr, input.n_y) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let ikx = match ptr_as_slice::<f64>(input.internal_knots_x_ptr, input.n_internal_knots_x) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let iky = match ptr_as_slice::<f64>(input.internal_knots_y_ptr, input.n_internal_knots_y) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+
+        let soph = match ArrayView2::from_shape((input.n_x, input.n_y), soph_flat) {
+            Ok(a) => a,
+            Err(_) => return ErrorCode::ShapeMismatch.code(),
+        };
+
+        let kernel_out = match crate::spline_basis::fit_tensor_product_spline(
+            soph,
+            feat_bins,
+            freq_bins,
+            ikx,
+            iky,
+            input.order as usize,
+            input.boundary_multiplicity as usize,
+        ) {
+            Ok(o) => o,
+            Err(_) => return ErrorCode::KernelError.code(),
+        };
+
+        let (my, mx) = kernel_out.coefs.dim();
+        let (nx, ny) = kernel_out.splinefit.dim();
+        if nx != input.n_x || ny != input.n_y {
+            return ErrorCode::ShapeMismatch.code();
+        }
+
+        let coefs_vec: Vec<f64> = kernel_out.coefs.iter().copied().collect();
+        let splinefit_vec: Vec<f64> = kernel_out.splinefit.iter().copied().collect();
+
+        output.m_y = my;
+        output.m_x = mx;
+        output.coefs_ptr       = leak_vec_f64(coefs_vec);
+        output.splinefit_ptr   = leak_vec_f64(splinefit_vec);
+        output.n_knots_x_aug   = kernel_out.knots_x_aug.len();
+        output.n_knots_y_aug   = kernel_out.knots_y_aug.len();
+        output.knots_x_aug_ptr = leak_vec_f64(kernel_out.knots_x_aug);
+        output.knots_y_aug_ptr = leak_vec_f64(kernel_out.knots_y_aug);
+        ErrorCode::Ok.code()
+    }));
+    result.unwrap_or(ErrorCode::Panic.code())
+}
+
+// -------------------------------------------------------------------------
+// paramfit FFI: rotgauss_fit + vmgauss_fit
+// -------------------------------------------------------------------------
+
+/// Input descriptor for the two paramfit kernels (`dynamo_rotgauss_fit`
+/// and `dynamo_vmgauss_fit`).
+///
+/// SOPH is `(n_y, n_x)` row-major where `n_y = freq_bins.len()` and
+/// `n_x = feat_bins.len()`. This matches the canonical MATLAB SOPH
+/// `(n_freqs, n_features)` column-major byte-for-byte — pass `mxGetPr`
+/// directly without copying.
+///
+/// Initial/lower/upper are `(n_modes, 6)` row-major:
+///   * power: `[amp, fmean, fstd, pmean,    pstd,      theta]`
+///   * phase: `[amp, fmean, fstd, phasepref, recikappa, theta]`
+///
+/// `bg_initial`, `bg_lower`, `bg_upper` are 3-vectors `[xxx, yyy, zzz]`.
+#[repr(C)]
+pub struct ParamFitIn {
+    pub soph_ptr:        *const f64,
+    pub n_y:             usize,
+    pub n_x:             usize,
+    pub feat_bins_ptr:   *const f64,
+    pub freq_bins_ptr:   *const f64,
+    pub initial_ptr:     *const f64,    // (n_modes * 6)
+    pub lower_ptr:       *const f64,
+    pub upper_ptr:       *const f64,
+    pub n_modes:         usize,
+    pub bg_initial:      [f64; 3],
+    pub bg_lower:        [f64; 3],
+    pub bg_upper:        [f64; 3],
+    pub max_iters:       u32,
+    /// vmGauss-only: nonzero = row-normalize the assembled model (matches
+    /// MATLAB `fit_vmGauss.m`'s `unit_row=true`). Ignored by rotgauss_fit.
+    pub unit_row:        u32,
+}
+
+#[repr(C)]
+pub struct ParamFitOutFFI {
+    /// Final parameters, `(n_modes, 6)` row-major. Allocated, length `n_modes * 6`.
+    pub params_ptr:      *mut f64,
+    /// Background-plane coefficients `[xxx, yyy, zzz]`.
+    pub background:      [f64; 3],
+    /// Model reconstruction on the input grid, `(n_y, n_x)` row-major.
+    pub model_ptr:       *mut f64,
+    pub n_y:             usize,
+    pub n_x:             usize,
+    /// gof.sse / rsquare / adjrsquare / rmse / dfe / dfm.
+    pub gof_sse:         f64,
+    pub gof_rsquare:     f64,
+    pub gof_adjrsquare:  f64,
+    pub gof_rmse:        f64,
+    pub gof_dfe:         f64,
+    pub gof_dfm:         f64,
+    pub iters_used:      u32,
+}
+
+fn empty_paramfit_out() -> ParamFitOutFFI {
+    ParamFitOutFFI {
+        params_ptr:     std::ptr::null_mut(),
+        background:     [0.0; 3],
+        model_ptr:      std::ptr::null_mut(),
+        n_y: 0, n_x: 0,
+        gof_sse: 0.0, gof_rsquare: 0.0, gof_adjrsquare: 0.0,
+        gof_rmse: 0.0, gof_dfe: 0.0, gof_dfm: 0.0,
+        iters_used: 0,
+    }
+}
+
+unsafe fn paramfit_common_setup(
+    input: &ParamFitIn,
+) -> Result<(ArrayView2<'static, f64>, &'static [f64], &'static [f64],
+             ArrayView2<'static, f64>, ArrayView2<'static, f64>, ArrayView2<'static, f64>),
+            c_int>
+{
+    if input.n_y == 0 || input.n_x == 0 || input.n_modes == 0 {
+        return Err(ErrorCode::InvalidArgument.code());
+    }
+    let soph_flat = match ptr_as_slice::<f64>(input.soph_ptr, input.n_y * input.n_x) {
+        Some(s) => s, None => return Err(ErrorCode::NullPointer.code()),
+    };
+    let feat_bins = match ptr_as_slice::<f64>(input.feat_bins_ptr, input.n_x) {
+        Some(s) => s, None => return Err(ErrorCode::NullPointer.code()),
+    };
+    let freq_bins = match ptr_as_slice::<f64>(input.freq_bins_ptr, input.n_y) {
+        Some(s) => s, None => return Err(ErrorCode::NullPointer.code()),
+    };
+    let init = match ptr_as_slice::<f64>(input.initial_ptr, input.n_modes * 6) {
+        Some(s) => s, None => return Err(ErrorCode::NullPointer.code()),
+    };
+    let lo = match ptr_as_slice::<f64>(input.lower_ptr, input.n_modes * 6) {
+        Some(s) => s, None => return Err(ErrorCode::NullPointer.code()),
+    };
+    let hi = match ptr_as_slice::<f64>(input.upper_ptr, input.n_modes * 6) {
+        Some(s) => s, None => return Err(ErrorCode::NullPointer.code()),
+    };
+    let soph = ArrayView2::from_shape((input.n_y, input.n_x), soph_flat)
+        .map_err(|_| ErrorCode::ShapeMismatch.code())?;
+    let initial = ArrayView2::from_shape((input.n_modes, 6), init)
+        .map_err(|_| ErrorCode::ShapeMismatch.code())?;
+    let lower = ArrayView2::from_shape((input.n_modes, 6), lo)
+        .map_err(|_| ErrorCode::ShapeMismatch.code())?;
+    let upper = ArrayView2::from_shape((input.n_modes, 6), hi)
+        .map_err(|_| ErrorCode::ShapeMismatch.code())?;
+    Ok((soph, feat_bins, freq_bins, initial, lower, upper))
+}
+
+fn fill_paramfit_out(out: &mut ParamFitOutFFI, kernel: crate::paramfit::ParamFitOut) {
+    let (n_modes, _) = kernel.params.dim();
+    let (ny, nx) = kernel.model_soph.dim();
+    out.background = kernel.background;
+    out.n_y = ny;
+    out.n_x = nx;
+    out.gof_sse        = kernel.gof.sse;
+    out.gof_rsquare    = kernel.gof.rsquare;
+    out.gof_adjrsquare = kernel.gof.adjrsquare;
+    out.gof_rmse       = kernel.gof.rmse;
+    out.gof_dfe        = kernel.gof.dfe;
+    out.gof_dfm        = kernel.gof.dfm;
+    out.iters_used     = kernel.iters_used;
+    let params_vec: Vec<f64> = kernel.params.iter().copied().collect();
+    let model_vec: Vec<f64> = kernel.model_soph.iter().copied().collect();
+    out.params_ptr = leak_vec_f64(params_vec);
+    out.model_ptr  = leak_vec_f64(model_vec);
+    let _ = n_modes;
+}
+
+/// Fit a rotated-Gaussian-mixture model + linear background plane to a SOPH
+/// histogram. Mirrors MATLAB `fit_rotGauss` (without `prepareSurfaceData`'s
+/// NaN drop — caller must hand us a finite-valued grid).
+///
+/// # Safety
+/// All pointers must back the declared lengths.
+#[no_mangle]
+pub unsafe extern "C" fn dynamo_rotgauss_fit(
+    in_: *const ParamFitIn,
+    out: *mut ParamFitOutFFI,
+) -> c_int {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let input = match NonNull::new(in_ as *mut ParamFitIn) {
+            Some(p) => &*p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let output = match NonNull::new(out) {
+            Some(p) => &mut *p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        *output = empty_paramfit_out();
+
+        let (soph, feat_bins, freq_bins, initial, lower, upper) =
+            match paramfit_common_setup(input) {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
+
+        let kernel_out = match crate::paramfit::rot_gauss::fit_rotgauss(
+            soph, feat_bins, freq_bins,
+            initial, lower, upper,
+            input.bg_initial, input.bg_lower, input.bg_upper,
+            input.max_iters,
+        ) {
+            Ok(o) => o,
+            Err(_) => return ErrorCode::KernelError.code(),
+        };
+        fill_paramfit_out(output, kernel_out);
+        ErrorCode::Ok.code()
+    }));
+    result.unwrap_or(ErrorCode::Panic.code())
+}
+
+/// Fit a von-Mises × Gaussian mixture + sinusoidal background to a SOPH
+/// histogram. Mirrors MATLAB `fit_vmGauss` **without** the per-row
+/// normalization step in `normalized_vmGauss.m` (see
+/// `src/paramfit/vm_gauss.rs` module docs).
+///
+/// # Safety
+/// All pointers must back the declared lengths.
+#[no_mangle]
+pub unsafe extern "C" fn dynamo_vmgauss_fit(
+    in_: *const ParamFitIn,
+    out: *mut ParamFitOutFFI,
+) -> c_int {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let input = match NonNull::new(in_ as *mut ParamFitIn) {
+            Some(p) => &*p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let output = match NonNull::new(out) {
+            Some(p) => &mut *p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        *output = empty_paramfit_out();
+
+        let (soph, feat_bins, freq_bins, initial, lower, upper) =
+            match paramfit_common_setup(input) {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
+
+        let kernel_out = match crate::paramfit::vm_gauss::fit_vmgauss(
+            soph, feat_bins, freq_bins,
+            initial, lower, upper,
+            input.bg_initial, input.bg_lower, input.bg_upper,
+            input.max_iters,
+            input.unit_row != 0,
+        ) {
+            Ok(o) => o,
+            Err(_) => return ErrorCode::KernelError.code(),
+        };
+        fill_paramfit_out(output, kernel_out);
+        ErrorCode::Ok.code()
+    }));
+    result.unwrap_or(ErrorCode::Panic.code())
+}
+
+// -------------------------------------------------------------------------
 // Tests
 // -------------------------------------------------------------------------
 //

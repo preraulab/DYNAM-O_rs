@@ -270,6 +270,113 @@ typedef struct SoPhaseOut {
   uintptr_t n_out;
 } SoPhaseOut;
 
+/**
+ * Input descriptor for [`dynamo_spline_basis_fit`].
+ *
+ * Layout mirrors MATLAB `spline_basis.m` semantics:
+ *   * `soph` is `(n_x, n_y)` row-major, where `n_x = feat_bins.len()` and
+ *     `n_y = freq_bins.len()`. This is the **transposed** orientation of
+ *     the canonical SOPH (the MATLAB-side wrapper does the transpose).
+ *   * `internal_knots_x`/`y` are the pre-`augknt` knot vectors.
+ *   * `order = 4` and `boundary_multiplicity = 3` reproduce DYNAM-O.
+ */
+typedef struct SplineBasisIn {
+  const double *soph_ptr;
+  uintptr_t n_x;
+  uintptr_t n_y;
+  const double *feat_bins_ptr;
+  const double *freq_bins_ptr;
+  const double *internal_knots_x_ptr;
+  uintptr_t n_internal_knots_x;
+  const double *internal_knots_y_ptr;
+  uintptr_t n_internal_knots_y;
+  uint32_t order;
+  uint32_t boundary_multiplicity;
+} SplineBasisIn;
+
+typedef struct SplineBasisOut {
+  /**
+   * `(m_y, m_x)` row-major. Matches MATLAB `squeeze(spline_obj.coefs)'`.
+   */
+  double *coefs_ptr;
+  uintptr_t m_y;
+  uintptr_t m_x;
+  /**
+   * `(n_x, n_y)` row-major. Matches MATLAB `splinefit` (= `size(SOPH')`).
+   */
+  double *splinefit_ptr;
+  /**
+   * Augmented knot vectors.
+   */
+  double *knots_x_aug_ptr;
+  uintptr_t n_knots_x_aug;
+  double *knots_y_aug_ptr;
+  uintptr_t n_knots_y_aug;
+} SplineBasisOut;
+
+/**
+ * Input descriptor for the two paramfit kernels (`dynamo_rotgauss_fit`
+ * and `dynamo_vmgauss_fit`).
+ *
+ * SOPH is `(n_y, n_x)` row-major where `n_y = freq_bins.len()` and
+ * `n_x = feat_bins.len()`. This matches the canonical MATLAB SOPH
+ * `(n_freqs, n_features)` column-major byte-for-byte — pass `mxGetPr`
+ * directly without copying.
+ *
+ * Initial/lower/upper are `(n_modes, 6)` row-major:
+ *   * power: `[amp, fmean, fstd, pmean,    pstd,      theta]`
+ *   * phase: `[amp, fmean, fstd, phasepref, recikappa, theta]`
+ *
+ * `bg_initial`, `bg_lower`, `bg_upper` are 3-vectors `[xxx, yyy, zzz]`.
+ */
+typedef struct ParamFitIn {
+  const double *soph_ptr;
+  uintptr_t n_y;
+  uintptr_t n_x;
+  const double *feat_bins_ptr;
+  const double *freq_bins_ptr;
+  const double *initial_ptr;
+  const double *lower_ptr;
+  const double *upper_ptr;
+  uintptr_t n_modes;
+  double bg_initial[3];
+  double bg_lower[3];
+  double bg_upper[3];
+  uint32_t max_iters;
+  /**
+   * vmGauss-only: nonzero = row-normalize the assembled model (matches
+   * MATLAB `fit_vmGauss.m`'s `unit_row=true`). Ignored by rotgauss_fit.
+   */
+  uint32_t unit_row;
+} ParamFitIn;
+
+typedef struct ParamFitOutFFI {
+  /**
+   * Final parameters, `(n_modes, 6)` row-major. Allocated, length `n_modes * 6`.
+   */
+  double *params_ptr;
+  /**
+   * Background-plane coefficients `[xxx, yyy, zzz]`.
+   */
+  double background[3];
+  /**
+   * Model reconstruction on the input grid, `(n_y, n_x)` row-major.
+   */
+  double *model_ptr;
+  uintptr_t n_y;
+  uintptr_t n_x;
+  /**
+   * gof.sse / rsquare / adjrsquare / rmse / dfe / dfm.
+   */
+  double gof_sse;
+  double gof_rsquare;
+  double gof_adjrsquare;
+  double gof_rmse;
+  double gof_dfe;
+  double gof_dfm;
+  uint32_t iters_used;
+} ParamFitOutFFI;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -525,6 +632,45 @@ void dynamo_free_buffer_u8(uint8_t *ptr, uintptr_t len);
  * (`height_data_offsets`, `boundary_offsets`) returned in `ExtractTfpeaksOut`.
  */
 void dynamo_free_buffer_u64(uint64_t *ptr, uintptr_t len);
+
+/**
+ * Fit a bivariate tensor-product B-spline on a regular grid.
+ *
+ * Parity-tested against MATLAB `spap2` to f64 round-off (see
+ * `tests/spline_basis_parity.rs`).
+ *
+ * All four output arrays are `Box::leak`-allocated. Caller frees with
+ * `dynamo_free_buffer_f64`:
+ *   * `coefs_ptr`       length `m_y * m_x`
+ *   * `splinefit_ptr`   length `n_x * n_y`
+ *   * `knots_x_aug_ptr` length `n_knots_x_aug`
+ *   * `knots_y_aug_ptr` length `n_knots_y_aug`
+ *
+ * # Safety
+ * All declared array pointers must back the corresponding lengths.
+ */
+int dynamo_spline_basis_fit(const struct SplineBasisIn *in_, struct SplineBasisOut *out);
+
+/**
+ * Fit a rotated-Gaussian-mixture model + linear background plane to a SOPH
+ * histogram. Mirrors MATLAB `fit_rotGauss` (without `prepareSurfaceData`'s
+ * NaN drop — caller must hand us a finite-valued grid).
+ *
+ * # Safety
+ * All pointers must back the declared lengths.
+ */
+int dynamo_rotgauss_fit(const struct ParamFitIn *in_, struct ParamFitOutFFI *out);
+
+/**
+ * Fit a von-Mises × Gaussian mixture + sinusoidal background to a SOPH
+ * histogram. Mirrors MATLAB `fit_vmGauss` **without** the per-row
+ * normalization step in `normalized_vmGauss.m` (see
+ * `src/paramfit/vm_gauss.rs` module docs).
+ *
+ * # Safety
+ * All pointers must back the declared lengths.
+ */
+int dynamo_vmgauss_fit(const struct ParamFitIn *in_, struct ParamFitOutFFI *out);
 
 #ifdef __cplusplus
 }  // extern "C"
