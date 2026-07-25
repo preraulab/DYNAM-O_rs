@@ -683,6 +683,20 @@ pub fn extract_tfpeaks(
     progress_cb: Option<&(dyn Fn(u32, u32) + Sync)>,
 ) -> Result<(SegmentPeaks, Array2<i64>), String> {
     let (f, t) = spect.dim();
+    if stimes.len() != t {
+        return Err(format!(
+            "spect time dimension {} does not match stimes length {}",
+            t,
+            stimes.len()
+        ));
+    }
+    if sfreqs.len() != f {
+        return Err(format!(
+            "spect frequency dimension {} does not match sfreqs length {}",
+            f,
+            sfreqs.len()
+        ));
+    }
     if f == 0 || t == 0 || stimes.len() < 2 {
         return Ok((SegmentPeaks::default(), Array2::<i64>::zeros((f, t))));
     }
@@ -1035,6 +1049,50 @@ mod tests {
     }
 
     fn _unused(_a: Array1<f64>) {}
+
+    #[test]
+    fn extract_tfpeaks_rejects_mismatched_axis_lengths() {
+        let spect = Array2::<f64>::zeros((3, 4));
+        let stimes = Array1::from_vec(vec![0.0, 1.0, 2.0, 3.0]);
+        let sfreqs = Array1::from_vec(vec![0.0, 1.0, 2.0]);
+        let params = ExtractParams {
+            seg_time: 30.0,
+            downsample_f: 1, downsample_t: 1,
+            merge_thresh: 8.0, max_merges: f64::INFINITY,
+            trim_vol_thresh: 0.8, trim_shift_val: f64::NAN,
+            dur_min: 0.0, dur_max: f64::INFINITY,
+            bw_min: 0.0, bw_max: f64::INFINITY,
+            freq_min: 0.0, freq_max: f64::INFINITY,
+            ht_db_min: f64::NEG_INFINITY,
+            expand_labels_distance: 5,
+        };
+
+        let time_err = match extract_tfpeaks(
+            spect.view(),
+            stimes.slice(ndarray::s![..3]),
+            sfreqs.view(),
+            None,
+            &params,
+            None,
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("mismatched stimes length was accepted"),
+        };
+        assert!(time_err.contains("stimes"));
+
+        let freq_err = match extract_tfpeaks(
+            spect.view(),
+            stimes.view(),
+            sfreqs.slice(ndarray::s![..1]),
+            None,
+            &params,
+            None,
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("mismatched sfreqs length was accepted"),
+        };
+        assert!(freq_err.contains("sfreqs"));
+    }
 
     /// Synthetic 2-segment extract: verify labels shape matches spect,
     /// that non-zero labels are 1..n_peaks contiguously, that each non-zero
