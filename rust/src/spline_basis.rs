@@ -116,6 +116,25 @@ pub fn fit_tensor_product_spline(
             boundary_multiplicity
         )));
     }
+    // find_span / Cox-de Boor require n_basis >= order. Since
+    // n_basis = augmented_knots.len() - order, the augmented vector must
+    // contain at least 2 * order knots.
+    let min_internal_knots = 2 * order - 2 * (boundary_multiplicity - 1);
+    for (name, knots) in [
+        ("internal_knots_x", internal_knots_x),
+        ("internal_knots_y", internal_knots_y),
+    ] {
+        if knots.len() < min_internal_knots {
+            return Err(SplineError::InvalidArgument(format!(
+                "{} length {} is too short for order {} and boundary_multiplicity {}; need at least {}",
+                name,
+                knots.len(),
+                order,
+                boundary_multiplicity,
+                min_internal_knots
+            )));
+        }
+    }
 
     let knots_x_aug = augknt(internal_knots_x, boundary_multiplicity);
     let knots_y_aug = augknt(internal_knots_y, boundary_multiplicity);
@@ -287,6 +306,54 @@ fn ndarray_to_nalgebra(a: &Array2<f64>) -> DMatrix<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_invalid_knot_error(
+        result: Result<SplineBasisOut, SplineError>,
+        axis_name: &str,
+    ) {
+        match result {
+            Err(SplineError::InvalidArgument(message)) => {
+                assert!(message.contains(axis_name), "unexpected error: {}", message);
+            }
+            Err(error) => panic!("expected InvalidArgument, got {}", error),
+            Ok(_) => panic!("invalid knot vector was accepted"),
+        }
+    }
+
+    #[test]
+    fn fit_rejects_empty_knot_vector() {
+        let soph = Array2::<f64>::zeros((2, 2));
+        let eval = [0.0, 1.0];
+        let valid_knots = [0.0, 0.25, 0.75, 1.0];
+        let result = fit_tensor_product_spline(
+            soph.view(),
+            &eval,
+            &eval,
+            &[],
+            &valid_knots,
+            4,
+            3,
+        );
+        assert_invalid_knot_error(result, "internal_knots_x");
+    }
+
+    #[test]
+    fn fit_rejects_too_few_augmented_knots() {
+        let soph = Array2::<f64>::zeros((2, 2));
+        let eval = [0.0, 1.0];
+        let valid_knots = [0.0, 0.25, 0.75, 1.0];
+        let too_short = [0.0, 0.5, 1.0];
+        let result = fit_tensor_product_spline(
+            soph.view(),
+            &eval,
+            &eval,
+            &valid_knots,
+            &too_short,
+            4,
+            3,
+        );
+        assert_invalid_knot_error(result, "internal_knots_y");
+    }
 
     #[test]
     fn augknt_basic() {
