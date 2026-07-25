@@ -326,6 +326,7 @@ typedef struct SplineBasisOut {
  * Initial/lower/upper are `(n_modes, 6)` row-major:
  *   * power: `[amp, fmean, fstd, pmean,    pstd,      theta]`
  *   * phase: `[amp, fmean, fstd, phasepref, recikappa, theta]`
+ * `fstd` is a frequency standard deviation in Hz for both axes.
  *
  * `bg_initial`, `bg_lower`, `bg_upper` are 3-vectors `[xxx, yyy, zzz]`.
  */
@@ -663,9 +664,8 @@ int dynamo_rotgauss_fit(const struct ParamFitIn *in_, struct ParamFitOutFFI *out
 
 /**
  * Fit a von-Mises × Gaussian mixture + sinusoidal background to a SOPH
- * histogram. Mirrors MATLAB `fit_vmGauss` **without** the per-row
- * normalization step in `normalized_vmGauss.m` (see
- * `src/paramfit/vm_gauss.rs` module docs).
+ * histogram. `ParamFitIn::unit_row` controls per-row normalization;
+ * nonzero matches MATLAB `fit_vmGauss`.
  *
  * # Safety
  * All pointers must back the declared lengths.

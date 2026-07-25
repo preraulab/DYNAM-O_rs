@@ -13,10 +13,14 @@
 //!
 //! ```text
 //!   vmGauss(x, y, A, ym, ys, xm, xs, t)
-//!     = A * exp(-(y-ym)^2 / ys)                    -- note: NOT ys^2
+//!     = A * exp(-((y-ym) / ys)^2)
 //!         * exp( κ * (cos(x - xm + (y-ym)*sin(t)) - 1) )
 //!     κ = 1 / xs^2
 //! ```
+//!
+//! The frequency width `ys` (`fstd`) is a standard deviation in Hz. Callers
+//! pass and consume it directly; legacy seeds and bounds tuned for the former
+//! variance-form equation must be square-rooted before reuse.
 //!
 //! Parameter layout (flat vector, length `6N + 3`):
 //!
@@ -75,7 +79,8 @@ pub fn eval_model(
                 let dy = y - fm;
                 let kappa = 1.0 / (rk * rk);
                 let arg_cos = x - pp + dy * th.sin();
-                v += a * (-(dy * dy) / fs).exp() * (kappa * (arg_cos.cos() - 1.0)).exp();
+                v += a * (-(dy * dy) / (fs * fs)).exp()
+                    * (kappa * (arg_cos.cos() - 1.0)).exp();
             }
             z[[iy, ix]] = v;
         }
@@ -257,10 +262,31 @@ mod tests {
         let y: f64 = 11.0;
         let dy = y - fm;
         let kappa = 1.0 / (rk * rk);
-        let expected = a * (-(dy * dy) / fs).exp() * (kappa * ((x - pp + dy * th.sin()).cos() - 1.0)).exp();
+        let expected = a * (-(dy * dy) / (fs * fs)).exp()
+            * (kappa * ((x - pp + dy * th.sin()).cos() - 1.0)).exp();
         let p = vec![a, fm, fs, pp, rk, th, 0.0, 0.0, 0.0];
         let z = eval_model(&p, 1, &[x], &[y], false);
         assert!((z[[0, 0]] - expected).abs() < 1e-14);
+    }
+
+    #[test]
+    fn frequency_width_is_standard_deviation() {
+        let amp = 2.0;
+        let fmean = 10.0;
+        let fstd = 2.5;
+        let phasepref = 0.0;
+        let recikappa = 1.0;
+        let theta = 0.0;
+        let p = [
+            amp, fmean, fstd, phasepref, recikappa, theta,
+            0.0, 0.0, 0.0,
+        ];
+
+        let at_center = eval_model(&p, 1, &[phasepref], &[fmean], false)[[0, 0]];
+        let at_one_std =
+            eval_model(&p, 1, &[phasepref], &[fmean + fstd], false)[[0, 0]];
+
+        assert!((at_one_std / at_center - (-1.0_f64).exp()).abs() < 1e-12);
     }
 
     #[test]
@@ -268,7 +294,7 @@ mod tests {
         let nx = 40usize; let ny = 40usize;
         let xg: Vec<f64> = (0..nx).map(|i| -std::f64::consts::PI + 2.0*std::f64::consts::PI*i as f64/(nx-1) as f64).collect();
         let yg: Vec<f64> = (0..ny).map(|j| 0.5 + 30.0*j as f64/(ny-1) as f64).collect();
-        let true_p = [0.08_f64, 11.0, 2.5, std::f64::consts::PI/3.0, 1.0, 0.0,
+        let true_p = [0.08_f64, 11.0, 2.5_f64.sqrt(), std::f64::consts::PI/3.0, 1.0, 0.0,
                        0.0, 0.0, 0.005];
         let z_clean = eval_model(&true_p, 1, &xg, &yg, false);
         let mut z = z_clean.clone();
@@ -279,11 +305,11 @@ mod tests {
         }
 
         let initial = Array2::from_shape_vec((1, 6),
-            vec![0.05, 10.0, 3.0, 1.0, 1.5, 0.0]).unwrap();
+            vec![0.05, 10.0, 3.0_f64.sqrt(), 1.0, 1.5, 0.0]).unwrap();
         let lower = Array2::from_shape_vec((1, 6),
             vec![0.0, 1.0, 1.0, -std::f64::consts::PI, 0.5, -std::f64::consts::PI/3.0]).unwrap();
         let upper = Array2::from_shape_vec((1, 6),
-            vec![1.0, 30.0, 15.0, std::f64::consts::PI, 5.0, std::f64::consts::PI/3.0]).unwrap();
+            vec![1.0, 30.0, 15.0_f64.sqrt(), std::f64::consts::PI, 5.0, std::f64::consts::PI/3.0]).unwrap();
 
         let out = fit_vmgauss(
             z.view(), &xg, &yg,
@@ -295,5 +321,64 @@ mod tests {
         assert!(out.gof.rsquare > 0.95,
             "Phase recovery R² too low: {} (sse={}, dfe={})",
             out.gof.rsquare, out.gof.sse, out.gof.dfe);
+        assert!(((out.params[[0, 2]] - true_p[2]) / true_p[2]).abs() < 0.12,
+            "Recovered FreqStd {} differs from planted sigma {}",
+            out.params[[0, 2]], true_p[2]);
+    }
+
+    #[test]
+    fn phase_center_bounds_allow_crossing_pi_seam() {
+        use std::f64::consts::PI;
+
+        let nx = 81usize;
+        let ny = 65usize;
+        let xg: Vec<f64> = (0..nx)
+            .map(|i| -PI + 2.0 * PI * i as f64 / (nx - 1) as f64)
+            .collect();
+        let yg: Vec<f64> = (0..ny)
+            .map(|i| 2.0 + 16.0 * i as f64 / (ny - 1) as f64)
+            .collect();
+        let planted = [
+            0.07, 10.5, 1.4, -PI + 0.12, 0.9, 0.42,
+            0.012, 0.35, 0.003,
+        ];
+        let soph = eval_model(&planted, 1, &xg, &yg, true);
+        let initial = Array2::from_shape_vec(
+            (1, 6),
+            vec![0.06, 10.2, 1.2, PI - 0.04, 1.0, 0.30],
+        ).unwrap();
+
+        for (label, phase_lower, phase_upper) in [
+            ("two-period", -2.0 * PI, 2.0 * PI),
+            ("unbounded", f64::NEG_INFINITY, f64::INFINITY),
+        ] {
+            let lower = Array2::from_shape_vec(
+                (1, 6),
+                vec![0.001, 2.0, 1.0, phase_lower, PI / 5.0, -PI / 3.0],
+            ).unwrap();
+            let upper = Array2::from_shape_vec(
+                (1, 6),
+                vec![1.0, 18.0, 15.0_f64.sqrt(), phase_upper, 2.0 * PI, PI / 3.0],
+            ).unwrap();
+
+            let out = fit_vmgauss(
+                soph.view(), &xg, &yg,
+                initial.view(), lower.view(), upper.view(),
+                [0.012, 0.35, 0.003], [-1.0, -PI, 0.0], [1.0, PI, 1.0],
+                500, true,
+            ).unwrap();
+            let raw_phase = out.params[[0, 3]];
+            let phase_error = (raw_phase - planted[3]).sin()
+                .atan2((raw_phase - planted[3]).cos())
+                .abs();
+
+            assert!(raw_phase > PI,
+                "{label}: expected the raw phase center to cross +pi, got {raw_phase}");
+            assert!(phase_error < 1e-4,
+                "{label}: recovered phase {raw_phase} is not circularly close to {}",
+                planted[3]);
+            assert!(out.gof.adjrsquare > 0.9999,
+                "{label}: seam-crossing adjusted R-squared too low: {}", out.gof.adjrsquare);
+        }
     }
 }

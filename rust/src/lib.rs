@@ -855,9 +855,10 @@ mod python {
     ///
     /// von-Mises × Gaussian mixture + sinusoidal baseline, mirroring MATLAB
     /// `fit_vmGauss.m`. Column layout of `initial`/`lower`/`upper` is
-    /// `[amp, fmean, fstd, phasepref, recikappa, theta]`. `unit_row=True`
-    /// replicates `normalized_vmGauss.m`'s per-frequency-row normalization
-    /// (MATLAB passes `problem=true` for the phase fit).
+    /// `[amp, fmean, fstd, phasepref, recikappa, theta]`, where `fstd` is a
+    /// frequency standard deviation in Hz. `unit_row=True` replicates
+    /// `normalized_vmGauss.m`'s per-frequency-row normalization (MATLAB
+    /// passes `problem=true` for the phase fit).
     #[pyfunction]
     #[pyo3(signature = (soph, x_grid, y_grid, initial, lower, upper,
                         bg_initial, bg_lower, bg_upper, max_iters=0, unit_row=true))]
