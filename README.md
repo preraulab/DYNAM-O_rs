@@ -155,7 +155,7 @@ rust/
     bin/dynamo.rs         # CLI entry point (`cargo build --bin dynamo`)
   include/
     dynamo_rs.h           # cbindgen-generated C header
-data_matlab_filters/      # 43 pre-computed SOphase SOS filters (.npy)
+data_matlab_filters/      # 42 pre-computed SOphase SOS filters (.npy)
 ```
 
 ---
@@ -166,8 +166,14 @@ data_matlab_filters/      # 43 pre-computed SOphase SOS filters (.npy)
 
 ```bash
 cd rust
-cargo build --release
+cargo build --release --locked
 ```
+
+This direct command is for local development. Do not distribute its outputs:
+it does not establish the controlled source-path remapping environment. Build
+release artifacts through `DYNAM-O_toolbox/release_build.py`, which checks out
+the current `origin/master` tips, applies path remapping, records provenance,
+and runs the mandatory privacy gate.
 
 Produces:
 - `target/release/libdynamo_rs.{dylib,so,a}` (macOS / Linux; `.dll` + `.dll.lib` on Windows).
@@ -182,25 +188,39 @@ in the MATLAB repo for the end-to-end build recipe.
 
 ```bash
 cd rust
-maturin build --release --features python
+maturin build --release --features python --locked
+python3 ../scripts/sanitize_maturin_sbom.py target/wheels/*.whl
+python3 ../scripts/sanitize_maturin_sbom.py --check target/wheels/*.whl
 # or, for in-place development:
-maturin develop --release --features python
+maturin develop --release --features python --locked
 ```
 
+These direct Maturin commands are also development-only. Use the toolbox
+release builder for any artifact that will be published. Sanitizing the SBOM
+does not replace remapping paths in the native extension itself.
+
 Produces `dynamo_rs*.whl`. Pydynamo's optional `import dynamo_rs` gate picks
-it up automatically when available.
+it up automatically when available. Maturin includes the 42 canonical
+SO-phase filters at `data_matlab_filters/` beside the native extension. The
+SBOM sanitizer replaces local Cargo package paths with deterministic virtual
+roots while preserving matching CycloneDX component and dependency references.
+After `maturin develop`, run the same sanitizer against the installed
+`dynamo_rs-*.dist-info/sboms/` directory.
 
 ### As a standalone CLI (no MATLAB or Python needed)
 
 ```bash
 cd rust
-cargo build --release --bin dynamo
+cargo build --release --locked --bin dynamo
 ./target/release/dynamo extract \
     --spect  spect.npy  \
     --stimes stimes.npy \
     --sfreqs sfreqs.npy \
     --out    stats.csv
 ```
+
+The direct CLI build is for local development; use the toolbox release builder
+before distributing the executable.
 
 Currently covers the "from-spectrogram" slice: given a pre-computed
 multitaper spectrogram as three `.npy` files, run the watershed / merge /
