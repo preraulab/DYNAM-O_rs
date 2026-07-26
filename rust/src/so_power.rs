@@ -33,8 +33,8 @@ pub enum NormMethod {
 }
 
 impl NormMethod {
-    /// Parse the MATLAB-style string form ("p2shift1234", "percent", "none",
-    /// "absolute", "%", "%SOP"). Returns `None` if unrecognized.
+    /// Parse the MATLAB-style string form ("shift", "p2shift1234", "percent",
+    /// "none", "absolute", "%", "%SOP"). Returns `None` if unrecognized.
     pub fn parse(s: &str) -> Option<Self> {
         let lower = s.to_ascii_lowercase();
         // "p{N}shift{S}" where N is 0–100 and S is a string of digits 1–5.
@@ -59,6 +59,10 @@ impl NormMethod {
             }
         }
         match lower.as_str() {
+            "shift" => Some(NormMethod::Shift {
+                ptile: 2.0,
+                stages: vec![1, 2, 3, 4],
+            }),
             "percent" | "percentile" | "%" | "%sop" => Some(NormMethod::Percent),
             "none" | "absolute" => Some(NormMethod::None_),
             _ => None,
@@ -361,6 +365,22 @@ mod tests {
         assert!(matches!(NormMethod::parse("%SOP"), Some(NormMethod::Percent)));
         assert!(matches!(NormMethod::parse("none"), Some(NormMethod::None_)));
         assert!(NormMethod::parse("nonsense").is_none());
+    }
+
+    #[test]
+    fn bare_shift_alias_matches_matlab_default() {
+        for alias in ["shift", "SHIFT"] {
+            match NormMethod::parse(alias).unwrap() {
+                NormMethod::Shift { ptile, stages } => {
+                    assert_eq!(ptile, 2.0);
+                    assert_eq!(stages, vec![1, 2, 3, 4]);
+                }
+                _ => panic!(),
+            }
+        }
+
+        assert!(NormMethod::parse("proportion").is_none());
+        assert!(NormMethod::parse("normalized").is_none());
     }
 
     #[test]
