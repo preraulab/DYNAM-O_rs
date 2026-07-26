@@ -7,7 +7,6 @@ venv/
 build/
 dist/
 target/
-Cargo.lock
 *.so
 *.pyd
 *.dylib
