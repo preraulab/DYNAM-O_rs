@@ -64,21 +64,47 @@ impl Default for ArtifactOpts {
 /// True where `data` sits in a run of ≥ `min_run` identical values.
 /// Port of pydynamo `_flat_mask`.
 pub fn flat_run_mask(data: &[f64], min_run: usize) -> Vec<bool> {
+    flat_run_mask_with_tolerance(data, min_run, 0.0)
+}
+
+/// True inside runs whose full value span stays within `tol`.
+fn flat_run_mask_with_tolerance(data: &[f64], min_run: usize, tol: f64) -> Vec<bool> {
     let n = data.len();
     if n == 0 {
         return vec![];
     }
     let mut mask = vec![false; n];
     let mut run_start = 0usize;
+    let mut run_min = data[0];
+    let mut run_max = data[0];
+
     for i in 1..=n {
-        if i == n || data[i] != data[i - 1] {
-            let run_len = i - run_start;
-            if run_len >= min_run {
-                for j in run_start..i {
-                    mask[j] = true;
-                }
+        let same = if i == n {
+            false
+        } else if tol > 0.0 {
+            if data[i].is_finite() && run_min.is_finite() {
+                let next_min = run_min.min(data[i]);
+                let next_max = run_max.max(data[i]);
+                next_max - next_min <= tol
+            } else {
+                false
+            }
+        } else {
+            data[i] == data[run_start]
+        };
+
+        if same {
+            run_min = run_min.min(data[i]);
+            run_max = run_max.max(data[i]);
+        } else {
+            if i - run_start >= min_run {
+                mask[run_start..i].fill(true);
             }
             run_start = i;
+            if i < n {
+                run_min = data[i];
+                run_max = data[i];
+            }
         }
     }
     mask
@@ -685,8 +711,16 @@ pub fn detect_artifacts(data: &[f64], fs: f64, opts: &ArtifactOpts) -> Vec<bool>
         return vec![];
     }
 
-    // Flat runs of ≥ 1 s.
-    let flat = flat_run_mask(data, fs.round().max(1.0) as usize);
+    // Flat runs of ≥ 1 s. Resampling leaves small ringing in genuinely
+    // disconnected segments, so match MATLAB's tolerance of 2% of the finite
+    // signal's sample standard deviation instead of requiring exact equality.
+    let (_, sample_std) = mean_std(data);
+    let flat_tol = 0.02 * sample_std;
+    let flat = flat_run_mask_with_tolerance(
+        data,
+        fs.round().max(1.0) as usize,
+        flat_tol,
+    );
     let mut bad: Vec<bool> = (0..n)
         .map(|i| !data[i].is_finite() || flat[i])
         .collect();
@@ -753,6 +787,48 @@ mod tests {
             m,
             vec![true, true, true, true, false, false, true, true, true]
         );
+    }
+
+    #[test]
+    fn flat_run_tolerance_uses_full_run_span() {
+        // Adjacent differences are within tolerance, but the full span is not.
+        // MATLAB get_chunks therefore splits this sequence.
+        let data = [0.0, 0.009, 0.018];
+
+        let mask = flat_run_mask_with_tolerance(&data, 3, 0.01);
+
+        assert!(!mask.iter().any(|&value| value));
+    }
+
+    #[test]
+    fn flat_run_tolerance_recovers_resampled_disconnection() {
+        let mut data: Vec<f64> = (0..2_000)
+            .map(|i| {
+                let x = i as f64;
+                (0.37 * x).sin() + 0.5 * (0.11 * x).cos()
+            })
+            .collect();
+        let (_, sample_std) = mean_std(&data);
+        let flat_tol = 0.02 * sample_std;
+        assert!(
+            !flat_run_mask_with_tolerance(&data, 100, flat_tol)
+                .iter()
+                .any(|&value| value),
+            "ordinary varying EEG must not be marked flat"
+        );
+
+        for (offset, value) in data[800..950].iter_mut().enumerate() {
+            *value = -0.005 + 0.01 * offset as f64 / 149.0;
+        }
+        let (_, sample_std) = mean_std(&data);
+        let mask = flat_run_mask_with_tolerance(&data, 100, 0.02 * sample_std);
+
+        assert!(mask[800..950].iter().all(|&value| value));
+        assert!(!mask[..500].iter().any(|&value| value));
+        assert!(!mask[1_200..].iter().any(|&value| value));
+
+        let artifacts = detect_artifacts(&data, 100.0, &ArtifactOpts::default());
+        assert!(artifacts[800..950].iter().all(|&value| value));
     }
 
     #[test]
@@ -848,7 +924,12 @@ mod tests {
 
         // Sequential reference — mirror the body of detect_artifacts
         // but without rayon::join.
-        let flat = flat_run_mask(&data, fs.round().max(1.0) as usize);
+        let (_, sample_std) = mean_std(&data);
+        let flat = flat_run_mask_with_tolerance(
+            &data,
+            fs.round().max(1.0) as usize,
+            0.02 * sample_std,
+        );
         let mut bad: Vec<bool> = (0..data.len())
             .map(|i| !data[i].is_finite() || flat[i])
             .collect();
