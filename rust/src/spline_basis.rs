@@ -3,7 +3,7 @@
 //! Port of MATLAB Curve Fitting Toolbox's
 //! `spap2({augknt(knots_x,3), augknt(knots_y,3)}, [4 4], {x, y}, SOPH')`
 //! as called from
-//! `DYNAM-O_dev/toolbox/SOPH_dim_reduction/spline_basis/spline_basis.m`.
+//! `DYNAM-O/toolbox/SOPH_dim_reduction/spline_basis/spline_basis.m`.
 //!
 //! # Algorithm
 //!

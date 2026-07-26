@@ -41,7 +41,7 @@ pub fn run_extract_from_spectrogram(
 /// Default `ExtractParams` matching `runDYNAMO` defaults:
 /// seg_time=30 s, downsample [2,2], merge_thresh=11, trim_vol=0.8,
 /// dur_min=0.5 s, dur_max=5 s, bw_min=2 Hz, bw_max=15 Hz, ht_db_min=-inf,
-/// expand_labels_distance=0 (MATLAB-paint, default on rust-bridge).
+/// expand_labels_distance=0 (MATLAB-paint, default).
 pub fn default_extract_params() -> ExtractParams {
     ExtractParams {
         seg_time: 30.0,
