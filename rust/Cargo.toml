@@ -6,10 +6,9 @@ description = "Rust kernel + pure-Rust pipeline for DYNAM-O"
 
 [lib]
 name = "dynamo_rs"
-# staticlib: for MEX wrappers to statically link the Rust ABI.
-# cdylib:    for Python (maturin) and MATLAB loadlibrary.
-# rlib:      for downstream Rust consumers.
-crate-type = ["staticlib", "cdylib", "rlib"]
+# cdylib: for Python (maturin) and dynamically linked MATLAB MEX wrappers.
+# rlib:   for the standalone CLI and downstream Rust consumers.
+crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["parallel"]
