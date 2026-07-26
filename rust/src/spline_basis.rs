@@ -11,12 +11,16 @@
 //! equations factor into two 1-D problems (Boor 1978, *A Practical Guide
 //! to Splines*, §XVII). Given the 1-D basis matrices
 //!
-//!     B_x[i, a] = N_a(x_i)   shape (n_x, m_x)
-//!     B_y[j, b] = N_b(y_j)   shape (n_y, m_y)
+//! ```text
+//! B_x[i, a] = N_a(x_i)   shape (n_x, m_x)
+//! B_y[j, b] = N_b(y_j)   shape (n_y, m_y)
+//! ```
 //!
 //! and data Z of shape `(n_x, n_y)`, the LSQ-optimal coefficients are
 //!
-//!     C = (B_x^T B_x)^-1  B_x^T  Z  B_y  (B_y^T B_y)^-1     shape (m_x, m_y)
+//! ```text
+//! C = (B_x^T B_x)^-1  B_x^T  Z  B_y  (B_y^T B_y)^-1     shape (m_x, m_y)
+//! ```
 //!
 //! Both Gram matrices are small SPD (tens of rows) so we solve via
 //! `nalgebra::Cholesky`.
