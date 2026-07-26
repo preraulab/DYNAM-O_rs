@@ -182,7 +182,7 @@ fn trf_bounds<R: ResidualsAndJacobian>(
     let scale = vec![1.0_f64; n_p];
     let scale_inv = vec![1.0_f64; n_p];
 
-    let (mut v, mut dv) = cl_scaling_vector(&x, &g, lb, ub);
+    let (mut v, _) = cl_scaling_vector(&x, &g, lb, ub);
     let mut delta: f64 = {
         // Delta = ||x0 * scale_inv / sqrt(v)||
         let mut s = 0.0_f64;
@@ -200,12 +200,11 @@ fn trf_bounds<R: ResidualsAndJacobian>(
     let mut status: Option<TrfStatus> = None;
     let mut iteration: u32 = 0;
     let mut step_norm: f64 = 0.0;
-    let mut actual_reduction: f64 = -1.0;
 
     loop {
         // Recompute scaling vector each iter.
-        let (v_new, dv_new) = cl_scaling_vector(&x, &g, lb, ub);
-        v = v_new; dv = dv_new;
+        let (v_new, dv) = cl_scaling_vector(&x, &g, lb, ub);
+        v = v_new;
 
         // ||g * v||_inf
         let g_norm_inf = g.iter().zip(v.iter()).map(|(gi, vi)| (gi * vi).abs()).fold(0.0_f64, f64::max);
@@ -301,13 +300,12 @@ fn trf_bounds<R: ResidualsAndJacobian>(
         // theta controls step-back from boundary
         let theta = 0.995_f64.max(1.0 - g_norm_inf);
 
-        actual_reduction = -1.0;
+        let mut actual_reduction = -1.0;
         let mut delta_new;
         let mut ratio;
         let mut x_new = x.clone();
         let mut f_new = f.clone();
         let mut cost_new = cost;
-        let mut step_h_norm = 0.0_f64;
 
         while actual_reduction <= 0.0 && nfev < max_nfev {
             // Solve TR subproblem in hat space → p_h
@@ -336,7 +334,7 @@ fn trf_bounds<R: ResidualsAndJacobian>(
             N_RES.with(|n| n.set(n.get() + 1));
             nfev += 1;
 
-            step_h_norm = norm(&step_h);
+            let step_h_norm = norm(&step_h);
 
             if !f_new.iter().all(|v| v.is_finite()) {
                 delta = 0.25 * step_h_norm;
@@ -355,9 +353,7 @@ fn trf_bounds<R: ResidualsAndJacobian>(
             let x_norm = norm(&x);
             let termination = check_termination(actual_reduction, cost, step_norm, x_norm, ratio, ftol, xtol);
             if let Some(t) = termination {
-                x_new = x_try.clone();
-                status = Some(t);
-                // Apply the accepted step (mirrors scipy: it breaks out, then later assigns x = x_new if reduction>0)
+                // Apply the accepted step before finalizing the termination report.
                 x = x_try.clone();
                 f.copy_from_slice(&f_new);
                 cost = cost_new;
