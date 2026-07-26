@@ -1,7 +1,7 @@
 //! Rotated 2-D Gaussian mixture model + LM fit driver.
 //!
 //! Mirrors MATLAB
-//! `DYNAM-O_dev/toolbox/SOPH_dim_reduction/parametric_basis/basis_functions/rotGauss.m`
+//! `DYNAM-O/toolbox/SOPH_dim_reduction/parametric_basis/basis_functions/rotGauss.m`
 //! and the linear background-plane sum from `fit_rotGauss.m:105`:
 //!
 //! ```text
