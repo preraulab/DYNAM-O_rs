@@ -452,6 +452,49 @@ mod tests {
     }
 
     #[test]
+    fn p2shift1234_excludes_wake_and_unknown_from_percentile() {
+        let n_freqs = 1;
+        let n_times = 6;
+        // Wake and Unknown have the two lowest powers. If either contributes
+        // to the shift percentile, the percentile will be below 0 dB.
+        let so_spect = vec![0.0001, 0.001, 1.0, 10.0, 100.0, 1000.0];
+        let stimes: Vec<f64> = (0..n_times).map(|i| i as f64).collect();
+        let sfreqs = vec![1.0];
+        let eeg_times = stimes.clone();
+        let isexcluded = vec![false; eeg_times.len()];
+        let stage_times = stimes.clone();
+        let stage_vals = vec![5.0, 0.0, 1.0, 2.0, 3.0, 4.0];
+        let norm_method = NormMethod::parse("p2shift1234").unwrap();
+
+        let out = so_power_from_spectrogram(
+            &so_spect,
+            n_freqs,
+            n_times,
+            &stimes,
+            &sfreqs,
+            &eeg_times,
+            &isexcluded,
+            &stage_times,
+            &stage_vals,
+            (0.0, 5.0),
+            10.0,
+            &norm_method,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(out.so_power_stages, stage_vals);
+        match out.ptile {
+            Some(PtileUsed::Single(p)) => {
+                // Valid stages 1-4 have powers [1, 10, 100, 1000], or
+                // [0, 10, 20, 30] dB. Their Hazen 2nd percentile is 0 dB.
+                assert!(p.abs() < 1e-12, "got ptile={}", p);
+            }
+            _ => panic!("expected single ptile"),
+        }
+    }
+
+    #[test]
     fn upsample_masks_excluded() {
         let n_freqs = 1;
         let n_times = 3;
