@@ -84,8 +84,13 @@ class ExtractTfpeaksOut(C.Structure):
 
 def _load_lib() -> C.CDLL:
     if not DYLIB.exists():
-        sys.exit(f"libdynamo_rs.dylib not found at {DYLIB}. "
-                 f"Run: cd rust && cargo build --release")
+        sys.exit(
+            f"libdynamo_rs.dylib not found at {DYLIB}.\n"
+            "For local validation only: cd rust && "
+            "cargo build --release --locked --lib\n"
+            "For distributable output, run ./bootstrap.sh --yes "
+            "(or .\\bootstrap.ps1 -Yes) from DYNAM-O_toolbox."
+        )
     lib = C.CDLL(str(DYLIB))
     lib.dynamo_extract_tfpeaks.argtypes = [
         C.POINTER(ExtractTfpeaksIn),

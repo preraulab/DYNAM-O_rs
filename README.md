@@ -115,15 +115,15 @@ resampled data.
 
 ## Crate layout
 
-Triple-target `cdylib` / `staticlib` / `rlib` with an optional `python`
+Dual-target `cdylib` / `rlib` with an optional `python`
 feature for PyO3 bindings:
 
 ```toml
 [lib]
-crate-type = ["cdylib", "staticlib", "rlib"]
+crate-type = ["cdylib", "rlib"]
 
 [features]
-default = []
+default = ["parallel"]
 python  = ["dep:pyo3", "dep:numpy"]
 ```
 
@@ -152,7 +152,7 @@ rust/
     filter_design.rs      # cheby1_sos (ported from scipy.signal.cheby1)
     adjacency.rs          # region adjacency utilities
     io/                   # edf, staging
-    bin/dynamo.rs         # CLI entry point (`cargo build --bin dynamo`)
+    bin/dynamo.rs         # standalone CLI entry point
   include/
     dynamo_rs.h           # cbindgen-generated C header
 data_matlab_filters/      # 42 pre-computed SOphase SOS filters (.npy)
@@ -162,52 +162,67 @@ data_matlab_filters/      # 42 pre-computed SOphase SOS filters (.npy)
 
 ## Build
 
+Build distributable artifacts from the parent `DYNAM-O_toolbox` checkout with
+the controlled bootstrap entrypoint:
+
+macOS or Linux:
+
+```bash
+cd <workspace>/DYNAM-O_toolbox
+./bootstrap.sh --yes
+```
+
+Windows PowerShell:
+
+```powershell
+cd <workspace>\DYNAM-O_toolbox
+.\bootstrap.ps1 -Yes
+```
+
+These entrypoints synchronize the repositories, establish source-path
+remapping, record provenance, and run the mandatory privacy gate.
+
 ### As a Rust library / C library (for MEX consumers)
+
+The direct Cargo command below is for local development only. Do not distribute
+its outputs: it does not establish the controlled source-path remapping
+environment.
 
 ```bash
 cd rust
-cargo build --release --locked
+cargo build --release --locked --lib
 ```
 
-This direct command is for local development. Do not distribute its outputs:
-it does not establish the controlled source-path remapping environment. Build
-release artifacts through `DYNAM-O_toolbox/release_build.py`, which checks out
-the current `origin/master` tips, applies path remapping, records provenance,
-and runs the mandatory privacy gate.
-
 Produces:
-- `target/release/libdynamo_rs.{dylib,so,a}` (macOS / Linux; `.dll` + `.dll.lib` on Windows).
-- `include/dynamo_rs.h` — regenerated on each build via `build.rs` + `cbindgen`.
+- `target/release/libdynamo_rs.dylib` on macOS, `libdynamo_rs.so` on Linux,
+  or `dynamo_rs.dll` plus its import library on Windows.
+- `target/release/libdynamo_rs.rlib`, an internal Cargo artifact for Rust
+  consumers. It is not shipped.
+- `include/dynamo_rs.h` — tracked and refreshed by `build.rs` + `cbindgen`
+  when relevant Rust inputs change.
 
-MATLAB MEX wrappers live in `DYNAM-O/rust_bridge/` and link against these
-artifacts. See
+MATLAB MEX wrappers live in `DYNAM-O/rust_bridge/` and link against the
+platform shared library. See
 [`rust_bridge/README.md`](https://github.com/preraulab/DYNAM-O/blob/master/rust_bridge/README.md)
 in the MATLAB repo for the end-to-end build recipe.
 
 ### As a Python extension (for pydynamo)
 
-```bash
-cd rust
-maturin build --release --features python --locked
-python3 ../scripts/sanitize_maturin_sbom.py target/wheels/*.whl
-python3 ../scripts/sanitize_maturin_sbom.py --check target/wheels/*.whl
-# or, for in-place development:
-maturin develop --release --features python --locked
-```
+Use the controlled toolbox bootstrap above. It installs the pinned Maturin
+version internally, builds and installs `dynamo_rs` into
+`DYNAM-O_py/.venv` under the path-remapped environment, includes the 42
+canonical SO-phase filters, sanitizes the installed SBOM, and runs the final
+privacy gate.
 
-These direct Maturin commands are also development-only. Use the toolbox
-release builder for any artifact that will be published. Sanitizing the SBOM
-does not replace remapping paths in the native extension itself.
-
-Produces `dynamo_rs*.whl`. Pydynamo's optional `import dynamo_rs` gate picks
-it up automatically when available. Maturin includes the 42 canonical
-SO-phase filters at `data_matlab_filters/` beside the native extension. The
-SBOM sanitizer replaces local Cargo package paths with deterministic virtual
-roots while preserving matching CycloneDX component and dependency references.
-After `maturin develop`, run the same sanitizer against the installed
-`dynamo_rs-*.dist-info/sboms/` directory.
+The controlled workflow does not currently produce a standalone `dynamo_rs`
+wheel for distribution. Native extensions or wheels produced by direct
+Maturin, pip, or other PEP 517 commands are not controlled release artifacts
+and must not be published as such.
 
 ### As a standalone CLI (no MATLAB or Python needed)
+
+The direct CLI build below is for local development only. Use the controlled
+toolbox bootstrap before distributing the executable.
 
 ```bash
 cd rust
@@ -218,9 +233,6 @@ cargo build --release --locked --bin dynamo
     --sfreqs sfreqs.npy \
     --out    stats.csv
 ```
-
-The direct CLI build is for local development; use the toolbox release builder
-before distributing the executable.
 
 Currently covers the "from-spectrogram" slice: given a pre-computed
 multitaper spectrogram as three `.npy` files, run the watershed / merge /
@@ -233,14 +245,12 @@ Defaults match `runDYNAMO`: `seg_time=30`, `downsample=(2,2)`,
 `merge_thresh=11`, `trim_vol=0.8`, `dur_min=0.5`, `bw_min=2`, etc. All
 overridable via flags.
 
-### Regenerate the C header manually
+### C header
 
-The `build.rs` script invokes `cbindgen` on every `cargo build`. If you need
-to regenerate manually:
-
-```bash
-cargo run --bin cbindgen -- --output include/dynamo_rs.h
-```
+The generated `rust/include/dynamo_rs.h` is tracked. Cargo's `build.rs`
+refreshes it through `cbindgen` when relevant Rust inputs change. Use the
+controlled toolbox bootstrap when distributing native artifacts built against
+an updated header.
 
 ---
 
@@ -249,9 +259,9 @@ cargo run --bin cbindgen -- --output include/dynamo_rs.h
 | Client | How it links | Entry points |
 |---|---|---|
 | **MATLAB MEX** (`DYNAM-O/rust_bridge/`) | Classic-C MEX `.c` files link `-ldynamo_rs` at build, load the dylib at runtime via `dlopen` (macOS embeds rpath) | `dynamo_extract_tfpeaks`, `dynamo_mask_spectrogram`, `dynamo_refine_peaks`, `dynamo_tfpeak_histogram` — in `src/c_api.rs` |
-| **Python** (`pydynamo`) | PyO3 extension (`maturin build --features python`) | `matlab_watershed`, `matlab_paint_labels`, `merge_segment`, `trim_regions`, `mask_spectrogram`, `compute_baseline`, `build_baseline_exclude`, `subtract_baseline`, `so_power_from_spectrogram`, `so_phase_from_eeg`, `detect_artifacts`, `hann_event_spectra`, `refine_from_spectra`, `tfpeak_histogram`, `hilbert`, `sosfiltfilt`, `movmean`, `unwrap`, … — in `src/lib.rs` under `#[pyfunction]` |
+| **Python** (`pydynamo`) | PyO3 extension installed by the controlled toolbox bootstrap | `matlab_watershed`, `matlab_paint_labels`, `merge_segment`, `trim_regions`, `mask_spectrogram`, `compute_baseline`, `build_baseline_exclude`, `subtract_baseline`, `so_power_from_spectrogram`, `so_phase_from_eeg`, `detect_artifacts`, `hann_event_spectra`, `refine_from_spectra`, `tfpeak_histogram`, `hilbert`, `sosfiltfilt`, `movmean`, `unwrap`, … — in `src/lib.rs` under `#[pyfunction]` |
 | **Rust** | `Cargo.toml` path or git dep | Public Rust items in `src/lib.rs` |
-| **Standalone CLI** | `cargo build --release --bin dynamo` | `dynamo extract --spect ... --out stats.csv` — in `src/bin/dynamo.rs` |
+| **Standalone CLI** | Local Cargo build; controlled toolbox bootstrap for distribution | `dynamo extract --spect ... --out stats.csv` — in `src/bin/dynamo.rs` |
 
 ---
 
