@@ -2,7 +2,7 @@
 //! extern "C"` surface declared in `src/c_api.rs`.
 //!
 //! This is best-effort: a cbindgen failure should NOT break the crate build,
-//! because the pure-Rust staticlib/cdylib is still valid without the header.
+//! because the Rust library build is still valid without the header.
 //! We emit a `cargo:warning` in that case.
 
 fn main() {
