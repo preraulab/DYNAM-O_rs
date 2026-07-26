@@ -36,12 +36,12 @@ nalgebra = { version = "0.34", default-features = false, features = ["std"] }
 levenberg-marquardt = "0.15"
 
 # Pure-Rust multitaper spectrogram. Path is relative so any checkout that
-# sits alongside DYNAM-O_dev (the standard layout under DYNAM-O_toolbox)
+# sits alongside DYNAM-O (the standard layout under DYNAM-O_toolbox)
 # resolves without the user editing Cargo.toml.
 # Layout assumption:
 #   ~/.../toolboxes/DYNAM-O_rs/rust/Cargo.toml            <-- this file
-#   ~/.../toolboxes/DYNAM-O_dev/toolbox/helper_functions/multitaper_toolbox/rust
-multitaper_rs = { path = "../../DYNAM-O_dev/toolbox/helper_functions/multitaper_toolbox/rust", default-features = false }
+#   ~/.../toolboxes/DYNAM-O/toolbox/helper_functions/multitaper_toolbox/rust
+multitaper_rs = { path = "../../DYNAM-O/toolbox/helper_functions/multitaper_toolbox/rust", default-features = false }
 
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"], optional = true }
 numpy = { version = "0.22", optional = true }
