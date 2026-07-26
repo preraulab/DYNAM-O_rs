@@ -1,6 +1,6 @@
 //! Parametric-basis fits for SOPH dimensionality reduction.
 //!
-//! Two kernels, mirroring `DYNAM-O_dev/toolbox/SOPH_dim_reduction/parametric_basis/`:
+//! Two kernels, mirroring `DYNAM-O/toolbox/SOPH_dim_reduction/parametric_basis/`:
 //! * [`rot_gauss`] — sum of N rotated 2-D Gaussians + linear background plane
 //!   (`xxx*x + yyy*y + zzz`). Used for SO-power histograms.
 //! * [`vm_gauss`] — sum of N von-Mises × Gaussian peaks + sinusoidal baseline

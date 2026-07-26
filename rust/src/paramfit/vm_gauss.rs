@@ -1,7 +1,7 @@
 //! von-Mises × Gaussian mixture model + LM fit driver.
 //!
 //! Mirrors MATLAB
-//! `DYNAM-O_dev/toolbox/SOPH_dim_reduction/parametric_basis/basis_functions/{vmGauss,normalized_vmGauss}.m`:
+//! `DYNAM-O/toolbox/SOPH_dim_reduction/parametric_basis/basis_functions/{vmGauss,normalized_vmGauss}.m`:
 //!
 //! ```text
 //!   z(x, y) = xxx * sin(x + yyy) + zzz

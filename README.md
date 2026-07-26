@@ -9,9 +9,9 @@ standalone `dynamo` CLI binary.
 
 This crate is the Rust core shared by:
 
-- **[DYNAM-O](https://github.com/preraulab/DYNAM-O)** — MATLAB toolbox. The `backend='rust'` path calls `dynamo_rs` via MEX wrappers (`DYNAM-O_dev/rust_bridge/`).
+- **[DYNAM-O](https://github.com/preraulab/DYNAM-O)** — MATLAB toolbox. The `backend='rust'` path calls `dynamo_rs` via MEX wrappers (`DYNAM-O/rust_bridge/`).
 - **[pyDYNAM-O](https://github.com/preraulab/DYNAM-O_py)** — Python port. Uses `dynamo_rs` via PyO3 bindings.
-- **[DYNAM-O_toolbox](https://github.com/preraulab/DYNAM-O_toolbox)** — parent meta-repo that pins all three as git submodules.
+- **[DYNAM-O_toolbox](https://github.com/preraulab/DYNAM-O_toolbox)** — parent meta-repo that bootstraps all three as sibling repositories.
 - **Standalone `dynamo` CLI** — native binary, no MATLAB or Python dependency at runtime. See *CLI usage* below.
 
 ---
@@ -21,8 +21,7 @@ This crate is the Rust core shared by:
 Measured head-to-head on the bundled night recording via
 `benchmark_runDYNAMO` (warm, 3-trial median per backend), 2026-04-24
 on an M3 8-core, MATLAB R2025b, Rust release build (fat LTO +
-codegen-units = 1). Committed JSON at
-[`rust_bridge/benchmarks/runs/2026-04-24-140745__DIMHDXTD6TQFV__darwin-arm64.json`](../../../../DYNAM-O_dev/blob/rust-bridge/rust_bridge/benchmarks/runs/2026-04-24-140745__DIMHDXTD6TQFV__darwin-arm64.json).
+codegen-units = 1).
 
 **Backend contract:** `backend='matlab'` is a pure-MATLAB reference
 implementation (except for the bundled `multitaper_spectrogram_mex`, which
@@ -110,7 +109,7 @@ for ~2× end-to-end speedup with zero analytical loss for sleep oscillations.
 Empirical: 10.5 h × 128 Hz EDF goes from ~41 s → ~22 s on a 32-core
 Threadripper (Rust backend, full pipeline). The MATLAB FileManager has
 this enabled by default; CLI / pydynamo callers should pass already-
-resampled data. See [`DYNAM-O_dev/rust_bridge/benchmarks/README.md`](https://github.com/preraulab/DYNAM-O_dev/blob/rust-bridge/rust_bridge/benchmarks/README.md) for the per-stage scaling analysis.
+resampled data.
 
 ---
 
@@ -174,9 +173,9 @@ Produces:
 - `target/release/libdynamo_rs.{dylib,so,a}` (macOS / Linux; `.dll` + `.dll.lib` on Windows).
 - `include/dynamo_rs.h` — regenerated on each build via `build.rs` + `cbindgen`.
 
-MATLAB MEX wrappers live in `DYNAM-O_dev/rust_bridge/` and link against these
+MATLAB MEX wrappers live in `DYNAM-O/rust_bridge/` and link against these
 artifacts. See
-[`rust_bridge/README.md`](https://github.com/preraulab/DYNAM-O/blob/main/rust_bridge/README.md)
+[`rust_bridge/README.md`](https://github.com/preraulab/DYNAM-O/blob/master/rust_bridge/README.md)
 in the MATLAB repo for the end-to-end build recipe.
 
 ### As a Python extension (for pydynamo)
@@ -229,7 +228,7 @@ cargo run --bin cbindgen -- --output include/dynamo_rs.h
 
 | Client | How it links | Entry points |
 |---|---|---|
-| **MATLAB MEX** (`DYNAM-O_dev/rust_bridge/`) | Classic-C MEX `.c` files link `-ldynamo_rs` at build, load the dylib at runtime via `dlopen` (macOS embeds rpath) | `dynamo_extract_tfpeaks`, `dynamo_mask_spectrogram`, `dynamo_refine_peaks`, `dynamo_tfpeak_histogram` — in `src/c_api.rs` |
+| **MATLAB MEX** (`DYNAM-O/rust_bridge/`) | Classic-C MEX `.c` files link `-ldynamo_rs` at build, load the dylib at runtime via `dlopen` (macOS embeds rpath) | `dynamo_extract_tfpeaks`, `dynamo_mask_spectrogram`, `dynamo_refine_peaks`, `dynamo_tfpeak_histogram` — in `src/c_api.rs` |
 | **Python** (`pydynamo`) | PyO3 extension (`maturin build --features python`) | `matlab_watershed`, `matlab_paint_labels`, `merge_segment`, `trim_regions`, `mask_spectrogram`, `compute_baseline`, `build_baseline_exclude`, `subtract_baseline`, `so_power_from_spectrogram`, `so_phase_from_eeg`, `detect_artifacts`, `hann_event_spectra`, `refine_from_spectra`, `tfpeak_histogram`, `hilbert`, `sosfiltfilt`, `movmean`, `unwrap`, … — in `src/lib.rs` under `#[pyfunction]` |
 | **Rust** | `Cargo.toml` path or git dep | Public Rust items in `src/lib.rs` |
 | **Standalone CLI** | `cargo build --release --bin dynamo` | `dynamo extract --spect ... --out stats.csv` — in `src/bin/dynamo.rs` |
@@ -252,15 +251,6 @@ between merged regions. Controlled by `ExtractParams.expand_labels_distance`:
   for backward compatibility; produces ~1–2 % more peaks than MATLAB.
 
 See `src/extract_pipeline.rs::extract_tfpeaks_segment` for the call site.
-
----
-
-## Branches
-
-- `rust-bridge` — active development line for the three-repo restructure. MATLAB-paint default, matlab_watershed, c_api with `expand_labels_distance`.
-- `main` — historical hybrid layout (Python + Rust + MATLAB shims together). Use only for archaeology.
-
-Tag releases as `v0.x.y-<feature>` when cutting consumer-pinnable snapshots.
 
 ---
 

@@ -1,7 +1,7 @@
 //! Linear-expression parser for EDF channel selection.
 //!
 //! Port of the channel-derivation grammar in MATLAB
-//! `DYNAM-O_dev/toolbox/helper_functions/EDF_toolbox/read_EDF.m:55–110`.
+//! `DYNAM-O/toolbox/helper_functions/EDF_toolbox/read_EDF.m:55–110`.
 //!
 //! Supports:
 //!   - bare label: `"C3"`
