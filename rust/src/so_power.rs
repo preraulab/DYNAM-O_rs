@@ -284,40 +284,11 @@ pub fn so_power_from_spectrogram(
         fp.push(*valid_vals.last().unwrap());
 
         let mut up = interp_linear_padded(&xp, &fp, eeg_times);
-        // Mark EEG samples at artifact times as NaN. Independent of the
-        // coarse-grid NaN bridging that follows.
+        // Match MATLAB/Python: interpolate through finite coarse-grid values,
+        // then restore NaNs only at the original excluded EEG samples.
         for (v, &ex) in up.iter_mut().zip(isexcluded.iter()) {
             if ex {
                 *v = f64::NAN;
-            }
-        }
-        // **NaN-bridge gaps from the coarse grid.** MATLAB's `interp1`
-        // propagates NaN: when a query falls between a finite and a NaN
-        // source value, the result is NaN. Our `interp_linear_padded`
-        // pre-filters out NaN points, so it silently bridges across
-        // gaps. Restore the gaps: any EEG sample whose surrounding
-        // coarse-grid neighbours include a NaN must be NaN too.
-        // `so_power_norm` here is still the pre-upsample coarse vector.
-        if !so_power_norm.is_empty() {
-            // For each EEG sample time, binary-search the coarse-grid
-            // step. The coarse grid is uniform (window_step), so we can
-            // compute the bracketing indices directly.
-            let coarse_t0 = so_power_times[0];
-            let coarse_step = if so_power_times.len() >= 2 {
-                so_power_times[1] - so_power_times[0]
-            } else { 1.0 };
-            let n_coarse = so_power_norm.len();
-            for (i, &t) in eeg_times.iter().enumerate() {
-                let f = (t - coarse_t0) / coarse_step;
-                let lo = f.floor() as isize;
-                let hi = lo + 1;
-                let left_nan = lo < 0 || lo >= n_coarse as isize
-                    || !so_power_norm[lo as usize].is_finite();
-                let right_nan = hi < 0 || hi >= n_coarse as isize
-                    || !so_power_norm[hi as usize].is_finite();
-                if left_nan || right_nan {
-                    up[i] = f64::NAN;
-                }
             }
         }
         so_power_norm = up;
@@ -513,5 +484,27 @@ mod tests {
         assert_eq!(out.so_power_norm.len(), eeg_times.len());
         assert!(out.so_power_norm[5].is_nan(), "excluded sample should be NaN");
         assert!(out.so_power_norm[0].is_finite());
+    }
+
+    #[test]
+    fn upsample_bridges_coarse_nans() {
+        let n_freqs = 1;
+        let n_times = 3;
+        let so_spect = vec![1.0, f64::NAN, 4.0];
+        let stimes = vec![0.0, 5.0, 10.0];
+        let sfreqs = vec![1.0];
+        let eeg_times: Vec<f64> = (0..=10).map(|i| i as f64).collect();
+        let isexcluded = vec![false; eeg_times.len()];
+
+        let out = so_power_from_spectrogram(
+            &so_spect, n_freqs, n_times, &stimes, &sfreqs, &eeg_times,
+            &isexcluded, &[], &[],
+            (0.0, 10.0), 10.0,
+            &NormMethod::None_, true,
+        ).unwrap();
+
+        assert!(out.so_power_norm.iter().all(|v| v.is_finite()));
+        let expected_midpoint = 10.0 * 2.0_f64.log10();
+        assert!((out.so_power_norm[5] - expected_midpoint).abs() < 1e-12);
     }
 }
