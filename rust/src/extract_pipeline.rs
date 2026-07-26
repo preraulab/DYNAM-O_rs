@@ -26,7 +26,7 @@
 //!   - `Volume    = sum(v) * d_time * d_freq`
 
 use ndarray::{Array2, ArrayView1, ArrayView2};
-use rayon::prelude::*;
+use crate::parallel::*;
 use std::collections::{HashMap, VecDeque};
 
 /// Per-segment peak table (one row per surviving label).
@@ -606,12 +606,12 @@ pub fn extract_tfpeaks_segment(
         }
         let mut drop: std::collections::HashSet<i64> = std::collections::HashSet::new();
         for (lbl, (r_min, r_max, c_min, c_max)) in &bb {
-            // MATLAB/pydynamo use (N - 1) * dx = (max - min) * dx. Note
-            // `p.bbox` in skimage is (min, max+1) so (maxc - minc - 1) =
-            // (N_pixels - 1). Our r_max/c_max are inclusive → use
-            // (max - min) directly.
-            let pre_dur = (*c_max as f64 - *c_min as f64) * d_time;
-            let pre_bw = (*r_max as f64 - *r_min as f64) * d_freq;
+            // Span = N_pixels * dx = (max - min + 1) * dx with inclusive
+            // r_max/c_max. Matches the MATLAB extractTFPeaks.m filter as
+            // of commit 7fef48f, which fixed an off-by-one (the old form
+            // (max-min)*dx dropped peaks of true span dur_min by one bin).
+            let pre_dur = (*c_max as f64 - *c_min as f64 + 1.0) * d_time;
+            let pre_bw  = (*r_max as f64 - *r_min as f64 + 1.0) * d_freq;
             if !(pre_dur > params.dur_min && pre_bw > params.bw_min) {
                 drop.insert(*lbl);
             }
@@ -683,6 +683,20 @@ pub fn extract_tfpeaks(
     progress_cb: Option<&(dyn Fn(u32, u32) + Sync)>,
 ) -> Result<(SegmentPeaks, Array2<i64>), String> {
     let (f, t) = spect.dim();
+    if stimes.len() != t {
+        return Err(format!(
+            "spect time dimension {} does not match stimes length {}",
+            t,
+            stimes.len()
+        ));
+    }
+    if sfreqs.len() != f {
+        return Err(format!(
+            "spect frequency dimension {} does not match sfreqs length {}",
+            f,
+            sfreqs.len()
+        ));
+    }
     if f == 0 || t == 0 || stimes.len() < 2 {
         return Ok((SegmentPeaks::default(), Array2::<i64>::zeros((f, t))));
     }
@@ -784,9 +798,7 @@ pub fn extract_tfpeaks(
 
     // filterStatsTable: Duration ∈ (dur_min, dur_max), Bandwidth ∈ (bw_min, bw_max),
     // PeakFrequency ∈ (freq_min, freq_max), pow2db(Height) > ht_db_min.
-    let d_time = stimes[1] - stimes[0];
-    let d_freq = if sfreqs.len() > 1 { sfreqs[1] - sfreqs[0] } else { 0.0 };
-    let keep = filter_indices(&all, params, d_time, d_freq);
+    let keep = filter_indices(&all, params);
 
     // Build a remap from old global label id -> new label id (1..n_kept).
     // Peaks not in `keep` -> 0.
@@ -808,8 +820,6 @@ pub fn extract_tfpeaks(
 fn filter_indices(
     p: &SegmentPeaks,
     params: &ExtractParams,
-    d_time: f64,
-    d_freq: f64,
 ) -> Vec<usize> {
     let mut out = Vec::new();
     for i in 0..p.len() {
@@ -818,16 +828,16 @@ fn filter_indices(
         let pf = p.peak_freq[i];
         let h = p.height[i];
         let h_db = if h > 0.0 { 10.0 * h.log10() } else { f64::NAN };
-        // MATLAB extractTFPeaks.m post-trim filter uses (max-min)*dx >
-        // dur_min, where Duration = N_pixels*dx → filter-value = Duration
-        // - dx. pydynamo replicates this (extract.py:262-264). We apply
-        // both it AND MATLAB's filterStatsTable.m `Duration > dur_min`
-        // (line 78), which is the strictly looser of the two; the stricter
-        // one is the binding constraint.
-        let filter_dur = dur - d_time;
-        let filter_bw = bw - d_freq;
-        let dur_ok = filter_dur > params.dur_min && dur < params.dur_max;
-        let bw_ok = filter_bw > params.bw_min && bw < params.bw_max;
+        // Span = Duration = N_pixels*dx (inclusive bbox). MATLAB's
+        // extractTFPeaks.m post-trim filter and filterStatsTable.m both
+        // compare Duration > dur_min directly as of MATLAB commit 7fef48f
+        // (which fixed an off-by-one: the old form (max-min)*dx = dur-dx
+        // dropped peaks of true span dur_min by one bin). pydynamo's
+        // extract.py:262-264 still uses the (N-1)*dx form and is now
+        // slightly stricter than this Rust path; pydynamo should be
+        // updated for parity if it is used as a numerical reference.
+        let dur_ok = dur > params.dur_min && dur < params.dur_max;
+        let bw_ok  = bw  > params.bw_min  && bw  < params.bw_max;
         let pf_ok = pf > params.freq_min && pf < params.freq_max;
         let ht_ok = h_db.is_finite() && h_db > params.ht_db_min;
         if dur_ok && bw_ok && pf_ok && ht_ok {
@@ -1027,18 +1037,62 @@ mod tests {
             freq_min: 0.0, freq_max: 40.0,
             ht_db_min: 7.0, expand_labels_distance: 5,
         };
-        let kept = filter_indices(&p, &params, 0.05, 0.1);
-        // Height=100 → pow2db = 20 dB > 7 dB ✓; filter_dur = 1.0 - 0.05
-        // = 0.95 > dur_min 0.5 ✓; bw 5 ∈ (2, 15) ✓ (filter_bw = 4.9 > 2).
+        let kept = filter_indices(&p, &params);
+        // Height=100 → pow2db = 20 dB > 7 dB ✓; dur 1.0 > dur_min 0.5 ✓;
+        // bw 5 ∈ (2, 15) ✓.
         assert_eq!(kept, vec![0usize]);
 
         // Out-of-range duration rejected.
         p.duration[0] = 10.0;
-        let kept = filter_indices(&p, &params, 0.05, 0.1);
+        let kept = filter_indices(&p, &params);
         assert!(kept.is_empty());
     }
 
     fn _unused(_a: Array1<f64>) {}
+
+    #[test]
+    fn extract_tfpeaks_rejects_mismatched_axis_lengths() {
+        let spect = Array2::<f64>::zeros((3, 4));
+        let stimes = Array1::from_vec(vec![0.0, 1.0, 2.0, 3.0]);
+        let sfreqs = Array1::from_vec(vec![0.0, 1.0, 2.0]);
+        let params = ExtractParams {
+            seg_time: 30.0,
+            downsample_f: 1, downsample_t: 1,
+            merge_thresh: 8.0, max_merges: f64::INFINITY,
+            trim_vol_thresh: 0.8, trim_shift_val: f64::NAN,
+            dur_min: 0.0, dur_max: f64::INFINITY,
+            bw_min: 0.0, bw_max: f64::INFINITY,
+            freq_min: 0.0, freq_max: f64::INFINITY,
+            ht_db_min: f64::NEG_INFINITY,
+            expand_labels_distance: 5,
+        };
+
+        let time_err = match extract_tfpeaks(
+            spect.view(),
+            stimes.slice(ndarray::s![..3]),
+            sfreqs.view(),
+            None,
+            &params,
+            None,
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("mismatched stimes length was accepted"),
+        };
+        assert!(time_err.contains("stimes"));
+
+        let freq_err = match extract_tfpeaks(
+            spect.view(),
+            stimes.view(),
+            sfreqs.slice(ndarray::s![..1]),
+            None,
+            &params,
+            None,
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("mismatched sfreqs length was accepted"),
+        };
+        assert!(freq_err.contains("sfreqs"));
+    }
 
     /// Synthetic 2-segment extract: verify labels shape matches spect,
     /// that non-zero labels are 1..n_peaks contiguously, that each non-zero

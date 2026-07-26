@@ -33,8 +33,8 @@ pub enum NormMethod {
 }
 
 impl NormMethod {
-    /// Parse the MATLAB-style string form ("p2shift1234", "percent", "none",
-    /// "absolute", "%", "%SOP"). Returns `None` if unrecognized.
+    /// Parse the MATLAB-style string form ("shift", "p2shift1234", "percent",
+    /// "none", "absolute", "%", "%SOP"). Returns `None` if unrecognized.
     pub fn parse(s: &str) -> Option<Self> {
         let lower = s.to_ascii_lowercase();
         // "p{N}shift{S}" where N is 0–100 and S is a string of digits 1–5.
@@ -59,6 +59,10 @@ impl NormMethod {
             }
         }
         match lower.as_str() {
+            "shift" => Some(NormMethod::Shift {
+                ptile: 2.0,
+                stages: vec![1, 2, 3, 4],
+            }),
             "percent" | "percentile" | "%" | "%sop" => Some(NormMethod::Percent),
             "none" | "absolute" => Some(NormMethod::None_),
             _ => None,
@@ -284,6 +288,8 @@ pub fn so_power_from_spectrogram(
         fp.push(*valid_vals.last().unwrap());
 
         let mut up = interp_linear_padded(&xp, &fp, eeg_times);
+        // Match MATLAB/Python: interpolate through finite coarse-grid values,
+        // then restore NaNs only at the original excluded EEG samples.
         for (v, &ex) in up.iter_mut().zip(isexcluded.iter()) {
             if ex {
                 *v = f64::NAN;
@@ -362,6 +368,22 @@ mod tests {
     }
 
     #[test]
+    fn bare_shift_alias_matches_matlab_default() {
+        for alias in ["shift", "SHIFT"] {
+            match NormMethod::parse(alias).unwrap() {
+                NormMethod::Shift { ptile, stages } => {
+                    assert_eq!(ptile, 2.0);
+                    assert_eq!(stages, vec![1, 2, 3, 4]);
+                }
+                _ => panic!(),
+            }
+        }
+
+        assert!(NormMethod::parse("proportion").is_none());
+        assert!(NormMethod::parse("normalized").is_none());
+    }
+
+    #[test]
     fn basic_pipeline_runs() {
         // Tiny synthetic: 2 freqs x 4 window centers, df = 1
         let n_freqs = 2;
@@ -421,6 +443,49 @@ mod tests {
     }
 
     #[test]
+    fn p2shift1234_excludes_wake_and_unknown_from_percentile() {
+        let n_freqs = 1;
+        let n_times = 6;
+        // Wake and Unknown have the two lowest powers. If either contributes
+        // to the shift percentile, the percentile will be below 0 dB.
+        let so_spect = vec![0.0001, 0.001, 1.0, 10.0, 100.0, 1000.0];
+        let stimes: Vec<f64> = (0..n_times).map(|i| i as f64).collect();
+        let sfreqs = vec![1.0];
+        let eeg_times = stimes.clone();
+        let isexcluded = vec![false; eeg_times.len()];
+        let stage_times = stimes.clone();
+        let stage_vals = vec![5.0, 0.0, 1.0, 2.0, 3.0, 4.0];
+        let norm_method = NormMethod::parse("p2shift1234").unwrap();
+
+        let out = so_power_from_spectrogram(
+            &so_spect,
+            n_freqs,
+            n_times,
+            &stimes,
+            &sfreqs,
+            &eeg_times,
+            &isexcluded,
+            &stage_times,
+            &stage_vals,
+            (0.0, 5.0),
+            10.0,
+            &norm_method,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(out.so_power_stages, stage_vals);
+        match out.ptile {
+            Some(PtileUsed::Single(p)) => {
+                // Valid stages 1-4 have powers [1, 10, 100, 1000], or
+                // [0, 10, 20, 30] dB. Their Hazen 2nd percentile is 0 dB.
+                assert!(p.abs() < 1e-12, "got ptile={}", p);
+            }
+            _ => panic!("expected single ptile"),
+        }
+    }
+
+    #[test]
     fn upsample_masks_excluded() {
         let n_freqs = 1;
         let n_times = 3;
@@ -439,5 +504,27 @@ mod tests {
         assert_eq!(out.so_power_norm.len(), eeg_times.len());
         assert!(out.so_power_norm[5].is_nan(), "excluded sample should be NaN");
         assert!(out.so_power_norm[0].is_finite());
+    }
+
+    #[test]
+    fn upsample_bridges_coarse_nans() {
+        let n_freqs = 1;
+        let n_times = 3;
+        let so_spect = vec![1.0, f64::NAN, 4.0];
+        let stimes = vec![0.0, 5.0, 10.0];
+        let sfreqs = vec![1.0];
+        let eeg_times: Vec<f64> = (0..=10).map(|i| i as f64).collect();
+        let isexcluded = vec![false; eeg_times.len()];
+
+        let out = so_power_from_spectrogram(
+            &so_spect, n_freqs, n_times, &stimes, &sfreqs, &eeg_times,
+            &isexcluded, &[], &[],
+            (0.0, 10.0), 10.0,
+            &NormMethod::None_, true,
+        ).unwrap();
+
+        assert!(out.so_power_norm.iter().all(|v| v.is_finite()));
+        let expected_midpoint = 10.0 * 2.0_f64.log10();
+        assert!((out.so_power_norm[5] - expected_midpoint).abs() < 1e-12);
     }
 }
