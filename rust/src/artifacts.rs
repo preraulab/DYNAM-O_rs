@@ -402,6 +402,7 @@ fn movmedian_fenwick(x: &[f64], win: usize) -> Vec<f64> {
 }
 
 /// Median of finite values. Returns NaN for all-NaN input.
+#[cfg(test)]
 fn median(xs: &[f64]) -> f64 {
     let mut v: Vec<f64> = xs.iter().filter(|x| x.is_finite()).copied().collect();
     if v.is_empty() {
@@ -418,6 +419,7 @@ fn median(xs: &[f64]) -> f64 {
 
 /// MATLAB default `mad(x)`: mean absolute deviation from the mean.
 /// (Not median absolute deviation! pydynamo matches.)
+#[cfg(test)]
 fn mad_meanabs(xs: &[f64]) -> f64 {
     let finite: Vec<f64> = xs.iter().filter(|x| x.is_finite()).copied().collect();
     if finite.is_empty() {
@@ -439,13 +441,6 @@ fn mean_std(xs: &[f64]) -> (f64, f64) {
     }
     let var_ = finite.iter().map(|&v| (v - mean_).powi(2)).sum::<f64>() / (n - 1.0);
     (mean_, var_.sqrt())
-}
-
-fn center_scale(xs: &[f64], method: ZScoreMethod) -> (f64, f64) {
-    match method {
-        ZScoreMethod::Robust => (median(xs), mad_meanabs(xs)),
-        ZScoreMethod::Standard => mean_std(xs),
-    }
 }
 
 /// Iteratively flag samples where |z| > crit, recomputing centering stats on
