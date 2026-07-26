@@ -2,8 +2,8 @@
 //! `validate_rotgauss_fit_mex.m`, runs the Rust fit, and prints diagnostics
 //! independent of MATLAB.
 
+use dynamo_rs::paramfit::rot_gauss::fit_rotgauss;
 use ndarray::Array2;
-use dynamo_rs::paramfit::rot_gauss::{eval_model, fit_rotgauss};
 
 #[test]
 fn two_mode_rotgauss_recovers_synthesized_truth() {
