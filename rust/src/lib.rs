@@ -28,12 +28,15 @@ pub mod mask;
 pub mod matlab_watershed;
 pub mod mts;
 pub mod merge;
+pub mod parallel;
 pub mod peak_assign;
 pub mod pipeline;
 pub mod refine;
 pub mod signal;
+pub mod paramfit;
 pub mod so_phase;
 pub mod so_power;
+pub mod spline_basis;
 pub mod trim;
 
 #[cfg(feature = "python")]
@@ -762,6 +765,311 @@ mod python {
         Ok((t.into_pyarray_bound(py), v.into_pyarray_bound(py)))
     }
 
+    /// Unpack a length-3 background-coefficient array into `[f64; 3]`.
+    fn bg3(name: &str, arr: PyReadonlyArray1<'_, f64>) -> PyResult<[f64; 3]> {
+        let v = arr.as_array();
+        if v.len() != 3 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "{} must have 3 elements, got {}",
+                name,
+                v.len()
+            )));
+        }
+        Ok([v[0], v[1], v[2]])
+    }
+
+    /// Pack a `ParamFitOut` into the dict both paramfit kernels return. The
+    /// `gof` fields are flattened to top-level keys so the caller can build a
+    /// MATLAB-style gof struct without a nested lookup.
+    fn paramfit_dict<'py>(
+        py: Python<'py>,
+        out: super::paramfit::ParamFitOut,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let dict = pyo3::types::PyDict::new_bound(py);
+        dict.set_item("params", out.params.into_pyarray_bound(py))?;
+        dict.set_item(
+            "background",
+            ndarray::Array1::from(out.background.to_vec()).into_pyarray_bound(py),
+        )?;
+        dict.set_item("model_soph", out.model_soph.into_pyarray_bound(py))?;
+        dict.set_item("sse", out.gof.sse)?;
+        dict.set_item("rsquare", out.gof.rsquare)?;
+        dict.set_item("adjrsquare", out.gof.adjrsquare)?;
+        dict.set_item("rmse", out.gof.rmse)?;
+        dict.set_item("dfe", out.gof.dfe)?;
+        dict.set_item("dfm", out.gof.dfm)?;
+        dict.set_item("iters_used", out.iters_used)?;
+        Ok(dict)
+    }
+
+    /// fit_rotgauss(soph, x_grid, y_grid, initial, lower, upper,
+    ///              bg_initial, bg_lower, bg_upper, max_iters=0)
+    /// → dict{params (N,6), background (3,), model_soph (n_y,n_x),
+    ///        sse, rsquare, adjrsquare, rmse, dfe, dfm, iters_used}
+    ///
+    /// Rotated-Gaussian mixture + linear background plane, mirroring MATLAB
+    /// `fit_rotGauss.m`. `soph` is `(n_y, n_x)` = `(n_freqs, n_features)`;
+    /// `initial`/`lower`/`upper` are `(N, 6)` with columns
+    /// `[amp, fmean, fstd, pmean, pstd, theta]`. Note `fstd` is a standard
+    /// deviation, not a variance. `max_iters=0` selects the scipy-equivalent
+    /// default of `100 * n_params`.
+    #[pyfunction]
+    #[pyo3(signature = (soph, x_grid, y_grid, initial, lower, upper,
+                        bg_initial, bg_lower, bg_upper, max_iters=0))]
+    #[allow(clippy::too_many_arguments)]
+    fn fit_rotgauss<'py>(
+        py: Python<'py>,
+        soph: PyReadonlyArray2<'py, f64>,
+        x_grid: PyReadonlyArray1<'py, f64>,
+        y_grid: PyReadonlyArray1<'py, f64>,
+        initial: PyReadonlyArray2<'py, f64>,
+        lower: PyReadonlyArray2<'py, f64>,
+        upper: PyReadonlyArray2<'py, f64>,
+        bg_initial: PyReadonlyArray1<'py, f64>,
+        bg_lower: PyReadonlyArray1<'py, f64>,
+        bg_upper: PyReadonlyArray1<'py, f64>,
+        max_iters: u32,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let xg: Vec<f64> = x_grid.as_array().iter().copied().collect();
+        let yg: Vec<f64> = y_grid.as_array().iter().copied().collect();
+        let out = super::paramfit::rot_gauss::fit_rotgauss(
+            soph.as_array(),
+            &xg,
+            &yg,
+            initial.as_array(),
+            lower.as_array(),
+            upper.as_array(),
+            bg3("bg_initial", bg_initial)?,
+            bg3("bg_lower", bg_lower)?,
+            bg3("bg_upper", bg_upper)?,
+            max_iters,
+        )
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+        paramfit_dict(py, out)
+    }
+
+    /// fit_vmgauss(soph, x_grid, y_grid, initial, lower, upper,
+    ///             bg_initial, bg_lower, bg_upper, max_iters=0, unit_row=True)
+    /// → dict{params (N,6), background (3,), model_soph (n_y,n_x),
+    ///        sse, rsquare, adjrsquare, rmse, dfe, dfm, iters_used}
+    ///
+    /// von-Mises × Gaussian mixture + sinusoidal baseline, mirroring MATLAB
+    /// `fit_vmGauss.m`. Column layout of `initial`/`lower`/`upper` is
+    /// `[amp, fmean, fstd, phasepref, recikappa, theta]`. `unit_row=True`
+    /// replicates `normalized_vmGauss.m`'s per-frequency-row normalization
+    /// (MATLAB passes `problem=true` for the phase fit).
+    #[pyfunction]
+    #[pyo3(signature = (soph, x_grid, y_grid, initial, lower, upper,
+                        bg_initial, bg_lower, bg_upper, max_iters=0, unit_row=true))]
+    #[allow(clippy::too_many_arguments)]
+    fn fit_vmgauss<'py>(
+        py: Python<'py>,
+        soph: PyReadonlyArray2<'py, f64>,
+        x_grid: PyReadonlyArray1<'py, f64>,
+        y_grid: PyReadonlyArray1<'py, f64>,
+        initial: PyReadonlyArray2<'py, f64>,
+        lower: PyReadonlyArray2<'py, f64>,
+        upper: PyReadonlyArray2<'py, f64>,
+        bg_initial: PyReadonlyArray1<'py, f64>,
+        bg_lower: PyReadonlyArray1<'py, f64>,
+        bg_upper: PyReadonlyArray1<'py, f64>,
+        max_iters: u32,
+        unit_row: bool,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let xg: Vec<f64> = x_grid.as_array().iter().copied().collect();
+        let yg: Vec<f64> = y_grid.as_array().iter().copied().collect();
+        let out = super::paramfit::vm_gauss::fit_vmgauss(
+            soph.as_array(),
+            &xg,
+            &yg,
+            initial.as_array(),
+            lower.as_array(),
+            upper.as_array(),
+            bg3("bg_initial", bg_initial)?,
+            bg3("bg_lower", bg_lower)?,
+            bg3("bg_upper", bg_upper)?,
+            max_iters,
+            unit_row,
+        )
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+        paramfit_dict(py, out)
+    }
+
+    /// fit_tensor_product_spline(soph, x_eval, y_eval, internal_knots_x,
+    ///                           internal_knots_y, order=4,
+    ///                           boundary_multiplicity=3)
+    /// → dict{coefs (m_y,m_x), splinefit (n_x,n_y), knots_x_aug, knots_y_aug}
+    ///
+    /// Tensor-product cubic B-spline least squares, equivalent to MATLAB
+    /// `spap2`. `soph` is `(n_x, n_y)` — the transpose of the canonical
+    /// `(n_freqs, n_features)` layout, matching what `spline_basis.m` feeds
+    /// `spap2`.
+    #[pyfunction]
+    #[pyo3(signature = (soph, x_eval, y_eval, internal_knots_x, internal_knots_y,
+                        order=4, boundary_multiplicity=3))]
+    fn fit_tensor_product_spline<'py>(
+        py: Python<'py>,
+        soph: PyReadonlyArray2<'py, f64>,
+        x_eval: PyReadonlyArray1<'py, f64>,
+        y_eval: PyReadonlyArray1<'py, f64>,
+        internal_knots_x: PyReadonlyArray1<'py, f64>,
+        internal_knots_y: PyReadonlyArray1<'py, f64>,
+        order: usize,
+        boundary_multiplicity: usize,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let xe: Vec<f64> = x_eval.as_array().iter().copied().collect();
+        let ye: Vec<f64> = y_eval.as_array().iter().copied().collect();
+        let kx: Vec<f64> = internal_knots_x.as_array().iter().copied().collect();
+        let ky: Vec<f64> = internal_knots_y.as_array().iter().copied().collect();
+        let out = super::spline_basis::fit_tensor_product_spline(
+            soph.as_array(),
+            &xe,
+            &ye,
+            &kx,
+            &ky,
+            order,
+            boundary_multiplicity,
+        )
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+        let dict = pyo3::types::PyDict::new_bound(py);
+        dict.set_item("coefs", out.coefs.into_pyarray_bound(py))?;
+        dict.set_item("splinefit", out.splinefit.into_pyarray_bound(py))?;
+        dict.set_item(
+            "knots_x_aug",
+            ndarray::Array1::from(out.knots_x_aug).into_pyarray_bound(py),
+        )?;
+        dict.set_item(
+            "knots_y_aug",
+            ndarray::Array1::from(out.knots_y_aug).into_pyarray_bound(py),
+        )?;
+        Ok(dict)
+    }
+
+    /// extract_tfpeaks(spect, stimes, sfreqs, baseline=None, ...)
+    /// → dict{peak_time, peak_freq, duration, bandwidth, height, volume,
+    ///        segment_num, area, peakiness, bbox (n,4), labels (F,T) i64,
+    ///        height_data?, boundaries?}
+    ///
+    /// The whole TF-peak extraction in one call: segment, downsample,
+    /// watershed, merge, paint labels, resize, trim, regionprops, then the
+    /// `filterStatsTable` cuts. This is the same fused path MATLAB reaches
+    /// through `dynamo_extract_tfpeaks`, so Python and the MATLAB rust
+    /// backend run identical code rather than Python re-assembling the
+    /// stages itself.
+    ///
+    /// `trim_shift_val` defaults to NaN, meaning "per-segment min(spect)".
+    /// `height_data` / `boundaries` are ragged and cost an allocation per
+    /// peak, so they are only built when asked for.
+    #[pyfunction]
+    #[pyo3(signature = (spect, stimes, sfreqs, baseline=None, seg_time=30.0,
+                        downsample_f=2, downsample_t=2, merge_thresh=11.0,
+                        max_merges=f64::INFINITY, trim_vol_thresh=0.8,
+                        trim_shift_val=f64::NAN, dur_min=0.5, dur_max=5.0,
+                        bw_min=2.0, bw_max=15.0, freq_min=0.0,
+                        freq_max=f64::INFINITY, ht_db_min=f64::NEG_INFINITY,
+                        expand_labels_distance=0, with_height_data=false,
+                        with_boundaries=false))]
+    #[allow(clippy::too_many_arguments)]
+    fn extract_tfpeaks<'py>(
+        py: Python<'py>,
+        spect: PyReadonlyArray2<'py, f64>,
+        stimes: PyReadonlyArray1<'py, f64>,
+        sfreqs: PyReadonlyArray1<'py, f64>,
+        baseline: Option<PyReadonlyArray1<'py, f64>>,
+        seg_time: f64,
+        downsample_f: usize,
+        downsample_t: usize,
+        merge_thresh: f64,
+        max_merges: f64,
+        trim_vol_thresh: f64,
+        trim_shift_val: f64,
+        dur_min: f64,
+        dur_max: f64,
+        bw_min: f64,
+        bw_max: f64,
+        freq_min: f64,
+        freq_max: f64,
+        ht_db_min: f64,
+        expand_labels_distance: u32,
+        with_height_data: bool,
+        with_boundaries: bool,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let params = super::extract_pipeline::ExtractParams {
+            seg_time,
+            downsample_f,
+            downsample_t,
+            merge_thresh,
+            max_merges,
+            trim_vol_thresh,
+            trim_shift_val,
+            dur_min,
+            dur_max,
+            bw_min,
+            bw_max,
+            freq_min,
+            freq_max,
+            ht_db_min,
+            expand_labels_distance,
+        };
+        let bl = baseline.as_ref().map(|b| b.as_array());
+        let (peaks, labels) = super::extract_pipeline::extract_tfpeaks(
+            spect.as_array(),
+            stimes.as_array(),
+            sfreqs.as_array(),
+            bl,
+            &params,
+            None,
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+
+        let n = peaks.len();
+        let dict = pyo3::types::PyDict::new_bound(py);
+        macro_rules! put {
+            ($name:expr, $v:expr) => {
+                dict.set_item($name,
+                    ndarray::Array1::from($v).into_pyarray_bound(py))?;
+            };
+        }
+        put!("peak_time", peaks.peak_time);
+        put!("peak_freq", peaks.peak_freq);
+        put!("duration", peaks.duration);
+        put!("bandwidth", peaks.bandwidth);
+        put!("height", peaks.height);
+        put!("volume", peaks.volume);
+        put!("segment_num", peaks.segment_num);
+        put!("area", peaks.area);
+        put!("peakiness", peaks.peakiness);
+
+        let bbox = ndarray::Array2::from_shape_vec((n, 4), peaks.bbox)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(
+                format!("bbox shape: {}", e)))?;
+        dict.set_item("bbox", bbox.into_pyarray_bound(py))?;
+        dict.set_item("labels", labels.into_pyarray_bound(py))?;
+
+        if with_height_data {
+            let items: Vec<Bound<'py, numpy::PyArray1<f64>>> = peaks
+                .height_data
+                .into_iter()
+                .map(|v| ndarray::Array1::from(v).into_pyarray_bound(py))
+                .collect();
+            dict.set_item("height_data", items)?;
+        }
+        if with_boundaries {
+            let items: Vec<Bound<'py, numpy::PyArray2<f64>>> = peaks
+                .boundaries_xy
+                .into_iter()
+                .map(|v| {
+                    let m = v.len() / 2;
+                    ndarray::Array2::from_shape_vec((m, 2), v)
+                        .unwrap_or_else(|_| ndarray::Array2::zeros((0, 2)))
+                        .into_pyarray_bound(py)
+                })
+                .collect();
+            dict.set_item("boundaries", items)?;
+        }
+        Ok(dict)
+    }
+
     #[pymodule]
     fn dynamo_rs(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(merge_segment, m)?)?;
@@ -785,6 +1093,10 @@ mod python {
         m.add_function(wrap_pyfunction!(movmean, m)?)?;
         m.add_function(wrap_pyfunction!(read_edf, m)?)?;
         m.add_function(wrap_pyfunction!(read_staging, m)?)?;
+        m.add_function(wrap_pyfunction!(extract_tfpeaks, m)?)?;
+        m.add_function(wrap_pyfunction!(fit_rotgauss, m)?)?;
+        m.add_function(wrap_pyfunction!(fit_vmgauss, m)?)?;
+        m.add_function(wrap_pyfunction!(fit_tensor_product_spline, m)?)?;
         Ok(())
     }
 }

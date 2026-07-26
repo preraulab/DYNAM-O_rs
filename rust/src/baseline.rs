@@ -16,7 +16,7 @@
 //! Returns a column vector `(F, 1)`.
 
 use ndarray::{s, Array2, ArrayView1, ArrayView2};
-use rayon::prelude::*;
+use crate::parallel::*;
 
 /// Hyndman-Fan method #5 ("hazen") percentile over a NaN-aware slice.
 ///

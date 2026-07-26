@@ -210,6 +210,50 @@ pub fn read_signal_headers(f: &mut File, nsig: usize) -> Result<Vec<SignalHeader
     Ok(sh)
 }
 
+/// Read just the EDF headers (main + per-signal) and apply the same
+/// post-processing `read_edf_all` performs — without reading sample
+/// data. Specifically:
+///   1. Compute `sampling_frequency = samples_in_record /
+///      data_record_duration` for each signal.
+///   2. If `num_data_records == -1` (EDF convention for "unknown"),
+///      derive it from `file_size − num_header_bytes` divided by the
+///      bytes-per-record (`2 · Σ samples_in_record`).
+///
+/// This is what `read_EDF.m` does in its header-only branch — UI
+/// previews need both quantities to display duration + fs.
+pub fn read_edf_header<P: AsRef<Path>>(path: P) -> Result<(EdfHeader, Vec<SignalHeader>), EdfError> {
+    let mut f = File::open(&path)?;
+    let mut header = read_main_header(&mut f)?;
+    if header.num_signals <= 0 {
+        return Err(EdfError::Format(format!(
+            "invalid num_signals: {}",
+            header.num_signals
+        )));
+    }
+    let mut sh = read_signal_headers(&mut f, header.num_signals as usize)?;
+
+    if header.data_record_duration > 0.0 {
+        for s in sh.iter_mut() {
+            s.sampling_frequency = s.samples_in_record as f64 / header.data_record_duration;
+        }
+    }
+
+    if header.num_data_records <= 0 {
+        let total_samp_per_rec: u64 = sh.iter().map(|s| s.samples_in_record.max(0) as u64).sum();
+        let bytes_per_rec = total_samp_per_rec * 2;
+        if bytes_per_rec > 0 {
+            let fsize = f.seek(SeekFrom::End(0))?;
+            let data_bytes = fsize.saturating_sub(header.num_header_bytes as u64);
+            let actual_records = (data_bytes / bytes_per_rec) as i32;
+            if actual_records >= 1 {
+                header.num_data_records = actual_records;
+            }
+        }
+    }
+
+    Ok((header, sh))
+}
+
 /// Read the whole EDF, decoding every signal. Returns (header, signals, data).
 pub fn read_edf_all<P: AsRef<Path>>(path: P) -> Result<EdfData, EdfError> {
     let mut f = File::open(&path)?;
@@ -362,4 +406,128 @@ fn find_label(sigs: &[SignalHeader], name: &str) -> Option<usize> {
     let name_lc = name.to_ascii_lowercase();
     sigs.iter()
         .position(|s| s.signal_labels.trim().to_ascii_lowercase() == name_lc)
+}
+
+/// Channel-selection with named-reference support. Ports MATLAB
+/// `read_EDF.m`'s `References` + `Channels` two-pass model:
+///
+/// 1. Parse and topo-sort `references` (each one a `"NAME = expr"` line).
+/// 2. Evaluate each reference against the EDF's raw channels (and any
+///    earlier reference results), building a `signals` table.
+/// 3. Parse `channel`, resolve its `SignalRef::Leaf` names against the
+///    table, and return the resulting linear combination.
+///
+/// The returned `SignalHeader` is synthesised from the first leaf
+/// channel's header (with `signal_labels` set to `channel`). All leaves
+/// must share the same sample count — read_EDF's uniform-fs rule.
+pub fn select_channel_with_refs(
+    edf: &EdfData,
+    channel: &str,
+    references: &[String],
+) -> Result<(SignalHeader, Vec<f64>), EdfError> {
+    use super::expr::{evaluate, parse, parse_named, resolve_references, ExprAst, SignalRef, Term};
+
+    // Channel fast-path: bare literal label match, even with refs
+    // present. EDF labels can contain '-', '[' / ']', spaces — under
+    // the new bracket-as-grouping parser semantics, those would mis-
+    // parse if we always routed through the expression parser.
+    if find_label(&edf.signals, channel.trim()).is_some() {
+        return select_channel(edf, channel);
+    }
+
+    // Parse references; topo-sort. Each ref's body gets a literal-
+    // label fast-path: if the textual body matches an EDF channel
+    // name exactly, replace the parsed AST with a single-leaf AST so
+    // the evaluator looks up the literal label directly.
+    let mut parsed_refs: Vec<(String, ExprAst)> = Vec::new();
+    for r in references {
+        let (name, ast) = parse_named(r)
+            .map_err(|e| EdfError::Format(format!("reference '{}': {}", r, e)))?;
+        let body = match r.find('=') { Some(i) => r[i + 1..].trim(), None => r.trim() };
+        let ast = if find_label(&edf.signals, body).is_some() {
+            ExprAst { terms: vec![Term { coeff: 1.0, signal: Some(SignalRef::Leaf(body.to_string())) }] }
+        } else {
+            ast
+        };
+        parsed_refs.push((name, ast));
+    }
+    let ordered = resolve_references(&parsed_refs)
+        .map_err(|e| EdfError::Format(format!("reference resolution: {}", e)))?;
+
+    // Seed signals table with file channels.
+    let mut signals: std::collections::HashMap<String, Vec<f64>> = std::collections::HashMap::new();
+    for sh in &edf.signals {
+        let key = sh.signal_labels.trim().to_string();
+        let idx = find_label(&edf.signals, &key).unwrap();
+        signals.insert(key, edf.data[idx].clone());
+    }
+
+    // Evaluate refs in dependency order.
+    for (name, ast) in &ordered {
+        let rewritten = rewrite_refs(ast, &signals_keys_only(&signals), &ordered);
+        let v = evaluate(&rewritten, &signals)
+            .map_err(|e| EdfError::Format(format!("evaluating ref '{}': {}", name, e)))?;
+        signals.insert(name.clone(), v);
+    }
+
+    // Parse the channel expression.
+    let channel = channel.trim();
+    // Bare label fast-path again — covers `select_channel_with_refs(edf, "M", &[…M…])`.
+    if let Some(v) = signals.get(channel) {
+        // Synthesise header from any leaf. Use file channel if it's
+        // a file label; otherwise fall back to the first file channel.
+        let sh = match find_label(&edf.signals, channel) {
+            Some(idx) => {
+                let mut sh = edf.signals[idx].clone();
+                sh.signal_labels = channel.to_string();
+                sh
+            }
+            None => {
+                let mut sh = edf.signals[0].clone();
+                sh.signal_labels = channel.to_string();
+                sh
+            }
+        };
+        return Ok((sh, v.clone()));
+    }
+
+    let ast = parse(channel).map_err(|e| EdfError::Format(format!("channel '{}': {}", channel, e)))?;
+    let rewritten = rewrite_refs(&ast, &signals_keys_only(&signals), &ordered);
+    let v = evaluate(&rewritten, &signals)
+        .map_err(|e| EdfError::Format(format!("evaluating channel '{}': {}", channel, e)))?;
+
+    // Synthesise the header from the first leaf encountered.
+    let header_leaf = ast.terms.iter().find_map(|t| t.signal.as_ref().map(|s| s.name().to_string()));
+    let mut sh = match header_leaf.and_then(|n| find_label(&edf.signals, &n)) {
+        Some(idx) => edf.signals[idx].clone(),
+        None => edf.signals[0].clone(),
+    };
+    sh.signal_labels = channel.to_string();
+    Ok((sh, v))
+}
+
+fn signals_keys_only(map: &std::collections::HashMap<String, Vec<f64>>) -> std::collections::HashSet<String> {
+    map.keys().cloned().collect()
+}
+
+/// SignalRef::Leaf names that are also known refs become SignalRef::Named.
+/// Kept simple — the evaluator looks up by name regardless of kind, but
+/// preserving the distinction helps error messages.
+fn rewrite_refs(
+    ast: &super::expr::ExprAst,
+    known_signals: &std::collections::HashSet<String>,
+    ordered_refs: &[(String, super::expr::ExprAst)],
+) -> super::expr::ExprAst {
+    use super::expr::{ExprAst, SignalRef, Term};
+    let ref_names: std::collections::HashSet<&str> =
+        ordered_refs.iter().map(|(n, _)| n.as_str()).collect();
+    let _ = known_signals; // currently unused; future: error early on missing
+    let terms = ast.terms.iter().map(|t| {
+        let new_sig = t.signal.as_ref().map(|s| {
+            let n = s.name();
+            if ref_names.contains(n) { SignalRef::Named(n.to_string()) } else { SignalRef::Leaf(n.to_string()) }
+        });
+        Term { coeff: t.coeff, signal: new_sig }
+    }).collect();
+    ExprAst { terms }
 }

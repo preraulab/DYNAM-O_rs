@@ -10,7 +10,7 @@
 //!      that sit within 1e-3 Hz of the bbox boundaries.
 
 use ndarray::Array2;
-use rayon::prelude::*;
+use crate::parallel::*;
 use realfft::RealFftPlanner;
 use realfft::num_complex::Complex;
 

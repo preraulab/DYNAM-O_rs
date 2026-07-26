@@ -6,7 +6,7 @@
 //! `time_in_bin` returns 5 columns for these 5 stages.
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
-use rayon::prelude::*;
+use crate::parallel::*;
 
 pub struct HistogramInputs<'a> {
     pub c_metric: ArrayView1<'a, f64>,

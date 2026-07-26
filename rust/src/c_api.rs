@@ -818,6 +818,700 @@ pub unsafe extern "C" fn dynamo_mask_spectrogram(
 }
 
 // -------------------------------------------------------------------------
+// 5. dynamo_multitaper_spectrogram: in/out structs
+// -------------------------------------------------------------------------
+
+/// Input descriptor for [`dynamo_multitaper_spectrogram`].
+///
+/// `data_ptr` is a length-`n_data` f64 vector. `tapers_ptr` is the
+/// pre-computed DPSS taper bank (caller supplies; we don't reimplement
+/// `dpss` in Rust), row-major (n_tapers × winsize) so element (k, i) is
+/// at `tapers_ptr[k * winsize + i]`. Caller MUST guarantee
+/// `winsize == round(window_size_s * fs)` — the underlying compute
+/// validates and returns ShapeMismatch otherwise.
+///
+/// `eigen_ptr` is required iff `weighting == 1` (Eigen). Pass null
+/// (and `weighting = 0`) for unity weighting (the DYNAM-O default).
+#[repr(C)]
+pub struct MtsIn {
+    pub data_ptr:        *const f64,
+    pub n_data:          usize,
+    pub fs:              f64,
+
+    pub tapers_ptr:      *const f64,
+    pub n_tapers:        usize,
+    pub winsize:         usize,
+    pub eigen_ptr:       *const f64, // null if unity
+    pub eigen_len:       usize,      // 0 if unity
+
+    pub freq_min:        f64,
+    pub freq_max:        f64,
+    pub window_size_s:   f64,
+    pub window_step_s:   f64,
+    pub nfft:            usize,
+    pub detrend:         u32,        // 0=none, 1=linear, 2=constant
+    pub weighting:       u32,        // 0=unity, 1=eigen
+}
+
+/// Output descriptor for [`dynamo_multitaper_spectrogram`].
+///
+/// `spect_ptr` points to a row-major (n_freqs_out × n_windows) f64 buffer.
+/// All three pointers come from `Box::leak` and must be released with
+/// `dynamo_free_buffer_f64(ptr, len)` where `len` is the matching
+/// `n_freqs_out`, `n_windows`, or `n_freqs_out * n_windows` count.
+#[repr(C)]
+pub struct MtsOut {
+    pub spect_ptr:    *mut f64,
+    pub n_freqs_out:  usize,
+    pub n_windows:    usize,
+    pub stimes_ptr:   *mut f64,
+    pub sfreqs_ptr:   *mut f64,
+}
+
+fn empty_mts_out() -> MtsOut {
+    MtsOut {
+        spect_ptr:   std::ptr::null_mut(),
+        n_freqs_out: 0,
+        n_windows:   0,
+        stimes_ptr:  std::ptr::null_mut(),
+        sfreqs_ptr:  std::ptr::null_mut(),
+    }
+}
+
+/// Compute a multitaper spectrogram via the `multitaper_rs` crate.
+///
+/// Wraps `multitaper_rs::compute_spectrogram` with a C ABI matching the
+/// shape of the other dynamo_rs ABI entries. f64 throughout — the MATLAB
+/// Coder MEX uses f32, so callers swapping over should expect f32-roundoff
+/// (~1e-7 relative) drift in output.
+///
+/// # Safety
+/// `in_` must point to a valid `MtsIn`. `out` must point to a valid
+/// (uninitialized or zeroed) `MtsOut`. Array pointers must be non-null
+/// for the lengths declared (data_ptr, tapers_ptr, eigen_ptr if used).
+#[no_mangle]
+pub unsafe extern "C" fn dynamo_multitaper_spectrogram(
+    in_: *const MtsIn,
+    out: *mut MtsOut,
+) -> c_int {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let input = match NonNull::new(in_ as *mut MtsIn) {
+            Some(p) => &*p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let output = match NonNull::new(out) {
+            Some(p) => &mut *p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+
+        if input.n_data == 0 || input.n_tapers == 0 || input.winsize == 0 || input.nfft == 0 {
+            *output = empty_mts_out();
+            return ErrorCode::InvalidArgument.code();
+        }
+
+        let data_slice = match ptr_as_slice::<f64>(input.data_ptr, input.n_data) {
+            Some(s) => s,
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let tapers_slice = match ptr_as_slice::<f64>(
+            input.tapers_ptr,
+            input.n_tapers * input.winsize,
+        ) {
+            Some(s) => s,
+            None => return ErrorCode::NullPointer.code(),
+        };
+
+        let data_view = ArrayView1::from(data_slice);
+        let tapers_view = match ArrayView2::from_shape((input.n_tapers, input.winsize), tapers_slice) {
+            Ok(v) => v,
+            Err(_) => return ErrorCode::ShapeMismatch.code(),
+        };
+
+        // Eigen weights are optional — only consumed when weighting=Eigen.
+        let eigen_storage: Option<Vec<f64>> = if input.weighting == 1 {
+            if input.eigen_ptr.is_null() || input.eigen_len != input.n_tapers {
+                return ErrorCode::InvalidArgument.code();
+            }
+            Some(slice::from_raw_parts(input.eigen_ptr, input.eigen_len).to_vec())
+        } else {
+            None
+        };
+        let eigen_view = eigen_storage.as_ref().map(|v| ArrayView1::from(v.as_slice()));
+
+        let detrend_mode = match input.detrend {
+            0 => crate::mts::DetrendMode::Off,
+            1 => crate::mts::DetrendMode::Linear,
+            2 => crate::mts::DetrendMode::Constant,
+            _ => return ErrorCode::InvalidArgument.code(),
+        };
+        let weighting = match input.weighting {
+            0 => crate::mts::Weighting::Unity,
+            1 => crate::mts::Weighting::Eigen,
+            _ => return ErrorCode::InvalidArgument.code(),
+        };
+
+        let params = crate::mts::SpectrogramParams {
+            fs: input.fs,
+            frequency_range: (input.freq_min, input.freq_max),
+            window_params: (input.window_size_s, input.window_step_s),
+            nfft: input.nfft,
+            detrend: detrend_mode,
+            weighting,
+        };
+
+        let mts_out = match crate::mts::compute_spectrogram(data_view, tapers_view, eigen_view, &params) {
+            Ok(o) => o,
+            Err(_) => return ErrorCode::KernelError.code(),
+        };
+
+        let n_freqs_out = mts_out.sfreqs.len();
+        let n_windows = mts_out.stimes.len();
+
+        // mt_spectrogram comes back as Array2 with shape (n_freqs_out, n_windows).
+        // Box::leak via a row-major Vec<f64> produced by .into_raw_vec_and_offset().
+        // ndarray's into_raw_vec preserves layout; .as_standard_layout() ensures
+        // the elements are contiguous row-major before we pull out the Vec.
+        let spect_std = mts_out.mt_spectrogram.as_standard_layout().to_owned();
+        let spect_vec: Vec<f64> = spect_std.into_raw_vec_and_offset().0;
+        let stimes_vec: Vec<f64> = mts_out.stimes.to_vec();
+        let sfreqs_vec: Vec<f64> = mts_out.sfreqs.to_vec();
+
+        output.spect_ptr   = leak_vec_f64(spect_vec);
+        output.n_freqs_out = n_freqs_out;
+        output.n_windows   = n_windows;
+        output.stimes_ptr  = leak_vec_f64(stimes_vec);
+        output.sfreqs_ptr  = leak_vec_f64(sfreqs_vec);
+
+        ErrorCode::Ok.code()
+    }));
+    result.unwrap_or(ErrorCode::Panic.code())
+}
+
+// -------------------------------------------------------------------------
+// dynamo_dpss — DPSS (Slepian) taper generation
+// -------------------------------------------------------------------------
+
+/// Generate K DPSS tapers of length N with time-half-bandwidth NW.
+///
+/// Caller-allocated outputs:
+///   `tapers_out`  — row-major (K, N) double, total K*N elements.
+///                   Row k is the k-th Slepian sequence, unit L²-norm.
+///   `ratios_out`  — length-K double, concentration ratios in (0, 1].
+///
+/// Matches MATLAB R2025a `dpss(N, NW, K)` and
+/// `scipy.signal.windows.dpss(N, NW, K, return_ratios=True)` after the
+/// scipy/MATLAB sign convention (even-index tapers have positive sum;
+/// odd-index tapers have positive central derivative). Validated to
+/// ≤1e-8 elementwise on (N=128, NW=2, K=3) and (N=1024, NW=4, K=7).
+///
+/// # Safety
+/// `tapers_out` must point to at least `k * n` writable f64s.
+/// `ratios_out` must point to at least `k` writable f64s.
+#[no_mangle]
+pub unsafe extern "C" fn dynamo_dpss(
+    n: usize,
+    nw: f64,
+    k: usize,
+    tapers_out: *mut f64,
+    ratios_out: *mut f64,
+) -> c_int {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if tapers_out.is_null() || ratios_out.is_null() {
+            return ErrorCode::NullPointer.code();
+        }
+        if n == 0 || k == 0 || k > n || !nw.is_finite() || nw <= 0.0 {
+            return ErrorCode::InvalidArgument.code();
+        }
+
+        let (tapers, ratios) = match multitaper_rs::dpss(n, nw, k) {
+            Ok(p) => p,
+            Err(_) => return ErrorCode::KernelError.code(),
+        };
+
+        // Tapers come back as (K, N); ensure standard (row-major) layout
+        // before copying.
+        let tapers_std = tapers.as_standard_layout().to_owned();
+        let tapers_slice = tapers_std.as_slice().unwrap_or(&[]);
+        if tapers_slice.len() != k * n {
+            return ErrorCode::ShapeMismatch.code();
+        }
+        let ratios_slice = match ratios.as_slice() {
+            Some(s) => s,
+            None => return ErrorCode::ShapeMismatch.code(),
+        };
+        if ratios_slice.len() != k {
+            return ErrorCode::ShapeMismatch.code();
+        }
+
+        std::ptr::copy_nonoverlapping(tapers_slice.as_ptr(), tapers_out, k * n);
+        std::ptr::copy_nonoverlapping(ratios_slice.as_ptr(), ratios_out, k);
+
+        ErrorCode::Ok.code()
+    }));
+    result.unwrap_or(ErrorCode::Panic.code())
+}
+
+// -------------------------------------------------------------------------
+// dynamo_detect_artifacts — band-detection iter-zscore artifact mask
+// -------------------------------------------------------------------------
+
+/// Plain-C mirror of `crate::artifacts::ArtifactOpts`. Mirrors the field
+/// order of the Rust struct so `cbindgen` lays it out identically.
+#[repr(C)]
+pub struct ArtifactOptsFFI {
+    pub hf_pass:          f64,
+    pub hf_crit:          f64,
+    pub bb_pass:          f64,
+    pub bb_crit:          f64,
+    pub hf_detrend:       u8,      // 0/1
+    pub bb_detrend:       u8,      // 0/1
+    pub smooth_duration:  f64,
+    pub detrend_duration: f64,
+    pub buffer_duration:  f64,
+    pub zscore_method:    u32,     // 0=Robust, 1=Standard
+}
+
+impl ArtifactOptsFFI {
+    fn to_rust(&self) -> Option<crate::artifacts::ArtifactOpts> {
+        let zm = match self.zscore_method {
+            0 => crate::artifacts::ZScoreMethod::Robust,
+            1 => crate::artifacts::ZScoreMethod::Standard,
+            _ => return None,
+        };
+        Some(crate::artifacts::ArtifactOpts {
+            hf_pass: self.hf_pass,
+            hf_crit: self.hf_crit,
+            bb_pass: self.bb_pass,
+            bb_crit: self.bb_crit,
+            hf_detrend: self.hf_detrend != 0,
+            bb_detrend: self.bb_detrend != 0,
+            smooth_duration: self.smooth_duration,
+            detrend_duration: self.detrend_duration,
+            buffer_duration: self.buffer_duration,
+            zscore_method: zm,
+        })
+    }
+}
+
+/// Band-detection artifact mask. **Does NOT include the slope-test
+/// branch** — that needs the multitaper spectrogram and is left to the
+/// caller (the MATLAB `detect_artifacts.m` ORs the slope mask in
+/// separately). The Rust path here matches `detect_artifacts.m` with
+/// `'slope_test', false` to within ≤30 samples on the synthetic-EEG
+/// fixture battery; validated end-to-end in the upstream
+/// `preraulab/artifact_detection` PR #1 and now MEX-bridged here.
+///
+/// Caller-allocated output `mask_out` is length `n`; 1 = artifact.
+///
+/// # Safety
+/// `data` must point to `n` readable f64s; `opts` must point to a valid
+/// `ArtifactOptsFFI`; `mask_out` must point to `n` writable u8s.
+#[no_mangle]
+pub unsafe extern "C" fn dynamo_detect_artifacts(
+    data: *const f64,
+    n: usize,
+    fs: f64,
+    opts: *const ArtifactOptsFFI,
+    mask_out: *mut u8,
+) -> c_int {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if mask_out.is_null() || opts.is_null() {
+            return ErrorCode::NullPointer.code();
+        }
+        if n == 0 || !fs.is_finite() || fs <= 0.0 {
+            return ErrorCode::InvalidArgument.code();
+        }
+        let data_slice = match ptr_as_slice::<f64>(data, n) {
+            Some(s) => s,
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let opts_ref = &*opts;
+        let opts_rust = match opts_ref.to_rust() {
+            Some(o) => o,
+            None => return ErrorCode::InvalidArgument.code(),
+        };
+
+        let mask = crate::artifacts::detect_artifacts(data_slice, fs, &opts_rust);
+        if mask.len() != n {
+            return ErrorCode::ShapeMismatch.code();
+        }
+        let mask_u8: Vec<u8> = mask.iter().map(|&b| b as u8).collect();
+        std::ptr::copy_nonoverlapping(mask_u8.as_ptr(), mask_out, n);
+        ErrorCode::Ok.code()
+    }));
+    result.unwrap_or(ErrorCode::Panic.code())
+}
+
+// -------------------------------------------------------------------------
+// dynamo_compute_baseline — per-frequency percentile baseline
+// -------------------------------------------------------------------------
+
+/// Compute the per-frequency baseline used in TFpeak extraction.
+///
+/// Inputs (all row-major):
+///   `spect`           — shape (n_freqs, n_times) double; baseline is the
+///                       `baseline_ptile`-th percentile over the valid
+///                       columns of each row (zeros treated as NaN).
+///   `stimes`          — length n_times; window-center times.
+///   `t_data`          — length n_data; the EEG time grid that the
+///                       `baseline_exclude` mask is defined on.
+///   `baseline_exclude` — length n_data u8 (1 = exclude); nearest-neighbor
+///                       interpolated onto `stimes` columns.
+///   `baseline_range_lo` / `baseline_range_hi` — time-range trimming
+///                       applied to `stimes`.
+///   `baseline_ptile`  — percentile in [0, 100] (Hyndman-Fan #5, matching
+///                       MATLAB `prctile(..., baseline_ptile, 2)`).
+///
+/// Caller-allocated output `baseline_out` is length `n_freqs`.
+///
+/// # Safety
+/// All input pointers must point to readable buffers of the declared
+/// lengths. `baseline_out` must be writable for `n_freqs` f64s.
+#[no_mangle]
+pub unsafe extern "C" fn dynamo_compute_baseline(
+    spect: *const f64,
+    n_freqs: usize,
+    n_times: usize,
+    stimes: *const f64,
+    t_data: *const f64,
+    n_data: usize,
+    baseline_exclude: *const u8,
+    baseline_range_lo: f64,
+    baseline_range_hi: f64,
+    baseline_ptile: f64,
+    baseline_out: *mut f64,
+) -> c_int {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if baseline_out.is_null() {
+            return ErrorCode::NullPointer.code();
+        }
+        if n_freqs == 0 || n_times == 0 || n_data == 0 {
+            return ErrorCode::InvalidArgument.code();
+        }
+        let spect_slice = match ptr_as_slice::<f64>(spect, n_freqs * n_times) {
+            Some(s) => s,
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let stimes_slice = match ptr_as_slice::<f64>(stimes, n_times) {
+            Some(s) => s,
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let t_data_slice = match ptr_as_slice::<f64>(t_data, n_data) {
+            Some(s) => s,
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let excl_slice = match ptr_as_slice::<u8>(baseline_exclude, n_data) {
+            Some(s) => s,
+            None => return ErrorCode::NullPointer.code(),
+        };
+
+        let spect_view = match ArrayView2::from_shape((n_freqs, n_times), spect_slice) {
+            Ok(v) => v,
+            Err(_) => return ErrorCode::ShapeMismatch.code(),
+        };
+        let stimes_view = ArrayView1::from(stimes_slice);
+        let t_data_view = ArrayView1::from(t_data_slice);
+        let excl_vec: Vec<bool> = excl_slice.iter().map(|&b| b != 0).collect();
+
+        let baseline = match crate::baseline::compute_baseline(
+            spect_view, stimes_view, t_data_view,
+            &excl_vec, (baseline_range_lo, baseline_range_hi), baseline_ptile,
+        ) {
+            Ok(b) => b,
+            Err(_) => return ErrorCode::KernelError.code(),
+        };
+
+        // Shape is (F, 1); flatten and copy.
+        if baseline.nrows() != n_freqs || baseline.ncols() != 1 {
+            return ErrorCode::ShapeMismatch.code();
+        }
+        let std_baseline = baseline.as_standard_layout().to_owned();
+        let baseline_slice = std_baseline.as_slice().unwrap_or(&[]);
+        if baseline_slice.len() != n_freqs {
+            return ErrorCode::ShapeMismatch.code();
+        }
+        std::ptr::copy_nonoverlapping(baseline_slice.as_ptr(), baseline_out, n_freqs);
+        ErrorCode::Ok.code()
+    }));
+    result.unwrap_or(ErrorCode::Panic.code())
+}
+
+// -------------------------------------------------------------------------
+// dynamo_so_power — SO-power time-series from a pre-computed spectrogram
+// -------------------------------------------------------------------------
+
+#[repr(C)]
+pub struct SoPowerIn {
+    pub spect_ptr:          *const f64,
+    pub n_freqs:            usize,
+    pub n_times:            usize,
+    pub stimes_ptr:         *const f64,    // len n_times
+    pub sfreqs_ptr:         *const f64,    // len n_freqs
+    pub eeg_times_ptr:      *const f64,    // len n_data
+    pub n_data:             usize,
+    pub isexcluded_ptr:     *const u8,     // len n_data (0/1)
+    pub stage_times_ptr:    *const f64,    // len n_stages (may be 0)
+    pub stage_vals_ptr:     *const f64,    // len n_stages
+    pub n_stages:           usize,
+    pub time_range_lo:      f64,
+    pub time_range_hi:      f64,
+    pub outlier_threshold:  f64,
+    pub retain_fs:          u8,            // 0/1
+    /// Null-terminated ASCII norm method spec: e.g. "p2shift1234",
+    /// "percent", "none". Same parser as `NormMethod::parse`.
+    pub norm_method_ptr:    *const u8,
+    pub norm_method_len:    usize,
+}
+
+#[repr(C)]
+pub struct SoPowerOut {
+    pub so_power_norm_ptr:    *mut f64,
+    pub so_power_times_ptr:   *mut f64,
+    pub so_power_stages_ptr:  *mut f64,
+    /// Output length (matches all three arrays above).
+    pub n_out:                usize,
+    /// ptile result: 0 = none, 1 = single (`ptile_value[0]`),
+    /// 2 = pair (`ptile_value[0]`, `ptile_value[1]`).
+    pub ptile_kind:           u32,
+    pub ptile_value:          [f64; 2],
+}
+
+fn empty_so_power_out() -> SoPowerOut {
+    SoPowerOut {
+        so_power_norm_ptr:   std::ptr::null_mut(),
+        so_power_times_ptr:  std::ptr::null_mut(),
+        so_power_stages_ptr: std::ptr::null_mut(),
+        n_out: 0,
+        ptile_kind: 0,
+        ptile_value: [0.0, 0.0],
+    }
+}
+
+/// Compute the SO-power time series and stage / outlier-masked
+/// normalization. Mirrors `crate::so_power::so_power_from_spectrogram`
+/// (and pydynamo `compute_so_power`); MATLAB analog is `computeSOpower.m`.
+///
+/// Output pointers are `Box::leak`-allocated; caller frees with
+/// `dynamo_free_buffer_f64(ptr, n_out)` for each of the three arrays.
+///
+/// # Safety
+/// `in_` and `out` must be valid. All array pointers must back the
+/// declared lengths.
+#[no_mangle]
+pub unsafe extern "C" fn dynamo_so_power(
+    in_: *const SoPowerIn,
+    out: *mut SoPowerOut,
+) -> c_int {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let input = match NonNull::new(in_ as *mut SoPowerIn) {
+            Some(p) => &*p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let output = match NonNull::new(out) {
+            Some(p) => &mut *p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        *output = empty_so_power_out();
+
+        if input.n_freqs == 0 || input.n_times == 0 || input.n_data == 0 {
+            return ErrorCode::InvalidArgument.code();
+        }
+        let spect_slice = match ptr_as_slice::<f64>(input.spect_ptr, input.n_freqs * input.n_times) {
+            Some(s) => s,
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let stimes = match ptr_as_slice::<f64>(input.stimes_ptr, input.n_times) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let sfreqs = match ptr_as_slice::<f64>(input.sfreqs_ptr, input.n_freqs) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let eeg_times = match ptr_as_slice::<f64>(input.eeg_times_ptr, input.n_data) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let excl_u8 = match ptr_as_slice::<u8>(input.isexcluded_ptr, input.n_data) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let isexcluded: Vec<bool> = excl_u8.iter().map(|&b| b != 0).collect();
+        let stage_times = match ptr_as_slice::<f64>(input.stage_times_ptr, input.n_stages) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let stage_vals = match ptr_as_slice::<f64>(input.stage_vals_ptr, input.n_stages) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+
+        let nm_bytes = match ptr_as_slice::<u8>(input.norm_method_ptr, input.norm_method_len) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let nm_str = match std::str::from_utf8(nm_bytes) {
+            Ok(s) => s, Err(_) => return ErrorCode::InvalidArgument.code(),
+        };
+        let nm = match crate::so_power::NormMethod::parse(nm_str) {
+            Some(n) => n, None => return ErrorCode::InvalidArgument.code(),
+        };
+
+        let kernel_out = match crate::so_power::so_power_from_spectrogram(
+            spect_slice, input.n_freqs, input.n_times,
+            stimes, sfreqs, eeg_times, &isexcluded,
+            stage_times, stage_vals,
+            (input.time_range_lo, input.time_range_hi),
+            input.outlier_threshold,
+            &nm,
+            input.retain_fs != 0,
+        ) {
+            Ok(o) => o,
+            Err(_) => return ErrorCode::KernelError.code(),
+        };
+
+        output.n_out = kernel_out.so_power_norm.len();
+        if kernel_out.so_power_times.len() != output.n_out
+            || kernel_out.so_power_stages.len() != output.n_out
+        {
+            return ErrorCode::ShapeMismatch.code();
+        }
+        output.so_power_norm_ptr   = leak_vec_f64(kernel_out.so_power_norm);
+        output.so_power_times_ptr  = leak_vec_f64(kernel_out.so_power_times);
+        output.so_power_stages_ptr = leak_vec_f64(kernel_out.so_power_stages);
+        match kernel_out.ptile {
+            None => {
+                output.ptile_kind = 0;
+            }
+            Some(crate::so_power::PtileUsed::Single(p)) => {
+                output.ptile_kind = 1;
+                output.ptile_value[0] = p;
+            }
+            Some(crate::so_power::PtileUsed::Pair(a, b)) => {
+                output.ptile_kind = 2;
+                output.ptile_value[0] = a;
+                output.ptile_value[1] = b;
+            }
+        }
+        ErrorCode::Ok.code()
+    }));
+    result.unwrap_or(ErrorCode::Panic.code())
+}
+
+// -------------------------------------------------------------------------
+// dynamo_so_phase — SO-phase time-series from raw EEG
+// -------------------------------------------------------------------------
+
+#[repr(C)]
+pub struct SoPhaseIn {
+    pub eeg_ptr:           *const f64,
+    pub eeg_times_ptr:     *const f64,
+    pub isexcluded_ptr:    *const u8,
+    pub n_data:            usize,
+    /// SOS filter coefficients, scipy layout: (n_sections, 6) flattened
+    /// row-major [b0 b1 b2 a0 a1 a2] per section.
+    pub sos_ptr:           *const f64,
+    pub n_sections:        usize,
+    pub stage_times_ptr:   *const f64,
+    pub stage_vals_ptr:    *const f64,
+    pub n_stages:          usize,
+}
+
+#[repr(C)]
+pub struct SoPhaseOut {
+    pub so_phase_ptr:        *mut f64,    // length n_data; unwrapped, NaN at excluded
+    pub so_phase_times_ptr:  *mut f64,    // length n_data (echo of eeg_times)
+    pub so_phase_stages_ptr: *mut f64,    // length n_data
+    pub filtdata_ptr:        *mut f64,    // length n_data; filtered EEG with NaN at excluded
+    pub n_out:               usize,
+}
+
+fn empty_so_phase_out() -> SoPhaseOut {
+    SoPhaseOut {
+        so_phase_ptr:        std::ptr::null_mut(),
+        so_phase_times_ptr:  std::ptr::null_mut(),
+        so_phase_stages_ptr: std::ptr::null_mut(),
+        filtdata_ptr:        std::ptr::null_mut(),
+        n_out: 0,
+    }
+}
+
+/// Compute unwrapped SO-phase from raw EEG via SOS bandpass + Hilbert +
+/// atan2 + unwrap + NaN-at-excluded + stage interp. Mirrors pydynamo
+/// `compute_so_phase`; MATLAB analog is `computeSOphase.m`.
+///
+/// All four output arrays are length `n_data` and `Box::leak`-allocated.
+/// Caller frees with `dynamo_free_buffer_f64(ptr, n_data)` each.
+///
+/// `sos_ptr` must point to `n_sections * 6` f64s in scipy layout
+/// `[b0 b1 b2 a0 a1 a2]` per section.
+///
+/// # Safety
+/// All declared array pointers must back the corresponding lengths.
+#[no_mangle]
+pub unsafe extern "C" fn dynamo_so_phase(
+    in_: *const SoPhaseIn,
+    out: *mut SoPhaseOut,
+) -> c_int {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let input = match NonNull::new(in_ as *mut SoPhaseIn) {
+            Some(p) => &*p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let output = match NonNull::new(out) {
+            Some(p) => &mut *p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        *output = empty_so_phase_out();
+
+        if input.n_data == 0 || input.n_sections == 0 {
+            return ErrorCode::InvalidArgument.code();
+        }
+        let eeg = match ptr_as_slice::<f64>(input.eeg_ptr, input.n_data) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let eeg_times = match ptr_as_slice::<f64>(input.eeg_times_ptr, input.n_data) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let excl_u8 = match ptr_as_slice::<u8>(input.isexcluded_ptr, input.n_data) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let isexcluded: Vec<bool> = excl_u8.iter().map(|&b| b != 0).collect();
+        let sos_flat = match ptr_as_slice::<f64>(input.sos_ptr, input.n_sections * 6) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let sos: Vec<[f64; 6]> = (0..input.n_sections)
+            .map(|i| {
+                let b = i * 6;
+                [sos_flat[b], sos_flat[b+1], sos_flat[b+2], sos_flat[b+3], sos_flat[b+4], sos_flat[b+5]]
+            })
+            .collect();
+        let stage_times = match ptr_as_slice::<f64>(input.stage_times_ptr, input.n_stages) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let stage_vals = match ptr_as_slice::<f64>(input.stage_vals_ptr, input.n_stages) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+
+        let kernel_out = match crate::so_phase::so_phase_from_eeg(
+            eeg, eeg_times, &isexcluded, &sos, stage_times, stage_vals,
+        ) {
+            Ok(o) => o,
+            Err(_) => return ErrorCode::KernelError.code(),
+        };
+
+        if kernel_out.so_phase_unwrapped.len() != input.n_data
+            || kernel_out.so_phase_times.len()  != input.n_data
+            || kernel_out.so_phase_stages.len() != input.n_data
+            || kernel_out.filtdata.len()        != input.n_data
+        {
+            return ErrorCode::ShapeMismatch.code();
+        }
+
+        output.n_out               = input.n_data;
+        output.so_phase_ptr        = leak_vec_f64(kernel_out.so_phase_unwrapped);
+        output.so_phase_times_ptr  = leak_vec_f64(kernel_out.so_phase_times);
+        output.so_phase_stages_ptr = leak_vec_f64(kernel_out.so_phase_stages);
+        output.filtdata_ptr        = leak_vec_f64(kernel_out.filtdata);
+        ErrorCode::Ok.code()
+    }));
+    result.unwrap_or(ErrorCode::Panic.code())
+}
+
+// -------------------------------------------------------------------------
 // 4. buffer-free helpers
 // -------------------------------------------------------------------------
 
@@ -851,6 +1545,367 @@ pub unsafe extern "C" fn dynamo_free_buffer_u8(ptr: *mut u8, len: usize) {
 #[no_mangle]
 pub unsafe extern "C" fn dynamo_free_buffer_u64(ptr: *mut u64, len: usize) {
     drop_leaked_u64(ptr, len);
+}
+
+// -------------------------------------------------------------------------
+// spline_basis FFI
+// -------------------------------------------------------------------------
+
+/// Input descriptor for [`dynamo_spline_basis_fit`].
+///
+/// Layout mirrors MATLAB `spline_basis.m` semantics:
+///   * `soph` is `(n_x, n_y)` row-major, where `n_x = feat_bins.len()` and
+///     `n_y = freq_bins.len()`. This is the **transposed** orientation of
+///     the canonical SOPH (the MATLAB-side wrapper does the transpose).
+///   * `internal_knots_x`/`y` are the pre-`augknt` knot vectors.
+///   * `order = 4` and `boundary_multiplicity = 3` reproduce DYNAM-O.
+#[repr(C)]
+pub struct SplineBasisIn {
+    pub soph_ptr:               *const f64,
+    pub n_x:                    usize,
+    pub n_y:                    usize,
+    pub feat_bins_ptr:          *const f64,
+    pub freq_bins_ptr:          *const f64,
+    pub internal_knots_x_ptr:   *const f64,
+    pub n_internal_knots_x:     usize,
+    pub internal_knots_y_ptr:   *const f64,
+    pub n_internal_knots_y:     usize,
+    pub order:                  u32,
+    pub boundary_multiplicity:  u32,
+}
+
+#[repr(C)]
+pub struct SplineBasisOut {
+    /// `(m_y, m_x)` row-major. Matches MATLAB `squeeze(spline_obj.coefs)'`.
+    pub coefs_ptr:        *mut f64,
+    pub m_y:              usize,
+    pub m_x:              usize,
+    /// `(n_x, n_y)` row-major. Matches MATLAB `splinefit` (= `size(SOPH')`).
+    pub splinefit_ptr:    *mut f64,
+    /// Augmented knot vectors.
+    pub knots_x_aug_ptr:  *mut f64,
+    pub n_knots_x_aug:    usize,
+    pub knots_y_aug_ptr:  *mut f64,
+    pub n_knots_y_aug:    usize,
+}
+
+fn empty_spline_basis_out() -> SplineBasisOut {
+    SplineBasisOut {
+        coefs_ptr:       std::ptr::null_mut(),
+        m_y: 0, m_x: 0,
+        splinefit_ptr:   std::ptr::null_mut(),
+        knots_x_aug_ptr: std::ptr::null_mut(),
+        n_knots_x_aug:   0,
+        knots_y_aug_ptr: std::ptr::null_mut(),
+        n_knots_y_aug:   0,
+    }
+}
+
+/// Fit a bivariate tensor-product B-spline on a regular grid.
+///
+/// Parity-tested against MATLAB `spap2` to f64 round-off (see
+/// `tests/spline_basis_parity.rs`).
+///
+/// All four output arrays are `Box::leak`-allocated. Caller frees with
+/// `dynamo_free_buffer_f64`:
+///   * `coefs_ptr`       length `m_y * m_x`
+///   * `splinefit_ptr`   length `n_x * n_y`
+///   * `knots_x_aug_ptr` length `n_knots_x_aug`
+///   * `knots_y_aug_ptr` length `n_knots_y_aug`
+///
+/// # Safety
+/// All declared array pointers must back the corresponding lengths.
+#[no_mangle]
+pub unsafe extern "C" fn dynamo_spline_basis_fit(
+    in_: *const SplineBasisIn,
+    out: *mut SplineBasisOut,
+) -> c_int {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let input = match NonNull::new(in_ as *mut SplineBasisIn) {
+            Some(p) => &*p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let output = match NonNull::new(out) {
+            Some(p) => &mut *p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        *output = empty_spline_basis_out();
+
+        if input.n_x == 0 || input.n_y == 0
+            || input.n_internal_knots_x == 0 || input.n_internal_knots_y == 0
+        {
+            return ErrorCode::InvalidArgument.code();
+        }
+
+        let soph_flat = match ptr_as_slice::<f64>(input.soph_ptr, input.n_x * input.n_y) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let feat_bins = match ptr_as_slice::<f64>(input.feat_bins_ptr, input.n_x) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let freq_bins = match ptr_as_slice::<f64>(input.freq_bins_ptr, input.n_y) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let ikx = match ptr_as_slice::<f64>(input.internal_knots_x_ptr, input.n_internal_knots_x) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+        let iky = match ptr_as_slice::<f64>(input.internal_knots_y_ptr, input.n_internal_knots_y) {
+            Some(s) => s, None => return ErrorCode::NullPointer.code(),
+        };
+
+        let soph = match ArrayView2::from_shape((input.n_x, input.n_y), soph_flat) {
+            Ok(a) => a,
+            Err(_) => return ErrorCode::ShapeMismatch.code(),
+        };
+
+        let kernel_out = match crate::spline_basis::fit_tensor_product_spline(
+            soph,
+            feat_bins,
+            freq_bins,
+            ikx,
+            iky,
+            input.order as usize,
+            input.boundary_multiplicity as usize,
+        ) {
+            Ok(o) => o,
+            Err(_) => return ErrorCode::KernelError.code(),
+        };
+
+        let (my, mx) = kernel_out.coefs.dim();
+        let (nx, ny) = kernel_out.splinefit.dim();
+        if nx != input.n_x || ny != input.n_y {
+            return ErrorCode::ShapeMismatch.code();
+        }
+
+        let coefs_vec: Vec<f64> = kernel_out.coefs.iter().copied().collect();
+        let splinefit_vec: Vec<f64> = kernel_out.splinefit.iter().copied().collect();
+
+        output.m_y = my;
+        output.m_x = mx;
+        output.coefs_ptr       = leak_vec_f64(coefs_vec);
+        output.splinefit_ptr   = leak_vec_f64(splinefit_vec);
+        output.n_knots_x_aug   = kernel_out.knots_x_aug.len();
+        output.n_knots_y_aug   = kernel_out.knots_y_aug.len();
+        output.knots_x_aug_ptr = leak_vec_f64(kernel_out.knots_x_aug);
+        output.knots_y_aug_ptr = leak_vec_f64(kernel_out.knots_y_aug);
+        ErrorCode::Ok.code()
+    }));
+    result.unwrap_or(ErrorCode::Panic.code())
+}
+
+// -------------------------------------------------------------------------
+// paramfit FFI: rotgauss_fit + vmgauss_fit
+// -------------------------------------------------------------------------
+
+/// Input descriptor for the two paramfit kernels (`dynamo_rotgauss_fit`
+/// and `dynamo_vmgauss_fit`).
+///
+/// SOPH is `(n_y, n_x)` row-major where `n_y = freq_bins.len()` and
+/// `n_x = feat_bins.len()`. This matches the canonical MATLAB SOPH
+/// `(n_freqs, n_features)` column-major byte-for-byte — pass `mxGetPr`
+/// directly without copying.
+///
+/// Initial/lower/upper are `(n_modes, 6)` row-major:
+///   * power: `[amp, fmean, fstd, pmean,    pstd,      theta]`
+///   * phase: `[amp, fmean, fstd, phasepref, recikappa, theta]`
+/// `fstd` is a frequency standard deviation in Hz for both fit types.
+///
+/// `bg_initial`, `bg_lower`, `bg_upper` are 3-vectors `[xxx, yyy, zzz]`.
+#[repr(C)]
+pub struct ParamFitIn {
+    pub soph_ptr:        *const f64,
+    pub n_y:             usize,
+    pub n_x:             usize,
+    pub feat_bins_ptr:   *const f64,
+    pub freq_bins_ptr:   *const f64,
+    pub initial_ptr:     *const f64,    // (n_modes * 6)
+    pub lower_ptr:       *const f64,
+    pub upper_ptr:       *const f64,
+    pub n_modes:         usize,
+    pub bg_initial:      [f64; 3],
+    pub bg_lower:        [f64; 3],
+    pub bg_upper:        [f64; 3],
+    pub max_iters:       u32,
+    /// vmGauss-only: nonzero = row-normalize the assembled model (matches
+    /// MATLAB `fit_vmGauss.m`'s `unit_row=true`). Ignored by rotgauss_fit.
+    pub unit_row:        u32,
+}
+
+#[repr(C)]
+pub struct ParamFitOutFFI {
+    /// Final parameters, `(n_modes, 6)` row-major. Allocated, length `n_modes * 6`.
+    pub params_ptr:      *mut f64,
+    /// Background-plane coefficients `[xxx, yyy, zzz]`.
+    pub background:      [f64; 3],
+    /// Model reconstruction on the input grid, `(n_y, n_x)` row-major.
+    pub model_ptr:       *mut f64,
+    pub n_y:             usize,
+    pub n_x:             usize,
+    /// gof.sse / rsquare / adjrsquare / rmse / dfe / dfm.
+    pub gof_sse:         f64,
+    pub gof_rsquare:     f64,
+    pub gof_adjrsquare:  f64,
+    pub gof_rmse:        f64,
+    pub gof_dfe:         f64,
+    pub gof_dfm:         f64,
+    pub iters_used:      u32,
+}
+
+fn empty_paramfit_out() -> ParamFitOutFFI {
+    ParamFitOutFFI {
+        params_ptr:     std::ptr::null_mut(),
+        background:     [0.0; 3],
+        model_ptr:      std::ptr::null_mut(),
+        n_y: 0, n_x: 0,
+        gof_sse: 0.0, gof_rsquare: 0.0, gof_adjrsquare: 0.0,
+        gof_rmse: 0.0, gof_dfe: 0.0, gof_dfm: 0.0,
+        iters_used: 0,
+    }
+}
+
+unsafe fn paramfit_common_setup(
+    input: &ParamFitIn,
+) -> Result<(ArrayView2<'static, f64>, &'static [f64], &'static [f64],
+             ArrayView2<'static, f64>, ArrayView2<'static, f64>, ArrayView2<'static, f64>),
+            c_int>
+{
+    if input.n_y == 0 || input.n_x == 0 || input.n_modes == 0 {
+        return Err(ErrorCode::InvalidArgument.code());
+    }
+    let soph_flat = match ptr_as_slice::<f64>(input.soph_ptr, input.n_y * input.n_x) {
+        Some(s) => s, None => return Err(ErrorCode::NullPointer.code()),
+    };
+    let feat_bins = match ptr_as_slice::<f64>(input.feat_bins_ptr, input.n_x) {
+        Some(s) => s, None => return Err(ErrorCode::NullPointer.code()),
+    };
+    let freq_bins = match ptr_as_slice::<f64>(input.freq_bins_ptr, input.n_y) {
+        Some(s) => s, None => return Err(ErrorCode::NullPointer.code()),
+    };
+    let init = match ptr_as_slice::<f64>(input.initial_ptr, input.n_modes * 6) {
+        Some(s) => s, None => return Err(ErrorCode::NullPointer.code()),
+    };
+    let lo = match ptr_as_slice::<f64>(input.lower_ptr, input.n_modes * 6) {
+        Some(s) => s, None => return Err(ErrorCode::NullPointer.code()),
+    };
+    let hi = match ptr_as_slice::<f64>(input.upper_ptr, input.n_modes * 6) {
+        Some(s) => s, None => return Err(ErrorCode::NullPointer.code()),
+    };
+    let soph = ArrayView2::from_shape((input.n_y, input.n_x), soph_flat)
+        .map_err(|_| ErrorCode::ShapeMismatch.code())?;
+    let initial = ArrayView2::from_shape((input.n_modes, 6), init)
+        .map_err(|_| ErrorCode::ShapeMismatch.code())?;
+    let lower = ArrayView2::from_shape((input.n_modes, 6), lo)
+        .map_err(|_| ErrorCode::ShapeMismatch.code())?;
+    let upper = ArrayView2::from_shape((input.n_modes, 6), hi)
+        .map_err(|_| ErrorCode::ShapeMismatch.code())?;
+    Ok((soph, feat_bins, freq_bins, initial, lower, upper))
+}
+
+fn fill_paramfit_out(out: &mut ParamFitOutFFI, kernel: crate::paramfit::ParamFitOut) {
+    let (n_modes, _) = kernel.params.dim();
+    let (ny, nx) = kernel.model_soph.dim();
+    out.background = kernel.background;
+    out.n_y = ny;
+    out.n_x = nx;
+    out.gof_sse        = kernel.gof.sse;
+    out.gof_rsquare    = kernel.gof.rsquare;
+    out.gof_adjrsquare = kernel.gof.adjrsquare;
+    out.gof_rmse       = kernel.gof.rmse;
+    out.gof_dfe        = kernel.gof.dfe;
+    out.gof_dfm        = kernel.gof.dfm;
+    out.iters_used     = kernel.iters_used;
+    let params_vec: Vec<f64> = kernel.params.iter().copied().collect();
+    let model_vec: Vec<f64> = kernel.model_soph.iter().copied().collect();
+    out.params_ptr = leak_vec_f64(params_vec);
+    out.model_ptr  = leak_vec_f64(model_vec);
+    let _ = n_modes;
+}
+
+/// Fit a rotated-Gaussian-mixture model + linear background plane to a SOPH
+/// histogram. Mirrors MATLAB `fit_rotGauss` (without `prepareSurfaceData`'s
+/// NaN drop — caller must hand us a finite-valued grid).
+///
+/// # Safety
+/// All pointers must back the declared lengths.
+#[no_mangle]
+pub unsafe extern "C" fn dynamo_rotgauss_fit(
+    in_: *const ParamFitIn,
+    out: *mut ParamFitOutFFI,
+) -> c_int {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let input = match NonNull::new(in_ as *mut ParamFitIn) {
+            Some(p) => &*p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let output = match NonNull::new(out) {
+            Some(p) => &mut *p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        *output = empty_paramfit_out();
+
+        let (soph, feat_bins, freq_bins, initial, lower, upper) =
+            match paramfit_common_setup(input) {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
+
+        let kernel_out = match crate::paramfit::rot_gauss::fit_rotgauss(
+            soph, feat_bins, freq_bins,
+            initial, lower, upper,
+            input.bg_initial, input.bg_lower, input.bg_upper,
+            input.max_iters,
+        ) {
+            Ok(o) => o,
+            Err(_) => return ErrorCode::KernelError.code(),
+        };
+        fill_paramfit_out(output, kernel_out);
+        ErrorCode::Ok.code()
+    }));
+    result.unwrap_or(ErrorCode::Panic.code())
+}
+
+/// Fit a von-Mises × Gaussian mixture + sinusoidal background to a SOPH
+/// histogram. `ParamFitIn::unit_row` controls per-row normalization;
+/// nonzero matches MATLAB `fit_vmGauss`.
+///
+/// # Safety
+/// All pointers must back the declared lengths.
+#[no_mangle]
+pub unsafe extern "C" fn dynamo_vmgauss_fit(
+    in_: *const ParamFitIn,
+    out: *mut ParamFitOutFFI,
+) -> c_int {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let input = match NonNull::new(in_ as *mut ParamFitIn) {
+            Some(p) => &*p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        let output = match NonNull::new(out) {
+            Some(p) => &mut *p.as_ptr(),
+            None => return ErrorCode::NullPointer.code(),
+        };
+        *output = empty_paramfit_out();
+
+        let (soph, feat_bins, freq_bins, initial, lower, upper) =
+            match paramfit_common_setup(input) {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
+
+        let kernel_out = match crate::paramfit::vm_gauss::fit_vmgauss(
+            soph, feat_bins, freq_bins,
+            initial, lower, upper,
+            input.bg_initial, input.bg_lower, input.bg_upper,
+            input.max_iters,
+            input.unit_row != 0,
+        ) {
+            Ok(o) => o,
+            Err(_) => return ErrorCode::KernelError.code(),
+        };
+        fill_paramfit_out(output, kernel_out);
+        ErrorCode::Ok.code()
+    }));
+    result.unwrap_or(ErrorCode::Panic.code())
 }
 
 // -------------------------------------------------------------------------
