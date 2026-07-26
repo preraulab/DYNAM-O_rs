@@ -19,7 +19,7 @@ pub use multitaper_rs::{
     compute_spectrogram, DetrendMode, SpectrogramOutput, SpectrogramParams, Weighting,
 };
 
-/// DYNAM-O pass-1 defaults: 1 s window, 50 ms step, freq 0–30 Hz, linear
+/// DYNAM-O pass-1 defaults: 1 s window, 50 ms step, freq 0–30 Hz, constant
 /// detrend, unity weighting. nfft is **not** defaulted — caller picks
 /// (typically next-pow2 of `winsize_samples` or a padded multiple).
 pub fn dynamo_pass1_params(fs: f64, nfft: usize) -> SpectrogramParams {
@@ -28,7 +28,7 @@ pub fn dynamo_pass1_params(fs: f64, nfft: usize) -> SpectrogramParams {
         frequency_range: (0.0, 30.0),
         window_params: (1.0, 0.05),
         nfft,
-        detrend: DetrendMode::Linear,
+        detrend: DetrendMode::Constant,
         weighting: Weighting::Unity,
     }
 }
@@ -40,7 +40,7 @@ pub fn dynamo_pass2_params(fs: f64, nfft: usize) -> SpectrogramParams {
         frequency_range: (0.0, 30.0),
         window_params: (2.0, 0.05),
         nfft,
-        detrend: DetrendMode::Linear,
+        detrend: DetrendMode::Constant,
         weighting: Weighting::Unity,
     }
 }
@@ -55,5 +55,30 @@ pub fn dynamo_sopower_params(fs: f64, nfft: usize) -> SpectrogramParams {
         nfft,
         detrend: DetrendMode::Linear,
         weighting: Weighting::Unity,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tf_passes_use_constant_detrending() {
+        assert!(matches!(
+            dynamo_pass1_params(100.0, 1024).detrend,
+            DetrendMode::Constant
+        ));
+        assert!(matches!(
+            dynamo_pass2_params(100.0, 1024).detrend,
+            DetrendMode::Constant
+        ));
+    }
+
+    #[test]
+    fn so_power_keeps_linear_detrending() {
+        assert!(matches!(
+            dynamo_sopower_params(100.0, 1024).detrend,
+            DetrendMode::Linear
+        ));
     }
 }
