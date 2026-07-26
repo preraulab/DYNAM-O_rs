@@ -67,8 +67,14 @@ pub fn flat_run_mask(data: &[f64], min_run: usize) -> Vec<bool> {
     flat_run_mask_with_tolerance(data, min_run, 0.0)
 }
 
-/// True inside runs whose full value span stays within `tol`.
-fn flat_run_mask_with_tolerance(data: &[f64], min_run: usize, tol: f64) -> Vec<bool> {
+/// Return a mask marking runs of at least `min_run` samples whose full value
+/// span (`max - min`) does not exceed `tolerance`.
+///
+/// Measuring the full span prevents a gradual drift from being joined into
+/// one run merely because each adjacent step is small. A non-positive
+/// `tolerance` uses strict equality, matching [`flat_run_mask`]. With a
+/// positive tolerance, non-finite samples terminate the current run.
+pub fn flat_run_mask_with_tolerance(data: &[f64], min_run: usize, tolerance: f64) -> Vec<bool> {
     let n = data.len();
     if n == 0 {
         return vec![];
@@ -81,11 +87,11 @@ fn flat_run_mask_with_tolerance(data: &[f64], min_run: usize, tol: f64) -> Vec<b
     for i in 1..=n {
         let same = if i == n {
             false
-        } else if tol > 0.0 {
+        } else if tolerance > 0.0 {
             if data[i].is_finite() && run_min.is_finite() {
                 let next_min = run_min.min(data[i]);
                 let next_max = run_max.max(data[i]);
-                next_max - next_min <= tol
+                next_max - next_min <= tolerance
             } else {
                 false
             }
