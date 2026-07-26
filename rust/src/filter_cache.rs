@@ -7,9 +7,11 @@
 //!
 //! Policy:
 //!   1. Resolve cache dir from env var `DYNAMO_FILTER_CACHE` if set.
-//!   2. Otherwise look next to the crate at
-//!      `$CARGO_MANIFEST_DIR/../data_matlab_filters`.
-//!   3. If neither hit → fall back to a **pure-Rust Chebyshev Type-I bandpass**
+//!   2. Otherwise look for `data_matlab_filters/` beside the loaded native
+//!      module. Release installers must preserve that sidecar layout.
+//!   3. For source-tree development, also check paths relative to the current
+//!      working directory.
+//!   4. If none hit → fall back to a **pure-Rust Chebyshev Type-I bandpass**
 //!      design (this crate already ships one in `filter_design.rs`)
 //!      and emit a warning. The MATLAB cache is actually an elliptic design
 //!      so this fallback introduces a small (~0.93 cosine similarity)
@@ -48,16 +50,125 @@ impl std::error::Error for FilterError {}
 
 /// Build the ordered list of candidate cache directories.
 fn candidate_filter_dirs() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(envp) = std::env::var("DYNAMO_FILTER_CACHE") {
-        if !envp.is_empty() {
-            dirs.push(PathBuf::from(envp));
+    candidate_filter_dirs_from(
+        std::env::var_os("DYNAMO_FILTER_CACHE")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from),
+        runtime_module_path().as_deref(),
+        std::env::current_dir().ok().as_deref(),
+    )
+}
+
+fn candidate_filter_dirs_from(
+    override_dir: Option<PathBuf>,
+    module_path: Option<&Path>,
+    current_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(path) = override_dir {
+        push_unique(&mut dirs, path);
+    }
+    if let Some(module_dir) = module_path.and_then(Path::parent) {
+        push_unique(&mut dirs, module_dir.join("data_matlab_filters"));
+    }
+    if let Some(current_dir) = current_dir {
+        push_unique(&mut dirs, current_dir.join("data_matlab_filters"));
+        if let Some(parent) = current_dir.parent() {
+            push_unique(&mut dirs, parent.join("data_matlab_filters"));
         }
     }
-    // Canonical: repo-root/data_matlab_filters, i.e. $CARGO_MANIFEST_DIR/../data_matlab_filters
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    dirs.push(Path::new(manifest).join("..").join("data_matlab_filters"));
     dirs
+}
+
+fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.contains(&path) {
+        paths.push(path);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn runtime_module_path() -> Option<PathBuf> {
+    use std::ffi::{c_char, c_int, c_void, CStr};
+    use std::mem::MaybeUninit;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[repr(C)]
+    struct DlInfo {
+        dli_fname: *const c_char,
+        dli_fbase: *mut c_void,
+        dli_sname: *const c_char,
+        dli_saddr: *mut c_void,
+    }
+
+    #[cfg_attr(target_os = "linux", link(name = "dl"))]
+    unsafe extern "C" {
+        fn dladdr(address: *const c_void, info: *mut DlInfo) -> c_int;
+    }
+
+    let mut info = MaybeUninit::<DlInfo>::zeroed();
+    let found = unsafe {
+        dladdr(
+            runtime_module_path as *const () as *const c_void,
+            info.as_mut_ptr(),
+        )
+    };
+    if found == 0 {
+        return None;
+    }
+
+    let info = unsafe { info.assume_init() };
+    if info.dli_fname.is_null() {
+        return None;
+    }
+    let bytes = unsafe { CStr::from_ptr(info.dli_fname) }.to_bytes();
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+}
+
+#[cfg(target_os = "windows")]
+fn runtime_module_path() -> Option<PathBuf> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStringExt;
+    use std::ptr;
+
+    const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x0000_0002;
+    const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleExW(flags: u32, module_name: *const u16, module: *mut *mut c_void)
+            -> i32;
+        fn GetModuleFileNameW(module: *mut c_void, filename: *mut u16, size: u32) -> u32;
+    }
+
+    let mut module = ptr::null_mut();
+    let found = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            runtime_module_path as *const () as *const u16,
+            &mut module,
+        )
+    };
+    if found == 0 {
+        return None;
+    }
+
+    let mut buffer = vec![0_u16; 260];
+    loop {
+        let length =
+            unsafe { GetModuleFileNameW(module, buffer.as_mut_ptr(), buffer.len() as u32) };
+        if length == 0 {
+            return None;
+        }
+        if (length as usize) < buffer.len() - 1 {
+            return Some(std::ffi::OsString::from_wide(&buffer[..length as usize]).into());
+        }
+        buffer.resize(buffer.len() * 2, 0);
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn runtime_module_path() -> Option<PathBuf> {
+    std::env::current_exe().ok()
 }
 
 /// `{:g}` mimics Python's `f"{v:g}"` and Rust's default `{}` for `f64` with
@@ -154,6 +265,24 @@ use crate::filter_design;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_candidates_prefer_override_then_runtime_install() {
+        let dirs = candidate_filter_dirs_from(
+            Some(PathBuf::from("/override")),
+            Some(Path::new("/install/dynamo_rs.so")),
+            Some(Path::new("/checkout/rust")),
+        );
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/override"),
+                PathBuf::from("/install/data_matlab_filters"),
+                PathBuf::from("/checkout/rust/data_matlab_filters"),
+                PathBuf::from("/checkout/data_matlab_filters"),
+            ]
+        );
+    }
 
     #[test]
     fn filename_format_matches_cache() {
