@@ -4,13 +4,13 @@ Pure Rust implementation of the DYNAM-O pipeline — TF-peak extraction (double
 watershed + merge + MATLAB-paint border + trim + Hann refinement), SO-power
 and SO-phase time-series + 2D histograms, two-band artifact detection,
 baseline subtraction, peak-stage/SO assignment, and EDF / staging I/O. Ships
-as a library, a C ABI for MATLAB MEX, a PyO3 extension for pydynamo, and a
+as a library, a C ABI for MATLAB MEX, a PyO3 extension for `pydynamo`, and a
 standalone `dynamo` CLI binary.
 
 This crate is the Rust core shared by:
 
 - **[DYNAM-O](https://github.com/preraulab/DYNAM-O)** — MATLAB toolbox. The `backend='rust'` path calls `dynamo_rs` via MEX wrappers (`DYNAM-O/rust_bridge/`).
-- **[pyDYNAM-O](https://github.com/preraulab/DYNAM-O_py)** — Python port. Uses `dynamo_rs` via PyO3 bindings.
+- **[DYNAM-O_py](https://github.com/preraulab/DYNAM-O_py)** — Python port. Uses `dynamo_rs` via PyO3 bindings.
 - **[DYNAM-O_toolbox](https://github.com/preraulab/DYNAM-O_toolbox)** — parent meta-repo that bootstraps all three as sibling repositories.
 - **Standalone `dynamo` CLI** — native binary, no MATLAB or Python dependency at runtime. See *CLI usage* below.
 
@@ -108,8 +108,8 @@ Resample to 100 Hz before feeding `dynamo extract` / `dynamo_extract_tfpeaks`
 for ~2× end-to-end speedup with zero analytical loss for sleep oscillations.
 Empirical: 10.5 h × 128 Hz EDF goes from ~41 s → ~22 s on a 32-core
 Threadripper (Rust backend, full pipeline). The MATLAB FileManager has
-this enabled by default; CLI / pydynamo callers should pass already-
-resampled data.
+this enabled by default; CLI / pydynamo callers should pass already-resampled
+data.
 
 ---
 
