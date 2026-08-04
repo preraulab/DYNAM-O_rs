@@ -810,9 +810,16 @@ mod python {
     /// Rotated-Gaussian mixture + linear background plane, mirroring MATLAB
     /// `fit_rotGauss.m`. `soph` is `(n_y, n_x)` = `(n_freqs, n_features)`;
     /// `initial`/`lower`/`upper` are `(N, 6)` with columns
-    /// `[amp, fmean, fstd, pmean, pstd, theta]`. Note `fstd` is a standard
-    /// deviation, not a variance. `max_iters=0` selects the scipy-equivalent
-    /// default of `100 * n_params`.
+    /// `[amp, fmean, fstd, pmean, pstd, theta]`. `max_iters=0` selects the
+    /// scipy-equivalent default of `100 * n_params`.
+    ///
+    /// The kernel is
+    /// `amp * exp(-0.5*(u/fstd)^2 - 0.5*(v/pstd)^2)`, so `fstd` and `pstd`
+    /// are standard deviations — not variances, and not the `sqrt(2)`-
+    /// inflated widths this function used before 0.2.0. Seeds, bounds and
+    /// returned values in columns 2 and 4 all shrank by `sqrt(2)` at 0.2.0;
+    /// the signature did not change, so old callers keep working and
+    /// silently describe a window `sqrt(2)` too wide.
     #[pyfunction]
     #[pyo3(signature = (soph, x_grid, y_grid, initial, lower, upper,
                         bg_initial, bg_lower, bg_upper, max_iters=0))]
@@ -858,6 +865,16 @@ mod python {
     /// `[amp, fmean, fstd, phasepref, recikappa, theta]`. `unit_row=True`
     /// replicates `normalized_vmGauss.m`'s per-frequency-row normalization
     /// (MATLAB passes `problem=true` for the phase fit).
+    ///
+    /// The kernel is `amp * exp(-0.5*(dy/fstd)^2) *
+    /// exp(k*(cos(dx) - 1))`, `k = 1/recikappa^2`, so both widths are
+    /// standard deviations — but only `fstd` (column 2) moved at 0.2.0,
+    /// where it shrank by `sqrt(2)` and, before that, stopped being
+    /// variance-like. `recikappa` (column 4) is unchanged and must NOT be
+    /// rescaled: the von Mises factor is its own small-angle Gaussian and
+    /// carries the half intrinsically. Column 4 is `pstd` for
+    /// `fit_rotgauss` and `recikappa` here, so any migration driven by
+    /// column index rather than by kernel corrupts every phase fit.
     #[pyfunction]
     #[pyo3(signature = (soph, x_grid, y_grid, initial, lower, upper,
                         bg_initial, bg_lower, bg_upper, max_iters=0, unit_row=true))]

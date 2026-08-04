@@ -1711,6 +1711,30 @@ pub unsafe extern "C" fn dynamo_spline_basis_fit(
 /// `fstd` is a frequency standard deviation in Hz for both fit types.
 ///
 /// `bg_initial`, `bg_lower`, `bg_upper` are 3-vectors `[xxx, yyy, zzz]`.
+///
+/// # Width convention changed in 0.2.0 — the ABI did not
+///
+/// The Gaussian widths are now genuine standard deviations. Both kernels
+/// carry an explicit factor of one half in the exponent:
+///
+/// ```text
+///   power: amp * exp(-0.5*(u/fstd)^2 - 0.5*(v/pstd)^2)
+///   phase: amp * exp(-0.5*(dy/fstd)^2) * exp(k*(cos(dx) - 1)), k = 1/recikappa^2
+/// ```
+///
+/// Before 0.2.0 the half was absent, so `fstd` and `pstd` were `sqrt(2)`
+/// times the standard deviation they were named after (and before that,
+/// the phase `fstd` divided unsquared, which made it variance-like). The
+/// struct layout, the field types and the function signatures are all
+/// unchanged, so a stale caller still links and still runs — it just
+/// describes a window `sqrt(2)` too wide and reads back numbers on the
+/// old scale. Rebuild every MEX/loadlibrary caller, and do not pool
+/// widths emitted across the change.
+///
+/// Column 4 is polymorphic and must NOT be migrated by index: it is
+/// `pstd` for `dynamo_rotgauss_fit` (rescales by `1/sqrt(2)`) and
+/// `recikappa` for `dynamo_vmgauss_fit` (unchanged — the von Mises factor
+/// is its own small-angle Gaussian and already carries the half).
 #[repr(C)]
 pub struct ParamFitIn {
     pub soph_ptr:        *const f64,
