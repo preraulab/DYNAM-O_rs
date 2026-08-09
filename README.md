@@ -4,15 +4,17 @@ Pure Rust implementation of the DYNAM-O pipeline — TF-peak extraction (double
 watershed + merge + MATLAB-paint border + trim + Hann refinement), SO-power
 and SO-phase time-series + 2D histograms, two-band artifact detection,
 baseline subtraction, peak-stage/SO assignment, and EDF / staging I/O. Ships
-as a library, a C ABI for MATLAB MEX, a PyO3 extension for `pydynamo`, and a
-standalone `dynamo` CLI binary.
+as a library, a C ABI for MATLAB MEX, and a PyO3 extension for `pydynamo`. A
+small `dynamo` binary exercises one slice of the pipeline directly from the
+shell — see *The `dynamo` developer binary* below for what it does and does
+not cover.
 
 This crate is the Rust core shared by:
 
 - **[DYNAM-O](https://github.com/preraulab/DYNAM-O)** — MATLAB toolbox. The `backend='rust'` path calls `dynamo_rs` via MEX wrappers (`DYNAM-O/rust_bridge/`).
 - **[DYNAM-O_py](https://github.com/preraulab/DYNAM-O_py)** — Python port. Uses `dynamo_rs` via PyO3 bindings.
 - **[DYNAM-O_toolbox](https://github.com/preraulab/DYNAM-O_toolbox)** — parent meta-repo that bootstraps all three as sibling repositories.
-- **Standalone `dynamo` CLI** — native binary, no MATLAB or Python dependency at runtime. See *CLI usage* below.
+- **The `dynamo` binary** — a development utility for driving the extraction kernel from the shell, with no MATLAB or Python in the loop. It is not a general-purpose DYNAM-O command-line tool; see below.
 
 ---
 
@@ -219,10 +221,17 @@ wheel for distribution. Native extensions or wheels produced by direct
 Maturin, pip, or other PEP 517 commands are not controlled release artifacts
 and must not be published as such.
 
-### As a standalone CLI (no MATLAB or Python needed)
+### The `dynamo` developer binary
 
-The direct CLI build below is for local development only. Use the controlled
-toolbox bootstrap before distributing the executable.
+`src/bin/dynamo.rs` is a thin shell wrapper over one slice of the kernel. It
+exists so the extraction path can be driven and profiled without MATLAB or
+Python in the loop — useful when bisecting a parity difference or timing a
+change. It is not a general-purpose DYNAM-O command-line tool, and is not
+what you want for running a study.
+
+**Scope: one subcommand, `extract`.** It takes a *pre-computed* multitaper
+spectrogram as three `.npy` files and writes a peak stats CSV with the same
+columns as MATLAB's `stats_table`:
 
 ```bash
 cd rust
@@ -234,12 +243,15 @@ cargo build --release --locked --bin dynamo
     --out    stats.csv
 ```
 
-Currently covers the "from-spectrogram" slice: given a pre-computed
-multitaper spectrogram as three `.npy` files, run the watershed / merge /
-trim / region-props / filter pipeline and write a CSV with the same columns
-as MATLAB's `stats_table`. Full EDF-to-CSV (multitaper + baseline + refine +
-histograms) is follow-up work; the library primitives are all in place, the
-CLI just needs stitching.
+**It does not read EDFs**, compute the spectrogram, subtract a baseline,
+refine peaks, or build SO-power / SO-phase histograms. Producing the three
+input arrays is the caller's problem. Everything upstream and downstream of
+the watershed belongs to whichever front end you are driving the kernel
+from — the MATLAB toolbox or `pydynamo` — and those remain the supported
+ways to run the pipeline end to end.
+
+The direct build above is for local development only. Use the controlled
+toolbox bootstrap before distributing the executable.
 
 Defaults match `runDYNAMO`: `seg_time=30`, `downsample=(2,2)`,
 `merge_thresh=11`, `trim_vol=0.8`, `dur_min=0.5`, `bw_min=2`, etc. All
@@ -261,7 +273,7 @@ an updated header.
 | **MATLAB MEX** (`DYNAM-O/rust_bridge/`) | Classic-C MEX `.c` files link `-ldynamo_rs` at build, load the dylib at runtime via `dlopen` (macOS embeds rpath) | `dynamo_extract_tfpeaks`, `dynamo_mask_spectrogram`, `dynamo_refine_peaks`, `dynamo_tfpeak_histogram` — in `src/c_api.rs` |
 | **Python** (`pydynamo`) | PyO3 extension installed by the controlled toolbox bootstrap | `matlab_watershed`, `matlab_paint_labels`, `merge_segment`, `trim_regions`, `mask_spectrogram`, `compute_baseline`, `build_baseline_exclude`, `subtract_baseline`, `so_power_from_spectrogram`, `so_phase_from_eeg`, `detect_artifacts`, `hann_event_spectra`, `refine_from_spectra`, `tfpeak_histogram`, `hilbert`, `sosfiltfilt`, `movmean`, `unwrap`, … — in `src/lib.rs` under `#[pyfunction]` |
 | **Rust** | `Cargo.toml` path or git dep | Public Rust items in `src/lib.rs` |
-| **Standalone CLI** | Local Cargo build; controlled toolbox bootstrap for distribution | `dynamo extract --spect ... --out stats.csv` — in `src/bin/dynamo.rs` |
+| **`dynamo` binary** (development utility, extraction slice only) | Local Cargo build; controlled toolbox bootstrap for distribution | `dynamo extract --spect ... --out stats.csv` — in `src/bin/dynamo.rs` |
 
 ---
 
