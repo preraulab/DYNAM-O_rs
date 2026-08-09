@@ -1731,10 +1731,15 @@ pub unsafe extern "C" fn dynamo_spline_basis_fit(
 /// old scale. Rebuild every MEX/loadlibrary caller, and do not pool
 /// widths emitted across the change.
 ///
-/// Column 4 is polymorphic and must NOT be migrated by index: it is
-/// `pstd` for `dynamo_rotgauss_fit` (rescales by `1/sqrt(2)`) and
-/// `recikappa` for `dynamo_vmgauss_fit` (unchanged — the von Mises factor
-/// is its own small-angle Gaussian and already carries the half).
+/// Values cross this ABI unchanged. Divide stored pre-0.2.0 Gaussian widths
+/// by `sqrt(2)` only when preserving an old modeled surface or bound window;
+/// fresh seeds and priors already expressed as standard deviations keep their
+/// numeric values.
+///
+/// Column 4 is polymorphic and must NOT be migrated by index: a stored
+/// pre-0.2.0 `pstd` for `dynamo_rotgauss_fit` rescales by `1/sqrt(2)`, while
+/// `recikappa` for `dynamo_vmgauss_fit` is unchanged — the von Mises factor
+/// is its own small-angle Gaussian and already carries the half.
 #[repr(C)]
 pub struct ParamFitIn {
     pub soph_ptr:        *const f64,
