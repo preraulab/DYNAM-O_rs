@@ -282,6 +282,26 @@ mod tests {
     }
 
     #[test]
+    fn frequency_width_is_standard_deviation() {
+        let amp = 2.0;
+        let fmean = 10.0;
+        let fstd = 2.5;
+        let phasepref = 0.0;
+        let recikappa = 1.0;
+        let theta = 0.0;
+        let p = [
+            amp, fmean, fstd, phasepref, recikappa, theta,
+            0.0, 0.0, 0.0,
+        ];
+
+        let at_center = eval_model(&p, 1, &[phasepref], &[fmean], false)[[0, 0]];
+        let at_one_std =
+            eval_model(&p, 1, &[phasepref], &[fmean + fstd], false)[[0, 0]];
+
+        assert!((at_one_std / at_center - (-0.5_f64).exp()).abs() < 1e-12);
+    }
+
+    #[test]
     fn recovers_known_single_mode_phase() {
         let nx = 40usize; let ny = 40usize;
         let xg: Vec<f64> = (0..nx).map(|i| -std::f64::consts::PI + 2.0*std::f64::consts::PI*i as f64/(nx-1) as f64).collect();
@@ -313,5 +333,64 @@ mod tests {
         assert!(out.gof.rsquare > 0.95,
             "Phase recovery R² too low: {} (sse={}, dfe={})",
             out.gof.rsquare, out.gof.sse, out.gof.dfe);
+        assert!(((out.params[[0, 2]] - true_p[2]) / true_p[2]).abs() < 0.12,
+            "Recovered FreqStd {} differs from planted σ {}",
+            out.params[[0, 2]], true_p[2]);
+    }
+
+    #[test]
+    fn phase_center_bounds_allow_crossing_pi_seam() {
+        use std::f64::consts::PI;
+
+        let nx = 81usize;
+        let ny = 65usize;
+        let xg: Vec<f64> = (0..nx)
+            .map(|i| -PI + 2.0 * PI * i as f64 / (nx - 1) as f64)
+            .collect();
+        let yg: Vec<f64> = (0..ny)
+            .map(|i| 2.0 + 16.0 * i as f64 / (ny - 1) as f64)
+            .collect();
+        let planted = [
+            0.07, 10.5, 1.4, -PI + 0.12, 0.9, 0.42,
+            0.012, 0.35, 0.003,
+        ];
+        let soph = eval_model(&planted, 1, &xg, &yg, true);
+        let initial = Array2::from_shape_vec(
+            (1, 6),
+            vec![0.06, 10.2, 1.2, PI - 0.04, 1.0, 0.30],
+        ).unwrap();
+        let historical_fstd_lower = 1.0 / 2.0_f64.sqrt();
+        let historical_fstd_upper = 7.5_f64.sqrt();
+        for (label, phase_lower, phase_upper) in [
+            ("two-period", -2.0 * PI, 2.0 * PI),
+            ("unbounded", f64::NEG_INFINITY, f64::INFINITY),
+        ] {
+            let lower = Array2::from_shape_vec(
+                (1, 6),
+                vec![0.001, 2.0, historical_fstd_lower, phase_lower, PI / 5.0, -PI / 3.0],
+            ).unwrap();
+            let upper = Array2::from_shape_vec(
+                (1, 6),
+                vec![1.0, 18.0, historical_fstd_upper, phase_upper, 2.0 * PI, PI / 3.0],
+            ).unwrap();
+
+            let out = fit_vmgauss(
+                soph.view(), &xg, &yg,
+                initial.view(), lower.view(), upper.view(),
+                [0.012, 0.35, 0.003], [-1.0, -PI, 0.0], [1.0, PI, 1.0],
+                500, true,
+            ).unwrap();
+            let raw_phase = out.params[[0, 3]];
+            let phase_delta = raw_phase - planted[3];
+            let circular_error = phase_delta.sin().atan2(phase_delta.cos()).abs();
+
+            assert!(raw_phase > PI,
+                "{label}: expected the raw phase center to cross +π, got {raw_phase}");
+            assert!(circular_error < 1e-4,
+                "{label}: recovered phase {raw_phase} is not circularly close to {}",
+                planted[3]);
+            assert!(out.gof.adjrsquare > 0.9999,
+                "{label}: seam-crossing adjusted R² too low: {}", out.gof.adjrsquare);
+        }
     }
 }
