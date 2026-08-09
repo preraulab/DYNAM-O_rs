@@ -14,9 +14,15 @@
 //!
 //! ```text
 //!   rotGauss(x, y, A, ym, ys, xm, xs, t)
-//!     = A * exp( -(((y-ym)*cos(t) + (x-xm)*sin(t)) / ys)^2
-//!                 -((-(y-ym)*sin(t) + (x-xm)*cos(t)) / xs)^2 )
+//!     = A * exp( -0.5 * (((y-ym)*cos(t) + (x-xm)*sin(t)) / ys)^2
+//!                -0.5 * ((-(y-ym)*sin(t) + (x-xm)*cos(t)) / xs)^2 )
 //! ```
+//!
+//! The `-0.5` is what makes `ys` (`fstd`) and `xs` (`pstd`) genuine
+//! standard deviations. The historical form omitted it, so the fitted
+//! widths were `sqrt(2)` times the standard deviation they were named
+//! after. Squaring the denominator alone is not sufficient — the factor
+//! of one half is the part that fixes the units.
 //!
 //! Parameter layout (flat vector, length `6N + 3`):
 //!
@@ -75,7 +81,7 @@ pub fn eval_model(
                 let (s, c) = th.sin_cos();
                 let u = (dy * c + dx * s) / fs;
                 let w = (-dy * s + dx * c) / ps;
-                v += a * (-(u * u) - w * w).exp();
+                v += a * (-0.5 * (u * u + w * w)).exp();
             }
             z[[iy, ix]] = v;
         }
@@ -160,8 +166,6 @@ impl<'a> ResidualsAndJacobian for RotGaussProblem<'a> {
             let (sin_t, cos_t) = th.sin_cos();
             let inv_fs = 1.0 / fs;
             let inv_ps = 1.0 / ps;
-            let two_inv_fs = 2.0 * inv_fs;
-            let two_inv_ps = 2.0 * inv_ps;
             let fs_over_ps_minus = fs * inv_ps - ps * inv_fs;
 
             let (col_a, col_fm, col_fs, col_pm, col_ps, col_t) = unsafe {
@@ -188,15 +192,21 @@ impl<'a> ResidualsAndJacobian for RotGaussProblem<'a> {
                     let dx = self.x_grid[ix] - pm;
                     let u = (dy_c + dx * sin_t) * inv_fs;
                     let w = (-dy_s + dx * cos_t) * inv_ps;
-                    let exp_arg = -(u * u) - w * w;
+                    // Kernel is exp(-1/2 (u^2 + w^2)), so each derivative
+                    // that used to carry the 2 from d/dx exp(-x^2) now
+                    // carries 1. `col_a` is d/d(amp) = kern and keeps its
+                    // form (only its value moves with the exponent), and
+                    // `fs_over_ps_minus` is a ratio in which the width
+                    // rescale cancels, so it is unchanged too.
+                    let exp_arg = -0.5 * (u * u + w * w);
                     let kern = exp_arg.exp();
                     let g = a * kern;
                     col_a[row]  = if a != 0.0 { g / a } else { kern };
-                    col_fm[row] = g * (two_inv_fs * u * cos_t - two_inv_ps * w * sin_t);
-                    col_fs[row] = g * two_inv_fs * u * u;
-                    col_pm[row] = g * (two_inv_fs * u * sin_t + two_inv_ps * w * cos_t);
-                    col_ps[row] = g * two_inv_ps * w * w;
-                    col_t[row]  = 2.0 * g * u * w * fs_over_ps_minus;
+                    col_fm[row] = g * (inv_fs * u * cos_t - inv_ps * w * sin_t);
+                    col_fs[row] = g * inv_fs * u * u;
+                    col_pm[row] = g * (inv_fs * u * sin_t + inv_ps * w * cos_t);
+                    col_ps[row] = g * inv_ps * w * w;
+                    col_t[row]  = g * u * w * fs_over_ps_minus;
                 }
             }
         }
@@ -340,12 +350,60 @@ mod tests {
         let (s, c) = th.sin_cos();
         let u = (dy * c + dx * s) / fs;
         let w = (-dy * s + dx * c) / ps;
-        let expected = a * (-(u * u) - w * w).exp();
+        let expected = a * (-0.5 * (u * u + w * w)).exp();
 
         // Single-mode params + zero background.
         let p = vec![a, fm, fs, pm, ps, th, 0.0, 0.0, 0.0];
         let z = eval_model(&p, 1, &[x], &[y]);
         assert!((z[[0, 0]] - expected).abs() < 1e-14, "z = {}, expected = {}", z[[0, 0]], expected);
+    }
+
+    #[test]
+    fn analytic_jacobian_matches_central_differences() {
+        // The hand-written derivative columns have to move with the kernel:
+        // exp(-1/2 (u² + w²)) turns every factor of 2 that came from
+        // d/dx exp(-x²) into a 1, except in `col_a` (= kern, whose form is
+        // unchanged) and in `fs_over_ps_minus` (a ratio in which the width
+        // rescale cancels). Central differences know only `eval_model`, so
+        // they disagree the moment a column is scaled wrong.
+        let (xg, yg) = make_grid(9, 7);
+        let p = vec![
+            3.0, 1.5,          // amp
+            12.0, 4.0,         // fmean
+            1.8, 0.9,          // fstd
+            10.0, -5.0,        // pmean
+            6.0, 4.0,          // pstd
+            0.3, -0.2,         // theta
+            0.01, 0.02, 0.5,   // xxx, yyy, zzz
+        ];
+        let n_modes = 2;
+        let n_r = xg.len() * yg.len();
+        let z_data = vec![0.0_f64; n_r];
+        let finite_mask = vec![true; n_r];
+        let problem = RotGaussProblem {
+            n_modes, x_grid: &xg, y_grid: &yg,
+            z_data: &z_data, finite_mask: &finite_mask,
+        };
+
+        let n_p = p.len();
+        let mut jac = DMatrix::<f64>::zeros(n_r, n_p);
+        problem.jacobian(&p, &mut jac);
+
+        let mut r_plus  = vec![0.0_f64; n_r];
+        let mut r_minus = vec![0.0_f64; n_r];
+        let mut pert = p.clone();
+        for c in 0..n_p {
+            let h = 1e-6 * p[c].abs().max(1.0);
+            pert[c] = p[c] + h; problem.residuals(&pert, &mut r_plus);
+            pert[c] = p[c] - h; problem.residuals(&pert, &mut r_minus);
+            pert[c] = p[c];
+            for r in 0..n_r {
+                let fd = (r_plus[r] - r_minus[r]) / (2.0 * h);
+                assert!((jac[(r, c)] - fd).abs() < 1e-6,
+                    "param {}, residual {}: analytic {} vs central-diff {}",
+                    c, r, jac[(r, c)], fd);
+            }
+        }
     }
 
     #[test]
