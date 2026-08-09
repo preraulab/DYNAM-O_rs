@@ -816,10 +816,11 @@ mod python {
     /// The kernel is
     /// `amp * exp(-0.5*(u/fstd)^2 - 0.5*(v/pstd)^2)`, so `fstd` and `pstd`
     /// are standard deviations — not variances, and not the `sqrt(2)`-
-    /// inflated widths this function used before 0.2.0. Seeds, bounds and
-    /// returned values in columns 2 and 4 all shrank by `sqrt(2)` at 0.2.0;
-    /// the signature did not change, so old callers keep working and
-    /// silently describe a window `sqrt(2)` too wide.
+    /// inflated widths this function used before 0.2.0. To preserve an old
+    /// modeled surface or bound window, divide stored pre-0.2.0 widths in
+    /// columns 2 and 4 by `sqrt(2)`. Fresh seeds and priors already expressed
+    /// as standard deviations keep their numeric values. The signature did
+    /// not change, and this function applies no conversion at its boundary.
     #[pyfunction]
     #[pyo3(signature = (soph, x_grid, y_grid, initial, lower, upper,
                         bg_initial, bg_lower, bg_upper, max_iters=0))]
@@ -868,13 +869,15 @@ mod python {
     ///
     /// The kernel is `amp * exp(-0.5*(dy/fstd)^2) *
     /// exp(k*(cos(dx) - 1))`, `k = 1/recikappa^2`, so both widths are
-    /// standard deviations — but only `fstd` (column 2) moved at 0.2.0,
-    /// where it shrank by `sqrt(2)` and, before that, stopped being
-    /// variance-like. `recikappa` (column 4) is unchanged and must NOT be
-    /// rescaled: the von Mises factor is its own small-angle Gaussian and
-    /// carries the half intrinsically. Column 4 is `pstd` for
-    /// `fit_rotgauss` and `recikappa` here, so any migration driven by
-    /// column index rather than by kernel corrupts every phase fit.
+    /// standard deviations. To preserve an old modeled surface or bound
+    /// window, divide stored pre-0.2.0 `fstd` values by `sqrt(2)`; fresh seeds
+    /// and priors already expressed as standard deviations keep their numeric
+    /// values. `recikappa` (column 4) is unchanged and must NOT be rescaled:
+    /// the von Mises factor is its own small-angle Gaussian and carries the
+    /// half intrinsically. Column 4 is `pstd` for `fit_rotgauss` and
+    /// `recikappa` here, so any migration driven by column index rather than
+    /// by kernel corrupts every phase fit. This function applies no conversion
+    /// at its boundary.
     #[pyfunction]
     #[pyo3(signature = (soph, x_grid, y_grid, initial, lower, upper,
                         bg_initial, bg_lower, bg_upper, max_iters=0, unit_row=true))]
