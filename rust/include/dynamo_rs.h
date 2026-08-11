@@ -8,6 +8,24 @@
 #include <stdint.h>
 
 /**
+ * C ABI version. The ABI contract is **additive-only**: new symbols and
+ * new `#define`s may appear, but existing signatures, struct layouts,
+ * and enum values never change under the same value. Bump this on any
+ * breaking change. Numeric-semantics changes that keep the ABI stable
+ * (e.g. the 0.2.0 width reparameterization) do NOT bump this — they
+ * bump the crate semver, which callers observe via [`dynamo_version`].
+ */
+#define DYNAMO_C_ABI_VERSION 1
+
+/**
+ * Stats-CSV schema version written by this crate (OUTPUT_FORMAT.md §8.2):
+ * format 3 = the 14-column layout below plus the `#` provenance preamble.
+ * Format 2 was the same columns bare; format 1 was the 16-column layout
+ * with the redundant `bbox_width_s`/`bbox_height_Hz`.
+ */
+#define STATS_CSV_FORMAT 3
+
+/**
  * Input descriptor for [`dynamo_extract_tfpeaks`].
  *
  * All array pointers point to row-major C layout: the spectrogram is
@@ -410,6 +428,21 @@ typedef struct ParamFitOutFFI {
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
+
+/**
+ * Runtime accessor for [`DYNAMO_C_ABI_VERSION`], for `dlopen` /
+ * `loadlibrary` consumers that cannot see the compile-time constant.
+ */
+uint32_t dynamo_c_abi_version(void);
+
+/**
+ * The kernel build identity as a NUL-terminated static string in the
+ * DYNAM-O provenance grammar `<semver>+<sha12>[.dirty]` (or
+ * `<semver>+unknown`). This is the `kernel_version` every consumer
+ * (MEX bridge, PyO3, app/CLI) should record next to its outputs. The
+ * pointer is `'static` — callers must NOT free it.
+ */
+const char *dynamo_version(void);
 
 /**
  * Run the full tf-peak extraction pipeline on a single segment spectrogram.

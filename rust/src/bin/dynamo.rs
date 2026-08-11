@@ -145,7 +145,15 @@ fn run_extract(args: ExtractArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("extracted {} peaks in {:.1}s", peaks.len(), t0.elapsed().as_secs_f64());
 
-    write_stats_csv(&peaks, &args.out)?;
+    // Defaults match `OutputOpts` at fs=100 (time at 8 sig figs covers
+    // recordings up to ~28 h with sub-sample precision).
+    let prec = dynamo_rs::pipeline::StatsCsvPrecision::default();
+    let prov = dynamo_rs::pipeline::StatsCsvProvenance {
+        writer: "dynamo-rs-bin",
+        writer_version: dynamo_rs::build_info::VERSION,
+        subject_id: None,
+    };
+    write_stats_csv(&peaks, &[], &[], &[], prec, Some(&prov), &args.out)?;
     eprintln!("wrote {}", args.out.display());
 
     if let Some(lab_path) = &args.labels_out {

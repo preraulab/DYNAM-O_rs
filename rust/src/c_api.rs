@@ -32,10 +32,37 @@
 //! errors. We never return positive codes.
 
 use ndarray::{ArrayView1, ArrayView2};
-use std::os::raw::c_int;
+use std::os::raw::{c_char, c_int};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::NonNull;
 use std::slice;
+
+/// C ABI version. The ABI contract is **additive-only**: new symbols and
+/// new `#define`s may appear, but existing signatures, struct layouts,
+/// and enum values never change under the same value. Bump this on any
+/// breaking change. Numeric-semantics changes that keep the ABI stable
+/// (e.g. the 0.2.0 width reparameterization) do NOT bump this — they
+/// bump the crate semver, which callers observe via [`dynamo_version`].
+pub const DYNAMO_C_ABI_VERSION: u32 = 1;
+
+/// Runtime accessor for [`DYNAMO_C_ABI_VERSION`], for `dlopen` /
+/// `loadlibrary` consumers that cannot see the compile-time constant.
+#[no_mangle]
+pub extern "C" fn dynamo_c_abi_version() -> u32 {
+    DYNAMO_C_ABI_VERSION
+}
+
+/// The kernel build identity as a NUL-terminated static string in the
+/// DYNAM-O provenance grammar `<semver>+<sha12>[.dirty]` (or
+/// `<semver>+unknown`). This is the `kernel_version` every consumer
+/// (MEX bridge, PyO3, app/CLI) should record next to its outputs. The
+/// pointer is `'static` — callers must NOT free it.
+#[no_mangle]
+pub extern "C" fn dynamo_version() -> *const c_char {
+    static VERSION_CSTR: &str =
+        concat!(env!("CARGO_PKG_VERSION"), "+", env!("DYNAMO_GIT_SHA"), "\0");
+    VERSION_CSTR.as_ptr() as *const c_char
+}
 
 /// Status/error codes for the C ABI. All non-zero values are negative.
 #[repr(i32)]
@@ -2012,6 +2039,18 @@ pub unsafe extern "C" fn dynamo_vmgauss_fit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `dynamo_version()` must return a NUL-terminated static matching
+    /// `build_info::VERSION` exactly, and the ABI accessor must agree
+    /// with the compile-time constant.
+    #[test]
+    fn version_symbols_are_consistent() {
+        assert_eq!(dynamo_c_abi_version(), DYNAMO_C_ABI_VERSION);
+        let ptr = dynamo_version();
+        assert!(!ptr.is_null());
+        let s = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap();
+        assert_eq!(s, crate::build_info::VERSION);
+    }
 
     #[test]
     fn free_buffer_lifecycle_f64() {

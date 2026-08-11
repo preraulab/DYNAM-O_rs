@@ -18,6 +18,7 @@
 pub mod adjacency;
 pub mod artifacts;
 pub mod baseline;
+pub mod build_info;
 pub mod c_api;
 pub mod extract_pipeline;
 pub mod filter_cache;
@@ -1117,6 +1118,27 @@ mod python {
         m.add_function(wrap_pyfunction!(fit_rotgauss, m)?)?;
         m.add_function(wrap_pyfunction!(fit_vmgauss, m)?)?;
         m.add_function(wrap_pyfunction!(fit_tensor_product_spline, m)?)?;
+        m.add_function(wrap_pyfunction!(build_info_py, m)?)?;
+        m.add("__version__", env!("CARGO_PKG_VERSION"))?;
         Ok(())
+    }
+
+    /// Build identity of the compiled kernel, for provenance stamping
+    /// (`kernel_version`, DesktopApp OUTPUT_FORMAT.md §8.1).
+    ///
+    /// Returns `{"version": semver, "git_sha": sha12[.dirty]|unknown,
+    /// "dirty": bool, "build_info": "<semver>+<sha>[.dirty]"}`. Unlike the
+    /// dist metadata (`importlib.metadata.version`), this reflects the
+    /// compiled extension module itself.
+    #[pyfunction]
+    #[pyo3(name = "build_info")]
+    fn build_info_py(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
+        let dict = pyo3::types::PyDict::new_bound(py);
+        let sha = env!("DYNAMO_GIT_SHA");
+        dict.set_item("version", env!("CARGO_PKG_VERSION"))?;
+        dict.set_item("git_sha", sha)?;
+        dict.set_item("dirty", sha.ends_with(".dirty"))?;
+        dict.set_item("build_info", crate::build_info::VERSION)?;
+        Ok(dict)
     }
 }
