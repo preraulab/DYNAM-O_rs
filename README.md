@@ -230,8 +230,10 @@ change. It is not a general-purpose DYNAM-O command-line tool, and is not
 what you want for running a study.
 
 **Scope: one subcommand, `extract`.** It takes a *pre-computed* multitaper
-spectrogram as three `.npy` files and writes a peak stats CSV with the same
-columns as MATLAB's `stats_table`:
+spectrogram as three `.npy` files and writes the canonical DYNAM-O stats
+CSV (14 columns plus a `#` provenance preamble — the format every DYNAM-O
+implementation reads and writes; spec: the DesktopApp's
+`documents/OUTPUT_FORMAT.md` §2.1 and §8):
 
 ```bash
 cd rust
