@@ -143,6 +143,7 @@ rust/
     mask.rs               # pass-2 spectrogram masking
     refine.rs             # Hann-window peak-frequency refinement
     histogram.rs          # SO-power / SO-phase 2D histogram accumulator
+                          #   (the "SOPHs" in the MATLAB/Python/app front ends)
     baseline.rs           # percentile-based baseline + build_baseline_exclude helper
     so_power.rs           # SO-power time-series pipeline (post-MTS)
     so_phase.rs           # SO-phase time-series (filter+hilbert+unwrap)
@@ -150,6 +151,9 @@ rust/
     artifacts.rs          # two-band artifact detection (HF + BB, robust z-score)
     mts.rs                # thin wrapper around `multitaper_rs` crate
     signal.rs             # sosfiltfilt, hilbert, unwrap, movmean
+    paramfit/             # rotGauss + vmGauss LM fits — the front ends'
+                          #   "paramfit" / parametric-basis columns
+    spline_basis.rs       # tensor-product B-spline fit ("splinefit")
     filter_cache.rs       # SOphase SOS cache (.npy) + cheby1 fallback
     filter_design.rs      # cheby1_sos (ported from scipy.signal.cheby1)
     adjacency.rs          # region adjacency utilities
@@ -230,8 +234,10 @@ change. It is not a general-purpose DYNAM-O command-line tool, and is not
 what you want for running a study.
 
 **Scope: one subcommand, `extract`.** It takes a *pre-computed* multitaper
-spectrogram as three `.npy` files and writes a peak stats CSV with the same
-columns as MATLAB's `stats_table`:
+spectrogram as three `.npy` files and writes the canonical DYNAM-O stats
+CSV (14 columns plus a `#` provenance preamble — the format every DYNAM-O
+implementation reads and writes; spec: the DesktopApp's
+`documents/OUTPUT_FORMAT.md` §2.1 and §8):
 
 ```bash
 cd rust
@@ -241,6 +247,19 @@ cargo build --release --locked --bin dynamo
     --stimes stimes.npy \
     --sfreqs sfreqs.npy \
     --out    stats.csv
+```
+
+`dynamo --version` prints the build identity; the same string lands in
+the CSV's preamble as `kernel_version`, so a stats file from a parity
+bisect is always attributable to an exact kernel build:
+
+```text
+# DYNAM-O stats table
+# format: 3
+# writer: dynamo-rs-bin
+# writer_version: 0.2.1+<sha12>
+# kernel_version: 0.2.1+<sha12>
+PeakTime,PeakFrequency,...
 ```
 
 **It does not read EDFs**, compute the spectrogram, subtract a baseline,

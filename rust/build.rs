@@ -10,6 +10,8 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../data_matlab_filters");
 
+    emit_git_sha();
+
     let crate_dir = match std::env::var("CARGO_MANIFEST_DIR") {
         Ok(v) => v,
         Err(_) => return,
@@ -55,6 +57,35 @@ fn main() {
             println!("cargo:warning=cbindgen failed: {e}");
         }
     }
+}
+
+/// Embed the git commit as `DYNAMO_GIT_SHA` so `build_info::VERSION` ties
+/// every kernel build to an exact source state (grammar:
+/// `<semver>+<sha12>[.dirty]`, DesktopApp OUTPUT_FORMAT.md §8.1). Fail-soft
+/// to `unknown` when git metadata is unavailable (source tarball builds).
+fn emit_git_sha() {
+    let sha = git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    let dirty = git(&["status", "--porcelain", "--untracked-files=no"])
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let ver = if dirty { format!("{sha}.dirty") } else { sha };
+    println!("cargo:rustc-env=DYNAMO_GIT_SHA={ver}");
+
+    // Re-run when HEAD moves (commit / pull / checkout); logs/HEAD is appended
+    // on every HEAD update, so it catches new commits on the same branch.
+    for p in ["logs/HEAD", "HEAD"] {
+        if let Some(path) = git(&["rev-parse", "--git-path", p]) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+}
+
+fn git(args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git").args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 fn stage_filter_cache(crate_dir: &std::path::Path) {

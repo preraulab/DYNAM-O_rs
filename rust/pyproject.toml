@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "dynamo_rs"
-version = "0.2.0"
+version = "0.2.1"
 description = "Rust kernel for the DYNAM-O region-merging inner loop"
 requires-python = ">=3.8"
 classifiers = [
