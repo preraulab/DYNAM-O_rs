@@ -37,7 +37,9 @@ use std::collections::{HashMap, VecDeque};
 /// boundary pixel of peak i (8-connectivity perimeter, in physical units).
 /// `height_data[i]` is the spectrogram values at every interior pixel of
 /// peak i, in MATLAB regionprops column-major order (bit-comparable across
-/// backends). `peakiness = 10*log10(Area·Height/Volume)` (dB).
+/// backends). `peakiness = N/(N-1) * (max - mean) / (max - min)` of the
+/// region's N pixels, unitless in [0, 1] (0 = flat plateau, 1 = spike;
+/// the N/(N-1) small-sample factor makes a spike score exactly 1).
 ///
 /// `boundaries_xy[i]` is the perimeter in **clockwise traversal order**
 /// (Moore-neighbor trace). This deliberately diverges from MATLAB's pure
@@ -57,7 +59,7 @@ pub struct SegmentPeaks {
     pub segment_num: Vec<f64>,
     pub bbox: Vec<f64>, // 4 * n (t_tl, f_tl, width_s, height_Hz) in pydynamo format
     pub area: Vec<f64>, // sec*Hz per peak (pixel_count * d_time * d_freq)
-    pub peakiness: Vec<f64>, // 10*log10(area * height / volume), dB
+    pub peakiness: Vec<f64>, // N/(N-1) * (max - mean) / (max - min) of region pixels, [0, 1]
     pub height_data: Vec<Vec<f64>>, // pixel values per peak (interior, NaN-excluded)
     pub boundaries_xy: Vec<Vec<f64>>, // interleaved (t, f) pairs per peak
 }
@@ -480,11 +482,19 @@ fn compute_peak_props_from_trim(
         let height = a.max_v - a.min_v;
         let volume = a.sum_v * d_time * d_freq;
         let area = (a.pixel_count as f64) * d_time * d_freq;
-        // peakiness = 10*log10(Area·Height/Volume), in dB. Pre-baseline-divided
-        // spectrogram pixels are positive in practice; degenerate regions
-        // (height=0 → log10(0) = -∞, or volume=0 → log10(±∞) = ±∞) propagate
-        // their sentinel so downstream filters can decide.
-        let peakiness = 10.0 * (area * height / volume).log10();
+        // peakiness = N/(N-1) * (max - mean) / (max - min) of the region's
+        // N pixels, in [0, 1]. The N/(N-1) factor is a small-sample
+        // correction: a single-pixel spike has mean = min + (max-min)/N,
+        // so the raw ratio caps at 1 - 1/N; corrected, a spike scores
+        // exactly 1 for every region size. 0 = flat plateau (asymptotic;
+        // floor 1/(N-1)). Affine-invariant (gain and additive pedestal
+        // both cancel; requires NaN masking, never 0). Degenerate flat
+        // regions (max == min) give 0/0 = NaN (N = 1 gives inf * NaN =
+        // NaN), propagated so downstream consumers can decide.
+        let n_px = a.pixel_count as f64;
+        let mean_v = a.sum_v / n_px;
+        let peakiness =
+            (n_px / (n_px - 1.0)) * (a.max_v - mean_v) / (a.max_v - a.min_v);
         // BoundingBox in pydynamo format: (time_tl, freq_tl, width_s, height_Hz).
         let t_tl = (a.c_min as f64) * d_time + t0;
         let f_tl = (a.r_min as f64) * d_freq + f0;
@@ -1025,7 +1035,7 @@ mod tests {
         p.segment_num.push(1.0);
         p.bbox.extend_from_slice(&[0.0, 0.0, 0.0, 0.0]);
         p.area.push(5.0);
-        p.peakiness.push(10.0 * (5.0_f64 * 100.0 / 1.0).log10()); // 10*log10(area * height / volume), dB
+        p.peakiness.push(0.5); // (max - mean) / (max - min), unitless [0, 1]
         p.height_data.push(vec![1.0, 2.0]);
         p.boundaries_xy.push(vec![0.0, 10.0]);
         let params = ExtractParams {
