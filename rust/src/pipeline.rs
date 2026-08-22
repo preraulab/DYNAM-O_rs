@@ -67,7 +67,8 @@ pub fn default_extract_params() -> ExtractParams {
 /// data rows identical either way). Column layout mirrors the MATLAB
 /// `stats_table` (PeakTime, PeakFrequency, Duration, Bandwidth, Height,
 /// Volume, SegmentNum, Area, Peakiness — where Peakiness =
-/// 10*log10(Area·Height/Volume), in dB — bbox_tl_s, bbox_tl_Hz), with two
+/// N/(N−1)·(max − mean)/(max − min) of region pixels, unitless in
+/// [0, 1] — bbox_tl_s, bbox_tl_Hz), with two
 /// deliberate omissions from MATLAB's set: the bbox extent columns
 /// `bbox_width_s` / `bbox_height_Hz` are dropped because they are identical
 /// to `Duration` / `Bandwidth` (same `n_pixels * bin size`), so only the
