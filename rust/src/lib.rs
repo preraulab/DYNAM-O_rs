@@ -38,6 +38,7 @@ pub mod paramfit;
 pub mod so_phase;
 pub mod so_power;
 pub mod spline_basis;
+pub mod stats;
 pub mod trim;
 
 #[cfg(feature = "python")]
@@ -1091,6 +1092,123 @@ mod python {
         Ok(dict)
     }
 
+    // ───────────────────────────────── group-comparison statistics
+    //
+    // Thin wrappers over `crate::stats`, so pydynamo runs the same code
+    // the desktop app and CLI do. Shapes are flat `(n_bins * n_trials)`
+    // row-major with `n_bins` given separately; the Python layer owns
+    // reshaping, which keeps 1-D and 2-D (SOPH) callers on one binding.
+
+    /// fdr_grid(g1, g2, n_bins, q=0.05, method="dep", paired=False)
+    ///
+    /// Returns `(p_values, p_adj, sigbins, crit_p, m)`. Port of
+    /// `FDR_1D.m` / `FDR_2D.m`; missing data is dropped, never imputed,
+    /// and untestable bins return NaN and stay out of the FDR family.
+    #[pyfunction]
+    #[pyo3(signature = (g1, g2, n_bins, q=0.05, method="dep", paired=false))]
+    fn fdr_grid<'py>(
+        py: Python<'py>,
+        g1: PyReadonlyArray1<'py, f64>,
+        g2: PyReadonlyArray1<'py, f64>,
+        n_bins: usize,
+        q: f64,
+        method: &str,
+        paired: bool,
+    ) -> PyResult<(
+        Bound<'py, numpy::PyArray1<f64>>,
+        Bound<'py, numpy::PyArray1<f64>>,
+        Bound<'py, numpy::PyArray1<bool>>,
+        f64,
+        usize,
+    )> {
+        use crate::stats::{fdr, fdr_grid as fg};
+        let meth = fdr::Method::parse(method).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown FDR method '{}' (want dep/dependent or pdep/independent)",
+                method
+            ))
+        })?;
+        let test = fg::Test::from_matlab_flags(true, paired)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        let r = fg::fdr_grid(
+            g1.as_slice()?,
+            g2.as_slice()?,
+            n_bins,
+            q,
+            meth,
+            test,
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        Ok((
+            r.p_values.into_pyarray_bound(py),
+            r.p_adj.into_pyarray_bound(py),
+            ndarray::Array1::from(r.sigbins).into_pyarray_bound(py),
+            r.crit_p,
+            r.m,
+        ))
+    }
+
+    /// fdr_adjust(pvals, q=0.05, method="dep") -> (p_adj, crit_p, m)
+    ///
+    /// The bare Benjamini–Hochberg / Benjamini–Yekutieli step, for
+    /// callers that already have p-values.
+    #[pyfunction]
+    #[pyo3(signature = (pvals, q=0.05, method="dep"))]
+    fn fdr_adjust<'py>(
+        py: Python<'py>,
+        pvals: PyReadonlyArray1<'py, f64>,
+        q: f64,
+        method: &str,
+    ) -> PyResult<(Bound<'py, numpy::PyArray1<f64>>, f64, usize)> {
+        use crate::stats::fdr;
+        let meth = fdr::Method::parse(method).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!("unknown FDR method '{}'", method))
+        })?;
+        let r = fdr::adjust(pvals.as_slice()?, q, meth);
+        Ok((r.p_adj.into_pyarray_bound(py), r.crit_p, r.m))
+    }
+
+    /// gpermtest(g1, g2, n_bins, alpha=0.05, iterations=10000, seed=0)
+    ///
+    /// Returns `(sigbins, acceptance_bounds, true_stat, n_excluded,
+    /// warning)`. Port of `gpermtest.m` / `gpermtest2.m`: family-wise
+    /// control by the max statistic. `warning` is None or a string the
+    /// caller should surface.
+    #[pyfunction]
+    #[pyo3(signature = (g1, g2, n_bins, alpha=0.05, iterations=10000, seed=0))]
+    fn gpermtest<'py>(
+        py: Python<'py>,
+        g1: PyReadonlyArray1<'py, f64>,
+        g2: PyReadonlyArray1<'py, f64>,
+        n_bins: usize,
+        alpha: f64,
+        iterations: usize,
+        seed: u64,
+    ) -> PyResult<(
+        Bound<'py, numpy::PyArray1<bool>>,
+        Bound<'py, numpy::PyArray1<f64>>,
+        Bound<'py, numpy::PyArray1<f64>>,
+        usize,
+        Option<String>,
+    )> {
+        let r = crate::stats::permtest::gpermtest(
+            g1.as_slice()?,
+            g2.as_slice()?,
+            n_bins,
+            alpha,
+            iterations,
+            seed,
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        Ok((
+            ndarray::Array1::from(r.sigbins).into_pyarray_bound(py),
+            r.acceptance_bounds.into_pyarray_bound(py),
+            r.true_stat.into_pyarray_bound(py),
+            r.n_excluded,
+            r.warning,
+        ))
+    }
+
     #[pymodule]
     fn dynamo_rs(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(merge_segment, m)?)?;
@@ -1119,6 +1237,9 @@ mod python {
         m.add_function(wrap_pyfunction!(fit_vmgauss, m)?)?;
         m.add_function(wrap_pyfunction!(fit_tensor_product_spline, m)?)?;
         m.add_function(wrap_pyfunction!(build_info_py, m)?)?;
+        m.add_function(wrap_pyfunction!(fdr_grid, m)?)?;
+        m.add_function(wrap_pyfunction!(fdr_adjust, m)?)?;
+        m.add_function(wrap_pyfunction!(gpermtest, m)?)?;
         m.add("__version__", env!("CARGO_PKG_VERSION"))?;
         Ok(())
     }
