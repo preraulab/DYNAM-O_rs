@@ -21,6 +21,7 @@ python = ["dep:pyo3", "dep:numpy"]
 parallel = ["dep:rayon", "ndarray/rayon"]
 
 [dependencies]
+flate2 = "1"
 ndarray = { version = "0.16", default-features = false }
 ndarray-npy = "0.9"
 rayon = { version = "1", optional = true }
