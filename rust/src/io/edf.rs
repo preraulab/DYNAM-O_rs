@@ -259,9 +259,16 @@ pub fn read_signal_headers<R: Read>(f: &mut R, nsig: usize) -> Result<Vec<Signal
     let mut sh = vec![SignalHeader::default(); nsig];
     let mut off = 0;
 
-    // 16-char labels
-    for s in sh.iter_mut() {
+    // 16-char labels. Some exports leave every label blank — give those
+    // signals deterministic positional names (`ch1`, `ch2`, …) so the
+    // rest of the stack (label pickers, channel expressions, run-time
+    // selection) can address them: the same synthesis runs on every
+    // read, so `ch3` always resolves to the third signal of that file.
+    for (i, s) in sh.iter_mut().enumerate() {
         s.signal_labels = trim_edf(&block[off..off + 16]);
+        if s.signal_labels.is_empty() {
+            s.signal_labels = format!("ch{}", i + 1);
+        }
         off += 16;
     }
     // 80-char transducer
@@ -1199,5 +1206,32 @@ mod select_refs_tests {
         let msg = format!("{}", err);
         assert!(msg.contains("M2"), "{msg}");
         assert!(msg.contains("reference not available"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod blank_label_tests {
+    use super::*;
+
+    #[test]
+    fn blank_signal_labels_get_positional_names() {
+        // One 256-byte signal-header block with an all-space label field:
+        // the reader must synthesize "ch1" so the signal stays addressable.
+        let mut block = vec![b' '; 256];
+        // samples_in_record field (8 chars) sits at offset 16+80+8+8+8+8+8+80 = 216.
+        block[216..224].copy_from_slice(b"200     ");
+        let mut cur = std::io::Cursor::new(block);
+        let sh = read_signal_headers(&mut cur, 1).unwrap();
+        assert_eq!(sh[0].signal_labels, "ch1");
+        assert_eq!(sh[0].samples_in_record, 200);
+    }
+
+    #[test]
+    fn real_labels_are_untouched() {
+        let mut block = vec![b' '; 256];
+        block[0..3].copy_from_slice(b"CA ");
+        let mut cur = std::io::Cursor::new(block);
+        let sh = read_signal_headers(&mut cur, 1).unwrap();
+        assert_eq!(sh[0].signal_labels, "CA");
     }
 }
