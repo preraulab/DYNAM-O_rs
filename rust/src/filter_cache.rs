@@ -1,6 +1,6 @@
 //! SOphase SOS filter cache loader + in-memory fallback design.
 //!
-//! The cache is the 42 `sophase_sos_Fs{fs}_{lo}_{hi}.npy` files shipped in
+//! The cache is the 48 `sophase_sos_Fs{fs}_{lo}_{hi}.npy` files shipped in
 //! `data_matlab_filters/` at the repo root. They were exported from MATLAB's
 //! `designfilt('bandpassiir', ...)` and are treated as the canonical
 //! coefficients for pydynamo/MATLAB bit-equivalence.

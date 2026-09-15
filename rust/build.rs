@@ -114,8 +114,8 @@ fn stage_filter_cache(crate_dir: &std::path::Path) {
     entries.sort_by_key(std::fs::DirEntry::file_name);
     assert_eq!(
         entries.len(),
-        42,
-        "expected 42 .npy filter-cache files in {}; found {}",
+        48,
+        "expected 48 .npy filter-cache files in {}; found {}",
         source_dir.display(),
         entries.len()
     );
