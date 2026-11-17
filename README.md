@@ -257,8 +257,8 @@ bisect is always attributable to an exact kernel build:
 # DYNAM-O stats table
 # format: 3
 # writer: dynamo-rs-bin
-# writer_version: 0.2.1+<sha12>
-# kernel_version: 0.2.1+<sha12>
+# writer_version: 0.2.2+<sha12>
+# kernel_version: 0.2.2+<sha12>
 PeakTime,PeakFrequency,...
 ```
 
