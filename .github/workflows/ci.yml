@@ -1,0 +1,35 @@
+name: CI
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Rust build + test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      # rust/rust-toolchain.toml selects the toolchain. rustup installs it
+      # on the first cargo call.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # --locked: fail when Cargo.lock is out of date, so the committed
+      # lockfile is the one the MATLAB and Python release builds use.
+      - name: cargo test
+        working-directory: rust
+        run: cargo test --locked
+      - name: Python bindings type-check
+        working-directory: rust
+        run: cargo check --locked --features python
+      - name: Build contract tests
+        run: |
+          python3 scripts/test_build_contracts.py
+          python3 scripts/test_sanitize_maturin_sbom.py
