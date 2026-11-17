@@ -19,6 +19,13 @@ pub struct Region {
     pub label: i32,
     pub interior: Vec<u32>,
     pub border: Vec<u32>,
+    /// MATLAB `Ldata2graph`'s `rgn{}` = `interior ∪ border`, carried
+    /// through merges by *union* (`mergeRegions`: `regions{a}=unique([…])`).
+    /// Unlike `border` (kept as a symmetric difference for edge weights),
+    /// `all_px` accumulates every pixel — including the now-interior
+    /// 0-lines between absorbed sub-regions — so the cut / trim / stats
+    /// see a solid region, exactly as `extracthistpeaks.m` does.
+    pub all_px: Vec<u32>,
     pub neighbors: BTreeSet<i32>,
 }
 
@@ -68,6 +75,7 @@ impl Graph {
                     label: lab,
                     interior: Vec::with_capacity(c as usize),
                     border: Vec::new(),
+                    all_px: Vec::new(),
                     neighbors: BTreeSet::new(),
                 }));
                 label_to_slot.insert(lab, slot);
@@ -92,140 +100,83 @@ impl Graph {
         g
     }
 
-    /// Per region:
-    /// - `border` = all zero-labeled pixels in the 3×3 (8-connected) dilation of the region.
-    /// - `neighbors` = all region-labels found in the 5×5 (2-pixel) dilation
-    ///   of the region, excluding 0 and the region itself.
+    /// Per region (mirrors MATLAB `Ldata2graph.m`):
+    /// - `border` = every pixel 8-adjacent to the region whose label differs
+    ///   from the region's own label — i.e. the `conv2(sub_img,[1 1 1;1 -8
+    ///   1;1 1 1])>0` rim, which is *all* non-self pixels around the region
+    ///   (watershed-0-line pixels AND pixels of other regions). MATLAB then
+    ///   redefines `rgn{} = interior ∪ border`.
+    /// - `neighbors` = every other region label appearing within a 2-pixel
+    ///   (Chebyshev) dilation of the region — MATLAB's 5×5 `H_dilate`,
+    ///   excluding 0 and the region itself.
     fn fill_borders_and_neighbors(&mut self, raw: &[i64], h: usize, w: usize) {
-        // Do it efficiently: scan the image once, and for each pixel p with
-        // label>0, look at its 8-neighbors; if any neighbor is 0, mark that
-        // neighbor as border of p's region, and look one more step out for
-        // labeled neighbors (which become 'neighbors' of p's region).
-        // This is equivalent to a per-region 3×3 dilation intersected with
-        // the zero mask plus a 5×5 dilation.
-        //
-        // We use a two-pass approach:
-        //   Pass A: for each 0-pixel, find all labeled neighbors (8-conn).
-        //           → every such labeled neighbor gets this 0-pixel as a border.
-        //           → all distinct labeled neighbors of this 0-pixel become
-        //             mutual neighbors (separated by a 1-pixel wide border).
-        //   Pass B (optional): also bridge labels separated by TWO 0-pixels
-        //           (MATLAB uses dilation distance=2). In practice the
-        //           watershed 0-line is 1-px wide, so Pass A covers it.
-        //
-        // Additionally mark any region-pixel adjacent to a non-equal labeled
-        // pixel as a neighbor (no watershed line between them).
         for y in 0..h {
             for x in 0..w {
-                let idx = y * w + x;
-                let v = raw[idx] as i32;
-                // 8-neighbor offsets
-                // Scan neighbors once; actions depend on center value.
-                // We only need unique labels touching this pixel.
-                if v == 0 {
-                    // border pixel — collect the set of labeled neighbors
-                    let mut seen: [i32; 8] = [0; 8];
-                    let mut n_seen = 0usize;
-                    for dy in -1i32..=1 {
-                        for dx in -1i32..=1 {
-                            if dx == 0 && dy == 0 {
-                                continue;
-                            }
-                            let ny = y as i32 + dy;
-                            let nx = x as i32 + dx;
-                            if ny < 0 || nx < 0 || ny >= h as i32 || nx >= w as i32 {
-                                continue;
-                            }
-                            let nidx = (ny as usize) * w + (nx as usize);
-                            let nv = raw[nidx] as i32;
-                            if nv > 0 {
-                                // dedupe in the 8-slot array
-                                let mut found = false;
-                                for k in 0..n_seen {
-                                    if seen[k] == nv {
-                                        found = true;
-                                        break;
-                                    }
-                                }
-                                if !found {
-                                    seen[n_seen] = nv;
-                                    n_seen += 1;
-                                }
-                            }
+                let v = raw[y * w + x] as i32;
+                if v <= 0 {
+                    continue;
+                }
+                let slot = match self.label_to_slot.get(&v).copied() {
+                    Some(s) => s,
+                    None => continue,
+                };
+                // 8-neighbour rim → border pixels of region v (any label ≠ v).
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        let ny = y as i32 + dy;
+                        let nx = x as i32 + dx;
+                        if ny < 0 || nx < 0 || ny >= h as i32 || nx >= w as i32 {
+                            continue;
+                        }
+                        let nidx = (ny as usize) * w + (nx as usize);
+                        if raw[nidx] as i32 != v {
+                            self.regions[slot].as_mut().unwrap().border.push(nidx as u32);
                         }
                     }
-                    // For every labeled neighbor, this 0-pixel is its border.
-                    for i in 0..n_seen {
-                        let a = seen[i];
-                        if let Some(slot) = self.label_to_slot.get(&a).copied() {
-                            if let Some(r) = self.regions[slot].as_mut() {
-                                r.border.push(idx as u32);
-                            }
+                }
+                // 5×5 (2-pixel Chebyshev) dilation → neighbour region labels.
+                for dy in -2i32..=2 {
+                    for dx in -2i32..=2 {
+                        if dx == 0 && dy == 0 {
+                            continue;
                         }
-                    }
-                    // And every pair of distinct labeled neighbors of this
-                    // 0-pixel are graph-neighbors.
-                    for i in 0..n_seen {
-                        for j in (i + 1)..n_seen {
-                            let (a, b) = (seen[i], seen[j]);
-                            if a == b {
-                                continue;
-                            }
-                            if let (Some(&sa), Some(&sb)) = (
-                                self.label_to_slot.get(&a),
-                                self.label_to_slot.get(&b),
-                            ) {
-                                if let Some(r) = self.regions[sa].as_mut() {
-                                    r.neighbors.insert(b);
-                                }
-                                if let Some(r) = self.regions[sb].as_mut() {
-                                    r.neighbors.insert(a);
-                                }
-                                let _ = (sa, sb);
-                            }
+                        let ny = y as i32 + dy;
+                        let nx = x as i32 + dx;
+                        if ny < 0 || nx < 0 || ny >= h as i32 || nx >= w as i32 {
+                            continue;
                         }
-                    }
-                } else {
-                    // labeled pixel: check for labeled neighbors with DIFFERENT
-                    // label (regions abutting without watershed line between)
-                    for dy in -1i32..=1 {
-                        for dx in -1i32..=1 {
-                            if dx == 0 && dy == 0 {
-                                continue;
-                            }
-                            let ny = y as i32 + dy;
-                            let nx = x as i32 + dx;
-                            if ny < 0 || nx < 0 || ny >= h as i32 || nx >= w as i32 {
-                                continue;
-                            }
-                            let nv = raw[(ny as usize) * w + (nx as usize)] as i32;
-                            if nv > 0 && nv != v {
-                                if let (Some(&sa), Some(&sb)) = (
-                                    self.label_to_slot.get(&v),
-                                    self.label_to_slot.get(&nv),
-                                ) {
-                                    if let Some(r) = self.regions[sa].as_mut() {
-                                        r.neighbors.insert(nv);
-                                    }
-                                    if let Some(r) = self.regions[sb].as_mut() {
-                                        r.neighbors.insert(v);
-                                    }
-                                    let _ = (sa, sb);
-                                }
-                            }
+                        let nv = raw[(ny as usize) * w + (nx as usize)] as i32;
+                        if nv > 0 && nv != v {
+                            self.regions[slot].as_mut().unwrap().neighbors.insert(nv);
                         }
                     }
                 }
             }
         }
 
-        // Dedupe / sort borders (pixels added multiple times via different 0-pixels
-        // should appear once; they're added in row-major order so already
-        // sorted mostly, but dedup is safe).
+        // Dedupe / sort borders (a rim pixel is reached from several region
+        // pixels). They're pushed in row-major order so largely sorted.
+        // Then build `all_px = interior ∪ border` (MATLAB `rgn{}`).
         for slot in 0..self.regions.len() {
             if let Some(r) = self.regions[slot].as_mut() {
                 r.border.sort_unstable();
                 r.border.dedup();
+                // interior is already sorted (row-major fill); merge with border.
+                let mut all = Vec::with_capacity(r.interior.len() + r.border.len());
+                let (mut i, mut j) = (0usize, 0usize);
+                while i < r.interior.len() && j < r.border.len() {
+                    match r.interior[i].cmp(&r.border[j]) {
+                        std::cmp::Ordering::Less => { all.push(r.interior[i]); i += 1; }
+                        std::cmp::Ordering::Greater => { all.push(r.border[j]); j += 1; }
+                        std::cmp::Ordering::Equal => { all.push(r.interior[i]); i += 1; j += 1; }
+                    }
+                }
+                all.extend_from_slice(&r.interior[i..]);
+                all.extend_from_slice(&r.border[j..]);
+                r.all_px = all;
             }
         }
     }

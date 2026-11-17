@@ -28,7 +28,7 @@ use ndarray_npy::ReadNpyExt;
 
 use dynamo_rs::extract_pipeline::ExtractParams;
 use dynamo_rs::pipeline::{
-    default_extract_params, run_extract_from_spectrogram, write_stats_csv,
+    default_extract_params, run_extract_from_spectrogram, write_stats_csv, StatsCsvPrecision,
 };
 
 #[derive(Parser, Debug)]
@@ -145,13 +145,17 @@ fn run_extract(args: ExtractArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("extracted {} peaks in {:.1}s", peaks.len(), t0.elapsed().as_secs_f64());
 
+    // Bare extract — no staging, so SO-power/phase/stage columns are empty.
     // Defaults match `OutputOpts` at fs=100 (time at 8 sig figs covers
     // recordings up to ~28 h with sub-sample precision).
-    let prec = dynamo_rs::pipeline::StatsCsvPrecision::default();
+    let prec = StatsCsvPrecision::default();
     let prov = dynamo_rs::pipeline::StatsCsvProvenance {
         writer: "dynamo-rs-bin",
         writer_version: dynamo_rs::build_info::VERSION,
         subject_id: None,
+        // The kernel sits below the settings crate, so it has no
+        // computation-semantics number to stamp.
+        semantics: None,
     };
     write_stats_csv(&peaks, &[], &[], &[], prec, Some(&prov), &args.out)?;
     eprintln!("wrote {}", args.out.display());

@@ -4,10 +4,11 @@
 //! Two stages:
 //!   1. `hann_event_spectra`: batched FFT of windowed+detrended+tapered EEG
 //!      segments, one per event. Returns one-sided PSD per event (F, N).
-//!   2. `refine_from_spectra`: per-event, fit a natural cubic spline to the
-//!      full PSD, evaluate on a dense grid inside the peak's bbox
-//!      frequency range, take argmax → refined frequency. Reject peaks
-//!      that sit within 1e-3 Hz of the bbox boundaries.
+//!   2. `refine_from_spectra`: per-event, fit a not-a-knot cubic spline
+//!      (MATLAB `interp1(..., 'spline')`) to the full PSD, evaluate on a
+//!      dense grid inside the peak's bbox frequency range, take argmax →
+//!      refined frequency. Reject peaks that sit within 1e-3 Hz of the
+//!      bbox boundaries.
 
 use ndarray::Array2;
 use crate::parallel::*;
@@ -169,53 +170,109 @@ pub enum DetrendOpt {
     Linear,
 }
 
-/// Natural cubic spline coefficients for y(x). Returns (a, b, c, d) each
-/// length N-1 so y(x) for x in [xs[i], xs[i+1]] ≈
-/// a[i] + b[i]*(x-xs[i]) + c[i]*(x-xs[i])^2 + d[i]*(x-xs[i])^3.
+/// Not-a-knot cubic spline coefficients for y(x), as MATLAB `spline` and
+/// `interp1(..., 'spline')` compute them. Returns (a, b, c, d), each of
+/// length N-1, so that for x in [xs[i], xs[i+1]]
+/// y(x) = a[i] + b[i]*(x-xs[i]) + c[i]*(x-xs[i])^2 + d[i]*(x-xs[i])^3.
 ///
-/// Natural boundary: c[0] = c[N-1] = 0. Tridiagonal solve via Thomas'
-/// algorithm. Matches scipy.interpolate.CubicSpline(bc_type='natural').
-fn natural_cubic_spline_coeffs(
+/// Not-a-knot end condition: the third derivative is continuous across
+/// the second and the second-to-last points, so the first two pieces are
+/// one cubic and so are the last two. With three points that leaves a
+/// single parabola through them, and with two points a straight line,
+/// which is what MATLAB returns in those cases.
+fn not_a_knot_cubic_spline_coeffs(
     xs: &[f64],
     ys: &[f64],
 ) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
     let n = xs.len();
     assert!(n >= 2);
-    let nm1 = n - 1;
-    // h[i] = xs[i+1] - xs[i]
-    let h: Vec<f64> = (0..nm1).map(|i| xs[i + 1] - xs[i]).collect();
-    // Build tridiagonal system for c[0..n] with c[0]=c[n-1]=0.
-    // For i in 1..n-1:  h[i-1]*c[i-1] + 2*(h[i-1]+h[i])*c[i] + h[i]*c[i+1]
-    //                  = 3*( (y[i+1]-y[i])/h[i] - (y[i]-y[i-1])/h[i-1] )
-    let mut alpha = vec![0.0f64; n];
-    for i in 1..nm1 {
-        alpha[i] = 3.0 * ((ys[i + 1] - ys[i]) / h[i] - (ys[i] - ys[i - 1]) / h[i - 1]);
+    let n_pieces = n - 1;
+
+    // h[i] = width of piece i, slope[i] = its secant slope.
+    let mut h = vec![0.0f64; n_pieces];
+    let mut slope = vec![0.0f64; n_pieces];
+    for i in 0..n_pieces {
+        h[i] = xs[i + 1] - xs[i];
+        slope[i] = (ys[i + 1] - ys[i]) / h[i];
     }
-    let mut l = vec![0.0f64; n];
-    let mut mu = vec![0.0f64; n];
-    let mut z = vec![0.0f64; n];
-    l[0] = 1.0;
-    for i in 1..nm1 {
-        l[i] = 2.0 * (xs[i + 1] - xs[i - 1]) - h[i - 1] * mu[i - 1];
-        mu[i] = h[i] / l[i];
-        z[i] = (alpha[i] - h[i - 1] * z[i - 1]) / l[i];
+
+    // c_node[i] is the quadratic coefficient at point i (half the second
+    // derivative there).
+    let mut c_node = vec![0.0f64; n];
+
+    if n == 3 {
+        // One parabola through the three points: constant second derivative.
+        let curvature = (slope[1] - slope[0]) / (h[0] + h[1]);
+        c_node[0] = curvature;
+        c_node[1] = curvature;
+        c_node[2] = curvature;
+    } else if n >= 4 {
+        // Interior continuity equations, one per interior point i = 1..n-2:
+        //   h[i-1]*c[i-1] + 2*(h[i-1]+h[i])*c[i] + h[i]*c[i+1] = 3*(slope[i]-slope[i-1])
+        // The two not-a-knot conditions express the end values through
+        // their neighbors,
+        //   c[0]   = ((h[0]+h[1])*c[1] - h[0]*c[2]) / h[1]
+        //   c[n-1] = ((hA+hB)*c[n-2] - hB*c[n-3]) / hA,  hA = h[n-3], hB = h[n-2]
+        // and substituting them into the first and last interior equations
+        // leaves a tridiagonal system in c[1..n-2].
+        let n_unknowns = n - 2;
+        let mut lower = vec![0.0f64; n_unknowns];
+        let mut diagonal = vec![0.0f64; n_unknowns];
+        let mut upper = vec![0.0f64; n_unknowns];
+        let mut rhs = vec![0.0f64; n_unknowns];
+        for k in 0..n_unknowns {
+            let i = k + 1;
+            lower[k] = h[i - 1];
+            diagonal[k] = 2.0 * (h[i - 1] + h[i]);
+            upper[k] = h[i];
+            rhs[k] = 3.0 * (slope[i] - slope[i - 1]);
+        }
+        // First interior equation with c[0] substituted.
+        let h0 = h[0];
+        let h1 = h[1];
+        diagonal[0] = (h0 + h1) * (h0 + 2.0 * h1) / h1;
+        upper[0] = (h1 * h1 - h0 * h0) / h1;
+        lower[0] = 0.0;
+        // Last interior equation with c[n-1] substituted.
+        let h_a = h[n - 3];
+        let h_b = h[n - 2];
+        let last = n_unknowns - 1;
+        diagonal[last] = (h_a + h_b) * (h_b + 2.0 * h_a) / h_a;
+        lower[last] = (h_a * h_a - h_b * h_b) / h_a;
+        upper[last] = 0.0;
+
+        // Thomas algorithm: forward elimination, then back substitution.
+        for k in 1..n_unknowns {
+            let factor = lower[k] / diagonal[k - 1];
+            diagonal[k] -= factor * upper[k - 1];
+            rhs[k] -= factor * rhs[k - 1];
+        }
+        let mut solution = vec![0.0f64; n_unknowns];
+        solution[last] = rhs[last] / diagonal[last];
+        for k in (0..last).rev() {
+            solution[k] = (rhs[k] - upper[k] * solution[k + 1]) / diagonal[k];
+        }
+        for k in 0..n_unknowns {
+            c_node[k + 1] = solution[k];
+        }
+        c_node[0] = ((h0 + h1) * c_node[1] - h0 * c_node[2]) / h1;
+        c_node[n - 1] = ((h_a + h_b) * c_node[n - 2] - h_b * c_node[n - 3]) / h_a;
     }
-    l[nm1] = 1.0;
-    let mut c = vec![0.0f64; n];
-    let mut b = vec![0.0f64; nm1];
-    let mut d = vec![0.0f64; nm1];
-    for j in (0..nm1).rev() {
-        c[j] = z[j] - mu[j] * c[j + 1];
-        b[j] = (ys[j + 1] - ys[j]) / h[j] - h[j] * (c[j + 1] + 2.0 * c[j]) / 3.0;
-        d[j] = (c[j + 1] - c[j]) / (3.0 * h[j]);
+    // n == 2: c_node stays zero, which is a straight line.
+
+    let mut b = vec![0.0f64; n_pieces];
+    let mut d = vec![0.0f64; n_pieces];
+    for j in 0..n_pieces {
+        b[j] = slope[j] - h[j] * (c_node[j + 1] + 2.0 * c_node[j]) / 3.0;
+        d[j] = (c_node[j + 1] - c_node[j]) / (3.0 * h[j]);
     }
-    let a: Vec<f64> = ys[..nm1].to_vec();
-    // Drop c's last element to match piece count.
-    c.truncate(nm1);
+    let a: Vec<f64> = ys[..n_pieces].to_vec();
+    let c: Vec<f64> = c_node[..n_pieces].to_vec();
     (a, b, c, d)
 }
 
-/// Evaluate natural cubic spline at a single x-point.
+/// Evaluate the cubic spline at a single x-point. Outside the data range
+/// the end piece is extended, as `interp1(..., 'spline')` extrapolates.
 #[inline]
 fn spline_eval(xs: &[f64], coeffs: &(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>), x: f64) -> f64 {
     // Find piece index via binary search (xs sorted ascending).
@@ -278,12 +335,19 @@ pub fn refine_from_spectra(
             if curr.len() < 2 {
                 return f64::NAN;
             }
-            let coeffs = natural_cubic_spline_coeffs(sfreqs, &curr);
+            let coeffs = not_a_knot_cubic_spline_coeffs(sfreqs, &curr);
             let mut best_x = start_freq;
             let mut best_y = f64::NEG_INFINITY;
+            // MATLAB `linspace(start_freq, end_freq, n_grid)`:
+            // start + i*(end - start)/(n - 1), with the last point set to
+            // `end_freq` exactly.
+            let n_steps = (n_grid - 1) as f64;
             for i in 0..n_grid {
-                let t = i as f64 / (n_grid - 1) as f64;
-                let x = start_freq + (end_freq - start_freq) * t;
+                let x = if i == n_grid - 1 {
+                    end_freq
+                } else {
+                    start_freq + (i as f64) * (end_freq - start_freq) / n_steps
+                };
                 let y = spline_eval(sfreqs, &coeffs, x);
                 if y > best_y {
                     best_y = y;
@@ -313,12 +377,71 @@ mod tests {
         // Linear function: spline should exactly reproduce.
         let xs = vec![0.0, 1.0, 2.0, 3.0, 4.0];
         let ys = vec![0.0, 2.0, 4.0, 6.0, 8.0];
-        let coeffs = natural_cubic_spline_coeffs(&xs, &ys);
+        let coeffs = not_a_knot_cubic_spline_coeffs(&xs, &ys);
         for &x in &[0.5, 1.5, 2.75, 3.9] {
             let y = spline_eval(&xs, &coeffs, x);
             let expected = 2.0 * x;
             assert!((y - expected).abs() < 1e-10, "x={x} y={y} expected={expected}");
         }
+    }
+
+    /// Evaluate the spline through (xs, ys) at each query.
+    fn spline_at(xs: &[f64], ys: &[f64], queries: &[f64]) -> Vec<f64> {
+        let coeffs = not_a_knot_cubic_spline_coeffs(xs, ys);
+        let mut values = Vec::new();
+        for &query in queries {
+            values.push(spline_eval(xs, &coeffs, query));
+        }
+        values
+    }
+
+    fn assert_all_close(got: &[f64], expected: &[f64]) {
+        assert_eq!(got.len(), expected.len());
+        for i in 0..got.len() {
+            assert!(
+                (got[i] - expected[i]).abs() < 1e-12,
+                "index {}: got {} expected {}",
+                i, got[i], expected[i]
+            );
+        }
+    }
+
+    // Expected values are MATLAB R2025b `interp1(x, y, xq, 'spline')`
+    // outputs for the same inputs, including the extrapolated queries.
+
+    #[test]
+    fn spline_matches_matlab_on_a_uniform_grid() {
+        // interp1([0 1 2 3 4 5],[1 3 2 5 4 6],[0.5 1.5 4.5 -0.5 5.5],'spline')
+        let got = spline_at(
+            &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+            &[1.0, 3.0, 2.0, 5.0, 4.0, 6.0],
+            &[0.5, 1.5, 4.5, -0.5, 5.5],
+        );
+        assert_all_close(&got, &[3.125, 2.125, 3.875, -4.875, 11.875]);
+    }
+
+    #[test]
+    fn spline_matches_matlab_on_a_nonuniform_grid() {
+        // interp1([0 0.5 2 3 4.5 5],[1 3 2 5 4 6],[0.25 1 4.75 -0.5 5.5],'spline')
+        let got = spline_at(
+            &[0.0, 0.5, 2.0, 3.0, 4.5, 5.0],
+            &[1.0, 3.0, 2.0, 5.0, 4.0, 6.0],
+            &[0.25, 1.0, 4.75, -0.5, 5.5],
+        );
+        assert_all_close(&got, &[2.354375, 2.88, 4.645625, -4.55, 11.55]);
+    }
+
+    #[test]
+    fn spline_matches_matlab_with_few_points() {
+        // interp1([0 1 2 3],[1 3 2 5],[0.5 1.5 2.5],'spline')
+        let four = spline_at(&[0.0, 1.0, 2.0, 3.0], &[1.0, 3.0, 2.0, 5.0], &[0.5, 1.5, 2.5]);
+        assert_all_close(&four, &[2.8125, 2.4375, 2.5625]);
+        // interp1([0 1 2],[1 3 2],[0.5 1.5 2.5],'spline'): one parabola
+        let three = spline_at(&[0.0, 1.0, 2.0], &[1.0, 3.0, 2.0], &[0.5, 1.5, 2.5]);
+        assert_all_close(&three, &[2.375, 2.875, 0.375]);
+        // interp1([0 1],[1 3],[0.5 1.5],'spline'): a straight line
+        let two = spline_at(&[0.0, 1.0], &[1.0, 3.0], &[0.5, 1.5]);
+        assert_all_close(&two, &[2.0, 4.0]);
     }
 
     #[test]

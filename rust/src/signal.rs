@@ -1,7 +1,7 @@
 //! Signal-processing primitives: sosfiltfilt, hilbert, unwrap, movmean.
 //!
-//! Targets byte-level parity with:
-//!   - scipy.signal.sosfiltfilt(sos, x, padtype='odd', padlen=None)
+//! Targets:
+//!   - MATLAB filtfilt(sos, 1, x) (section-by-section forward-backward)
 //!   - scipy.signal.hilbert(x, axis=-1)
 //!   - numpy.unwrap(p, discont=π)
 //!   - numpy running-window mean (centered, partial-window at edges, matches
@@ -37,121 +37,120 @@ fn sosfilt_single_section(sec: &[f64; 6], x: &mut [f64], mut z0: f64, mut z1: f6
     (z0, z1)
 }
 
-/// Forward lfilter across all sections. Mutates `x` in place. Initial state
-/// per section defaults to zeros unless `zi` is given.
-#[allow(dead_code)]
-fn sosfilt(sos: &[[f64; 6]], x: &mut [f64], zi: Option<&[[f64; 2]]>) {
-    for (i, sec) in sos.iter().enumerate() {
-        let (z0, z1) = zi.map(|z| (z[i][0], z[i][1])).unwrap_or((0.0, 0.0));
-        sosfilt_single_section(sec, x, z0, z1);
-    }
+/// Steady-state initial conditions for one section, for a unit step input
+/// (MATLAB `filtfilt.m`, `getCoeffsAndInitialConditions`; the same values
+/// as `scipy.signal.lfilter_zi`). Multiplying them by the first input
+/// sample starts the filter as if that value had been held forever, which
+/// removes the start-up transient for a constant offset.
+fn section_initial_conditions(sec: &[f64; 6]) -> [f64; 2] {
+    let a0 = sec[3];
+    let b0 = sec[0] / a0;
+    let b1 = sec[1] / a0;
+    let b2 = sec[2] / a0;
+    let a1 = sec[4] / a0;
+    let a2 = sec[5] / a0;
+    // Solve
+    //   (1 + a1)*z0 - z1 = b1 - a1*b0
+    //        a2*z0 + z1 = b2 - a2*b0
+    // by adding the two rows.
+    let rhs0 = b1 - a1 * b0;
+    let rhs1 = b2 - a2 * b0;
+    let z0 = (rhs0 + rhs1) / (1.0 + a1 + a2);
+    let z1 = rhs1 - a2 * z0;
+    [z0, z1]
 }
 
-/// Compute initial conditions scipy.signal.sosfilt_zi.
-///
-/// For each section, solves (I - A) * zi = B * sum(b)/sum(a) with
-///   A = [[-a1, 1], [-a2, 0]],
-///   B = [[b1 - a1*b0], [b2 - a2*b0]]
-///
-/// The per-section state is scaled by the cumulative DC gain of preceding
-/// sections so that a steady-state input produces zero transient.
-fn sosfilt_zi(sos: &[[f64; 6]]) -> Vec<[f64; 2]> {
-    let mut out = Vec::with_capacity(sos.len());
-    let mut scale = 1.0f64;
+/// Order of one section as MATLAB `filtfilt.m` `findFilterOrder` counts it:
+/// the position of the last nonzero coefficient, in the numerator or the
+/// denominator whichever is longer, minus one.
+fn section_order(sec: &[f64; 6]) -> usize {
+    let numerator = [sec[0], sec[1], sec[2]];
+    let denominator = [sec[3], sec[4], sec[5]];
+    let mut numerator_length = 0usize;
+    let mut denominator_length = 0usize;
+    for k in 0..3 {
+        if numerator[k] != 0.0 {
+            numerator_length = k + 1;
+        }
+        if denominator[k] != 0.0 {
+            denominator_length = k + 1;
+        }
+    }
+    let longest = numerator_length.max(denominator_length);
+    longest.saturating_sub(1)
+}
+
+/// Length of the reflected extension at each end, MATLAB `filtfilt.m`:
+/// three times the total filter order (6 samples per full biquad), at
+/// least 1.
+fn edge_transient_length(sos: &[[f64; 6]]) -> usize {
+    let mut total_order = 0usize;
     for sec in sos {
-        let a0 = sec[3];
-        let b0 = sec[0] / a0;
-        let b1 = sec[1] / a0;
-        let b2 = sec[2] / a0;
-        let a1 = sec[4] / a0;
-        let a2 = sec[5] / a0;
-        // I - A = [[1+a1, -1], [a2, 1]]
-        // solve:
-        //   (1+a1)*z0 - z1 = (b1 - a1*b0)
-        //   a2*z0 + z1      = (b2 - a2*b0)
-        // add: (1+a1+a2)*z0 = (b1 + b2 - a1*b0 - a2*b0)
-        let det = 1.0 + a1 + a2;
-        let rhs0 = b1 - a1 * b0;
-        let rhs1 = b2 - a2 * b0;
-        let z0 = (rhs0 + rhs1) / det;
-        // row 2: a2*z0 + z1 = rhs1 → z1 = rhs1 - a2*z0
-        let z1 = rhs1 - a2 * z0;
-        out.push([scale * z0, scale * z1]);
-        // DC gain of this section: (b0+b1+b2)/(1+a1+a2)
-        let dc_gain = (b0 + b1 + b2) / det;
-        scale *= dc_gain;
+        total_order += section_order(sec);
     }
-    out
+    (3 * total_order).max(1)
 }
 
-/// Default padlen chosen by scipy.signal.sosfiltfilt for SOS:
-///   edge = max(0, ord_est - 1) * 2, where ord_est is approximated from
-///   the number of sections. scipy uses ntaps = 2*len(sos) + 1; padlen = 3
-///   * ntaps. We replicate that.
-fn default_padlen_sos(n_sections: usize) -> usize {
-    let ntaps = 2 * n_sections + 1;
-    3 * ntaps
-}
-
-/// Apply scipy.signal.sosfiltfilt (`padtype='odd'`, default `padlen`).
+/// Zero-phase filtering with second-order sections, following MATLAB
+/// `filtfilt(sos, 1, x)` step for step.
 ///
-/// Implementation follows scipy:
-///   1. Build the odd-extension padded signal:
-///        ext = [2*x[0] - x[padlen..0:-1], x, 2*x[-1] - x[-2:-padlen-1:-1]]
-///   2. Compute zi = sosfilt_zi(sos).
-///   3. Forward lfilter with initial state = zi * ext[0].
-///   4. Reverse, forward with initial state = zi * reversed_ext[0].
-///   5. Reverse again, trim padding.
+/// The sections are applied one at a time, and each one is run forward
+/// and backward before the next starts:
+///   1. Extend the current signal at both ends by odd reflection,
+///      `2*y[0] - y[L..1]` in front and `2*y[n-1] - y[n-2..n-1-L]` behind,
+///      with `L = edge_transient_length(sos)` (the same for every section).
+///   2. Filter forward, starting from the section's initial conditions
+///      times the first extended sample.
+///   3. Reverse, filter again from the initial conditions times the first
+///      sample of the reversed signal, reverse back.
+///   4. Drop the extensions. The result is the input to the next section.
+///
+/// Running all sections forward and then all backward on a single
+/// extension gives the same answer far from the ends but a different one
+/// near them, where each procedure's start-up transient lives. For a
+/// narrow low-frequency band those transients last tens of seconds.
+///
+/// MATLAB refuses a signal no longer than `L`. Here the extension is
+/// shortened to `n - 1` samples in that case.
 pub fn sosfiltfilt(sos: &[[f64; 6]], x: &[f64]) -> Vec<f64> {
     let n = x.len();
     if n == 0 {
         return Vec::new();
     }
-    let mut padlen = default_padlen_sos(sos.len());
-    if padlen >= n {
-        padlen = if n == 0 { 0 } else { n - 1 };
+    let mut pad = edge_transient_length(sos);
+    if pad >= n {
+        pad = n - 1;
     }
 
-    // Build odd-extension pad: y[-i] = 2*x[0] - x[i]; y[n+i] = 2*x[n-1] - x[n-1-i]
-    let mut ext = Vec::with_capacity(n + 2 * padlen);
-    for i in (1..=padlen).rev() {
-        ext.push(2.0 * x[0] - x[i]);
+    let mut current: Vec<f64> = x.to_vec();
+    let mut extended: Vec<f64> = Vec::with_capacity(n + 2 * pad);
+    for sec in sos {
+        let zi = section_initial_conditions(sec);
+
+        // 1. Odd reflection at both ends.
+        extended.clear();
+        for i in (1..=pad).rev() {
+            extended.push(2.0 * current[0] - current[i]);
+        }
+        extended.extend_from_slice(&current);
+        for i in 1..=pad {
+            extended.push(2.0 * current[n - 1] - current[n - 1 - i]);
+        }
+
+        // 2. Forward pass.
+        let first = extended[0];
+        sosfilt_single_section(sec, &mut extended, zi[0] * first, zi[1] * first);
+
+        // 3. Backward pass.
+        extended.reverse();
+        let first_reversed = extended[0];
+        sosfilt_single_section(sec, &mut extended, zi[0] * first_reversed, zi[1] * first_reversed);
+        extended.reverse();
+
+        // 4. Keep the central part.
+        current.copy_from_slice(&extended[pad..pad + n]);
     }
-    ext.extend_from_slice(x);
-    for i in 1..=padlen {
-        ext.push(2.0 * x[n - 1] - x[n - 1 - i]);
-    }
-
-    let zi = sosfilt_zi(sos);
-
-    // Forward pass scaled by ext[0].
-    let mut y = ext.clone();
-    let zi0_scaled: Vec<[f64; 2]> = zi.iter().map(|s| [s[0] * ext[0], s[1] * ext[0]]).collect();
-    let zi0_flat: Vec<f64> = zi0_scaled.iter().flat_map(|s| [s[0], s[1]]).collect();
-    apply_sosfilt_with_state(sos, &mut y, &zi0_flat);
-
-    // Reverse, forward pass scaled by y_rev[0] = y[last].
-    y.reverse();
-    let scale_rev = y[0];
-    let zi_scaled: Vec<f64> = zi
-        .iter()
-        .flat_map(|s| [s[0] * scale_rev, s[1] * scale_rev])
-        .collect();
-    apply_sosfilt_with_state(sos, &mut y, &zi_scaled);
-    y.reverse();
-
-    // Trim padding.
-    y[padlen..padlen + n].to_vec()
-}
-
-/// Apply forward lfilter across all sections with the given initial states
-/// (flat, per-section pairs).
-fn apply_sosfilt_with_state(sos: &[[f64; 6]], x: &mut [f64], zi_flat: &[f64]) {
-    for (i, sec) in sos.iter().enumerate() {
-        let z0 = zi_flat[2 * i];
-        let z1 = zi_flat[2 * i + 1];
-        sosfilt_single_section(sec, x, z0, z1);
-    }
+    current
 }
 
 // ---------------------------------------------------------------------------
@@ -253,8 +252,10 @@ pub fn movmean(x: &[f64], win: usize) -> Vec<f64> {
     if win <= 1 || n == 0 {
         return x.to_vec();
     }
-    let half_l = (win - 1) / 2;
-    let half_r = win / 2;
+    // MATLAB places an even-length window one sample toward the past:
+    // samples [i - win/2, i + win/2 - 1]. Odd lengths are symmetric.
+    let half_l = win / 2;
+    let half_r = (win - 1) / 2;
     // Prefix sum for O(N) window query.
     let mut csum = vec![0.0f64; n + 1];
     for i in 0..n {
@@ -288,11 +289,74 @@ mod tests {
     }
 
     #[test]
+    fn movmean_even_window_matches_matlab() {
+        // MATLAB R2025b: movmean([1 2 3 4 5 6], 4) -> 1.5 2 2.5 3.5 4.5 5
+        let out = movmean(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 4);
+        assert_eq!(out, vec![1.5, 2.0, 2.5, 3.5, 4.5, 5.0]);
+    }
+
+    #[test]
     fn movmean_uniform() {
         let x = vec![1.0; 10];
         let out = movmean(&x, 3);
         for &v in &out {
             assert!((v - 1.0).abs() < 1e-12);
+        }
+    }
+
+    /// Twenty samples used by the MATLAB-referenced filter tests.
+    fn filter_test_signal() -> Vec<f64> {
+        vec![
+            1.0, 3.0, -2.0, 4.0, 0.5, -1.0, 2.0, 6.0, -3.0, 1.5, 0.0, 2.5, -4.0, 1.0, 3.0, -0.5,
+            2.0, 1.0, -1.0, 0.25,
+        ]
+    }
+
+    #[test]
+    fn sosfiltfilt_matches_matlab_for_two_sections() {
+        // MATLAB R2025b: filtfilt(sos, 1, x) for these two sections. The
+        // signal is short, so every sample is inside the edge transient
+        // and the per-section forward-backward order shows in each value.
+        let sos = [
+            [0.2, 0.3, 0.1, 1.0, -0.5, 0.25],
+            [0.5, -0.4, 0.3, 1.0, 0.2, 0.1],
+        ];
+        let expected = [
+            0.060615437759993715, 0.063128012819028773, 0.039762767348181891,
+            0.11004233829414317, 0.08006004681626884, 0.0054990525849684668,
+            0.11609159617429311, 0.14709455538778837, 0.0052953103829598211,
+            -0.0026329053627278526, 0.085746897291231694, 0.03638896700719628,
+            -0.049659639998364216, 0.028800304687914183, 0.082676527515276182,
+            0.025948909084606522, 0.049749356818104731, 0.059157810678188164,
+            0.0017809135577381355, 0.015171566031306094,
+        ];
+        assert_eq!(edge_transient_length(&sos), 12);
+        let y = sosfiltfilt(&sos, &filter_test_signal());
+        for i in 0..expected.len() {
+            assert!((y[i] - expected[i]).abs() < 1e-13, "sample {}: {} vs {}", i, y[i], expected[i]);
+        }
+    }
+
+    #[test]
+    fn sosfiltfilt_counts_a_first_order_section_as_order_one() {
+        // A full biquad then a first-order section (trailing zeros in both
+        // numerator and denominator): total order 3, so MATLAB extends by
+        // 9 samples, not 12. Values from MATLAB R2025b filtfilt(sos, 1, x).
+        let sos = [
+            [0.2, 0.3, 0.1, 1.0, -0.5, 0.25],
+            [0.3, 0.2, 0.0, 1.0, -0.6, 0.0],
+        ];
+        let expected = [
+            0.99916061642573784, 1.0433005311514916, 1.0739746286132892, 1.0908942291621668,
+            1.1206120181854424, 1.1959112366784157, 1.2673704087192197, 1.2096887862005048,
+            0.99124705720011153, 0.72012699822331894, 0.49238591942932608, 0.34369776312763795,
+            0.32595877488488612, 0.46240264566135808, 0.65336216826290183, 0.75227897726200643,
+            0.7021333489271242, 0.55140599751589181, 0.38705556014010317, 0.25306284049141103,
+        ];
+        assert_eq!(edge_transient_length(&sos), 9);
+        let y = sosfiltfilt(&sos, &filter_test_signal());
+        for i in 0..expected.len() {
+            assert!((y[i] - expected[i]).abs() < 1e-13, "sample {}: {} vs {}", i, y[i], expected[i]);
         }
     }
 

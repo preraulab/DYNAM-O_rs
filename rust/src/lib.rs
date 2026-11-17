@@ -24,6 +24,7 @@ pub mod extract_pipeline;
 pub mod filter_cache;
 pub mod filter_design;
 pub mod histogram;
+pub mod histpeaks;
 pub mod io;
 pub mod mask;
 pub mod matlab_watershed;
@@ -585,7 +586,9 @@ mod python {
     }
 
     /// sosfiltfilt(sos (M, 6), x (N,)) → (N,) zero-phase filtered signal.
-    /// Matches scipy.signal.sosfiltfilt with padtype='odd', default padlen.
+    /// Follows MATLAB filtfilt(sos, 1, x): each section is run forward and
+    /// backward on its own odd-reflected extension. Differs from
+    /// scipy.signal.sosfiltfilt near the ends of the signal.
     #[pyfunction]
     fn sosfiltfilt<'py>(
         py: Python<'py>,
@@ -759,6 +762,8 @@ mod python {
             delimiter: delim,
             epoch_dur,
             start_time: start_time.map(|s| s.to_string()),
+            recording_duration: None,
+            stage_vals: Vec::new(),
         };
         let out = super::io::staging::read_staging(path, &opts)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
@@ -1040,6 +1045,7 @@ mod python {
             sfreqs.as_array(),
             bl,
             &params,
+            None,
             None,
         )
         .map_err(pyo3::exceptions::PyValueError::new_err)?;

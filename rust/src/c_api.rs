@@ -381,7 +381,7 @@ pub unsafe extern "C" fn dynamo_extract_tfpeaks(
             progress_boxed.as_deref().map(|b| b as &(dyn Fn(u32, u32) + Sync));
 
         let (peaks, labels) = match crate::extract_pipeline::extract_tfpeaks(
-            spect_view, stimes_view, sfreqs_view, baseline_view, &params, progress_ref,
+            spect_view, stimes_view, sfreqs_view, baseline_view, &params, progress_ref, None,
         ) {
             Ok(p) => p,
             Err(_) => return ErrorCode::KernelError.code(),
