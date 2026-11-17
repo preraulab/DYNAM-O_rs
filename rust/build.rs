@@ -29,6 +29,14 @@ fn main() {
     // elliptic design instead of silently degrading to a cheby1 fallback.
     generate_embedded_filters(&crate_dir);
 
+    // The C header is written into the source tree. A consumer that builds
+    // this crate from a read-only or pinned checkout (a git submodule, a
+    // container layer) sets DYNAMO_SKIP_C_HEADER=1 to leave the tree alone.
+    println!("cargo:rerun-if-env-changed=DYNAMO_SKIP_C_HEADER");
+    if std::env::var_os("DYNAMO_SKIP_C_HEADER").is_some() {
+        return;
+    }
+
     let include_dir = format!("{crate_dir}/include");
     let out = format!("{include_dir}/dynamo_rs.h");
     if std::fs::create_dir_all(&include_dir).is_err() {
