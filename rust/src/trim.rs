@@ -229,14 +229,23 @@ pub fn trim_all_regions(
         }
 
         // Write back to out_labels
+        let mut n_written = 0u32;
         for sr in 0..sub_h {
             for sc in 0..sub_w {
                 let cc_i = sr * sub_w + sc;
                 if cc[cc_i] as usize == best_lab {
                     let full = (rmin_p + sr) * w + (cmin_p + sc);
                     out_slice[full] = label;
+                    n_written += 1;
                 }
             }
+        }
+        if std::env::var("HISTPEAKS_DEBUG").is_ok() {
+            let n_ge = sub_mask.iter().filter(|&&b| b).count();
+            eprintln!(
+                "[trim] lbl={} npix={} total={:.2} target={:.2} cutoff_idx={} level={:.4} n_ge_level(filled)={} n_largest_cc={}",
+                label, pixels.len(), total, target, cutoff_idx, level, n_ge, n_written
+            );
         }
     }
 

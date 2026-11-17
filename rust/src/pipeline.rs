@@ -35,7 +35,7 @@ pub fn run_extract_from_spectrogram(
     sfreqs: ArrayView1<f64>,
     params: &ExtractParams,
 ) -> Result<(SegmentPeaks, Array2<i64>), String> {
-    extract_tfpeaks(spect, stimes, sfreqs, None, params, None)
+    extract_tfpeaks(spect, stimes, sfreqs, None, params, None, None)
 }
 
 /// Default `ExtractParams` matching `runDYNAMO` defaults:
@@ -207,6 +207,9 @@ pub struct StatsCsvProvenance<'a> {
     pub writer_version: &'a str,
     /// Emitted as `# subjectID:` when non-empty.
     pub subject_id: Option<&'a str>,
+    /// Computation-semantics version (`# semantics:` line); emitted when
+    /// `Some`. Same number across builds ⇒ comparable numbers.
+    pub semantics: Option<u32>,
 }
 
 pub fn write_stats_csv(
@@ -230,6 +233,9 @@ pub fn write_stats_csv(
         writeln!(w, "# writer: {}", p.writer)?;
         writeln!(w, "# writer_version: {}", p.writer_version)?;
         writeln!(w, "# kernel_version: {}", crate::build_info::VERSION)?;
+        if let Some(sem) = p.semantics {
+            writeln!(w, "# semantics: {}", sem)?;
+        }
         if let Some(sid) = p.subject_id {
             if !sid.is_empty() {
                 writeln!(w, "# subjectID: {}", sid)?;
@@ -362,6 +368,7 @@ mod tests {
             writer: "dynamo-rs-bin",
             writer_version: crate::build_info::VERSION,
             subject_id: Some("S001"),
+            semantics: Some(4),
         };
         write_stats_csv(&peaks, &sopow, &soph, &stage, prec, Some(&prov), &stamped).unwrap();
 
@@ -381,8 +388,9 @@ mod tests {
         assert_eq!(preamble[2], "# writer: dynamo-rs-bin");
         assert_eq!(preamble[3], format!("# writer_version: {}", crate::build_info::VERSION));
         assert_eq!(preamble[4], format!("# kernel_version: {}", crate::build_info::VERSION));
-        assert_eq!(preamble[5], "# subjectID: S001");
-        assert_eq!(preamble.len(), 6);
+        assert_eq!(preamble[5], "# semantics: 4");
+        assert_eq!(preamble[6], "# subjectID: S001");
+        assert_eq!(preamble.len(), 7);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

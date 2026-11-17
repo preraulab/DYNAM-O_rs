@@ -261,6 +261,40 @@ pub fn matlab_watershed_2d(img: ArrayView2<f64>) -> Array2<u16> {
     out
 }
 
+/// MATLAB `runWatershed.m`: `watershed(-data, 8)` followed by
+/// `bwlabel(Ldata)`.
+///
+/// The `bwlabel` pass renumbers the regions: each 8-connected component of
+/// nonzero pixels gets the next number in column-major scan order, so a
+/// region is numbered by its first pixel going down the columns, where
+/// `watershed` alone numbers it by its regional minimum. The numbering
+/// matters downstream because the merge visits edges in label order. Two
+/// basins that touch with no watershed line between them become one
+/// region, as they do in MATLAB.
+///
+/// `negated` is the already negated image (`-data`).
+pub fn matlab_run_watershed_2d(negated: ArrayView2<f64>) -> Array2<i64> {
+    let basins = matlab_watershed_2d(negated);
+    let (h, w) = basins.dim();
+
+    // Nonzero mask in column-major order, the layout `bwlabel_8conn` scans.
+    let mut nonzero_mask: Vec<bool> = Vec::with_capacity(h * w);
+    for c in 0..w {
+        for r in 0..h {
+            nonzero_mask.push(basins[[r, c]] != 0);
+        }
+    }
+    let (component_labels, _n_components) = bwlabel_8conn(&nonzero_mask, h, w);
+
+    let mut relabeled = Array2::<i64>::zeros((h, w));
+    for c in 0..w {
+        for r in 0..h {
+            relabeled[[r, c]] = component_labels[c * h + r] as i64;
+        }
+    }
+    relabeled
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,5 +311,48 @@ mod tests {
         let uniq: std::collections::BTreeSet<u16> =
             labels.iter().copied().filter(|&v| v > 0).collect();
         assert_eq!(uniq.len(), 2, "expected 2 basins, got {:?}", uniq);
+    }
+
+    #[test]
+    fn run_watershed_numbers_regions_by_first_pixel_down_the_columns() {
+        // Two basins side by side, split by a ridge in column 2. The left
+        // basin's minimum is at the bottom of column 1, the right basin's
+        // minimum is at the top of column 3. `watershed` numbers by minimum
+        // position and `bwlabel` by first pixel, and both scans go down the
+        // columns, so the left basin is 1 either way. Moving the right
+        // basin's minimum does not change that.
+        let negated = array![
+            [-1.0f64, -1.0, 0.0, -9.0, -1.0],
+            [-1.0, -1.0, 0.0, -1.0, -1.0],
+            [-1.0, -9.0, 0.0, -1.0, -1.0],
+        ];
+        let relabeled = matlab_run_watershed_2d(negated.view());
+        assert_eq!(relabeled[[0, 0]], 1);
+        assert_eq!(relabeled[[0, 4]], 2);
+        for r in 0..3 {
+            assert_eq!(relabeled[[r, 2]], 0, "ridge column stays a watershed line");
+        }
+    }
+
+    #[test]
+    fn run_watershed_renumbers_when_the_minimum_order_differs_from_the_pixel_order() {
+        // The top-left basin reaches column 0 but has its minimum far to
+        // the right (column 4). The bottom basin has its minimum in column
+        // 0. `watershed` alone numbers the bottom basin first (its minimum
+        // comes first going down the columns). `bwlabel` numbers the top
+        // basin first because its pixel at row 0, column 0 is scanned first.
+        let negated = array![
+            [-1.0f64, -1.0, -1.0, -1.0, -9.0],
+            [-1.0, -1.0, -1.0, -1.0, -1.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+            [-1.0, -1.0, -1.0, -1.0, -1.0],
+            [-9.0, -1.0, -1.0, -1.0, -1.0],
+        ];
+        let plain = matlab_watershed_2d(negated.view());
+        let relabeled = matlab_run_watershed_2d(negated.view());
+        assert_eq!(plain[[4, 0]], 1, "watershed numbers the bottom basin first");
+        assert_eq!(plain[[0, 0]], 2);
+        assert_eq!(relabeled[[0, 0]], 1, "bwlabel numbers the top basin first");
+        assert_eq!(relabeled[[4, 0]], 2);
     }
 }

@@ -1,16 +1,20 @@
 //! Pass-2 spectrogram masking.
 //!
-//! Port of pydynamo `tfpeaks.mask.mask_spectrogram` which itself matches
-//! MATLAB `computeTFPeaks.m:maskSpectrogram`:
+//! Follows MATLAB `computeTFPeaks.m:maskSpectrogram`:
 //!
 //! 1. For each pass-2 time column, find the nearest pass-1 column and
 //!    look up its label vector.
-//! 2. Paint spect2[f,t] wherever labels>0; zero elsewhere.
-//! 3. Zero the 1-pixel inner perimeter of each labeled region (8-conn),
-//!    matching MATLAB's `spect_masked(border_inds) = 0` where
-//!    border_inds = trim_borders from bwboundaries.
+//! 2. Keep spect2[f,t] wherever the pass-1 label is > 0; zero elsewhere.
+//! 3. Zero each region's contour, MATLAB's `spect_masked(border_inds) = 0`.
+//!    `border_inds` are the `trimmed_borders` of `trimWshedRegions.m`:
+//!    the 8-connected outer boundary that `bwtraceboundary` walks from the
+//!    region's first pixel. A region pixel that touches the outside only
+//!    at a corner is not on that walk and is kept.
 
 use ndarray::{Array2, ArrayView1, ArrayView2};
+use std::collections::HashMap;
+
+use crate::extract_pipeline::moore_trace;
 
 /// Nearest-neighbor mapping: for each stimes_2s value, the index into
 /// stimes_1s of the closest entry. Ties broken toward the right (matches
@@ -38,35 +42,35 @@ fn nearest_indices(stimes_2s: ArrayView1<f64>, stimes_1s: ArrayView1<f64>) -> Ve
     out
 }
 
-/// True if pixel (r, c) is an "inner boundary" pixel of its label under
-/// 8-connectivity — i.e. at least one of its 8 neighbors has a different
-/// label (including 0 / out-of-bounds). Matches
-/// `skimage.segmentation.find_boundaries(mode="inner", connectivity=2)`.
-#[inline]
-fn is_inner_boundary(labels: &Array2<i64>, r: usize, c: usize) -> bool {
-    let h = labels.nrows();
-    let w = labels.ncols();
-    let my_label = labels[[r, c]];
-    if my_label == 0 {
-        return false;
-    }
-    for dr in -1i32..=1 {
-        for dc in -1i32..=1 {
-            if dr == 0 && dc == 0 {
-                continue;
-            }
-            let nr = r as i32 + dr;
-            let nc = c as i32 + dc;
-            if nr < 0 || nc < 0 || nr >= h as i32 || nc >= w as i32 {
-                // OOB counts as different label → inner-boundary
-                return true;
-            }
-            if labels[[nr as usize, nc as usize]] != my_label {
-                return true;
+/// Contour pixels of every labeled region, on the label image's own grid.
+///
+/// For each label the walk starts at the region's first pixel in
+/// column-major order (top of its leftmost column), as `trimWshedRegions.m`
+/// seeds `bwtraceboundary(cc_mask, seed, 'N', 8)`, and follows the
+/// 8-connected outer boundary all the way around. Every pixel the walk
+/// visits is marked.
+fn region_contour_mask(labels: ArrayView2<i64>) -> Array2<bool> {
+    let (n_rows, n_cols) = labels.dim();
+
+    // First pixel of each label, scanning down each column, left to right.
+    let mut first_pixel: HashMap<i64, (usize, usize)> = HashMap::new();
+    for c in 0..n_cols {
+        for r in 0..n_rows {
+            let label = labels[[r, c]];
+            if label > 0 && !first_pixel.contains_key(&label) {
+                first_pixel.insert(label, (r, c));
             }
         }
     }
-    false
+
+    let mut on_contour = Array2::<bool>::from_elem((n_rows, n_cols), false);
+    for (&label, &(start_r, start_c)) in first_pixel.iter() {
+        let walk = moore_trace(labels, label, start_r, start_c);
+        for (r, c) in walk {
+            on_contour[[r, c]] = true;
+        }
+    }
+    on_contour
 }
 
 /// Build the pass-2 masked spectrogram.
@@ -102,33 +106,20 @@ pub fn mask_spectrogram(
     // Map each pass-2 column to the nearest pass-1 column.
     let nearest = nearest_indices(stimes_2s, stimes_1s);
 
-    // Construct labels_on_2s and apply mask in one pass.
-    // Easier to materialize labels_on_2s so we can do the boundary pass
-    // on it directly.
-    let mut labels_on_2s = Array2::<i64>::zeros((f_count, t_count_2));
+    // Region contours are traced on the pass-1 grid, where the regions
+    // were found, and carried to the pass-2 grid with the labels. MATLAB
+    // does the same: borders are pass-1 pixel indices shifted in time.
+    let on_contour_1s = region_contour_mask(labels_1s);
+
+    // Keep a pass-2 pixel when its pass-1 pixel is inside a region and
+    // not on that region's contour.
+    let mut masked = Array2::<f64>::zeros((f_count, t_count_2));
     for t in 0..t_count_2 {
         let src = nearest[t];
         for f in 0..f_count {
-            labels_on_2s[[f, t]] = labels_1s[[f, src]];
-        }
-    }
-
-    // Initial mask: paint spect wherever labels > 0, else 0.
-    let mut masked = Array2::<f64>::zeros((f_count, t_count_2));
-    for t in 0..t_count_2 {
-        for f in 0..f_count {
-            if labels_on_2s[[f, t]] > 0 {
+            let in_region = labels_1s[[f, src]] > 0;
+            if in_region && !on_contour_1s[[f, src]] {
                 masked[[f, t]] = spect_2s[[f, t]];
-            }
-        }
-    }
-
-    // Zero 1-pixel inner perimeter of each labeled region.
-    // (skimage find_boundaries mode='inner', connectivity=2)
-    for t in 0..t_count_2 {
-        for f in 0..f_count {
-            if labels_on_2s[[f, t]] > 0 && is_inner_boundary(&labels_on_2s, f, t) {
-                masked[[f, t]] = 0.0;
             }
         }
     }
@@ -170,6 +161,60 @@ mod tests {
             .collect();
         assert_eq!(nz, vec![(2, 2)]);
         assert_eq!(masked[[2, 2]], 13.0);
+    }
+
+    #[test]
+    fn a_pixel_touching_outside_only_at_a_corner_is_kept() {
+        // The region's top-right corner is cut off, so pixel (2,3) has the
+        // outside pixel (1,4) as a diagonal neighbor and region pixels on
+        // all four sides. The contour walk goes (1,3) -> (2,4) and steps
+        // past it, as MATLAB's bwtraceboundary does, so it is kept.
+        let labels = array![
+            [0i64, 0, 0, 0, 0, 0],
+            [0, 1, 1, 1, 0, 0],
+            [0, 1, 1, 1, 1, 0],
+            [0, 1, 1, 1, 1, 0],
+            [0, 1, 1, 1, 1, 0],
+            [0, 0, 0, 0, 0, 0],
+        ];
+        let spect = Array2::<f64>::from_elem((6, 6), 7.0);
+        let stimes = array![0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let masked = mask_spectrogram(spect.view(), stimes.view(), labels.view(), stimes.view())
+            .unwrap();
+        let mut kept: Vec<(usize, usize)> = Vec::new();
+        for r in 0..6 {
+            for c in 0..6 {
+                if masked[[r, c]] != 0.0 {
+                    kept.push((r, c));
+                }
+            }
+        }
+        assert_eq!(kept, vec![(2, 2), (2, 3), (3, 2), (3, 3)]);
+    }
+
+    #[test]
+    fn touching_regions_each_lose_their_own_contour() {
+        // Two regions side by side with no gap. Each contour is traced on
+        // its own region, so both facing columns are zeroed and only the
+        // two interior pixels survive.
+        let labels = array![
+            [1i64, 1, 1, 2, 2, 2],
+            [1, 1, 1, 2, 2, 2],
+            [1, 1, 1, 2, 2, 2],
+        ];
+        let spect = Array2::<f64>::from_elem((3, 6), 5.0);
+        let stimes = array![0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let masked = mask_spectrogram(spect.view(), stimes.view(), labels.view(), stimes.view())
+            .unwrap();
+        let mut kept: Vec<(usize, usize)> = Vec::new();
+        for r in 0..3 {
+            for c in 0..6 {
+                if masked[[r, c]] != 0.0 {
+                    kept.push((r, c));
+                }
+            }
+        }
+        assert_eq!(kept, vec![(1, 1), (1, 4)]);
     }
 
     #[test]

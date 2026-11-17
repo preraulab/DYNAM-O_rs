@@ -11,16 +11,27 @@
 //!   5. movmedian over `detrend_duration` → subtract (detrend)
 //!   6. iterative robust z-score (median + MAD) until convergence
 //!
-//! **Slope test is NOT ported.** The MATLAB / pydynamo `slope_test=True`
-//! branch needs a multitaper spectrogram; deferred until Part 5 step 7
-//! (multitaper_rs pull-in). `detect_artifacts_default` here sets
-//! `slope_test=false`; the caller can OR in a slope mask computed elsewhere.
+//! **Slope test.** [`slope_test_artifacts`] is MATLAB's `slope_test=true`
+//! branch: a multitaper spectrogram on 10 s windows, a log-log line fit per
+//! window, and a flag where the spectrum is too flat.
+//! [`detect_artifacts_with_slope_test`] is the full MATLAB default. It runs
+//! the slope test first and hands the mask to
+//! [`detect_artifacts_with_known_bad`], which treats it the way
+//! `detect_artifacts.m` treats `bad_slope`: the flagged samples join the
+//! flat-run and non-finite samples BEFORE the band tests, so they are
+//! interpolated out of the filtered signal and left out of the z-score
+//! statistics. OR-ing a slope mask onto the finished band mask is not
+//! equivalent, because the band thresholds are then computed from data
+//! MATLAB would have excluded.
 //!
-//! Bit-equivalence target: the band-based path must agree with pydynamo
-//! when pydynamo is invoked with `slope_test=False`.
+//! [`detect_artifacts`] is the same detector with no slope test (MATLAB
+//! `slope_test=false`).
 
 use crate::filter_design::cheby1_sos;
 use crate::signal::{hilbert, sosfiltfilt};
+use multitaper_rs::dpss::dpss_tapers;
+use multitaper_rs::{compute_spectrogram, DetrendMode, SpectrogramParams, Weighting};
+use ndarray::ArrayView1;
 
 /// Options for `detect_artifacts`. Matches pydynamo defaults.
 #[derive(Debug, Clone)]
@@ -61,59 +72,88 @@ impl Default for ArtifactOpts {
     }
 }
 
-/// True where `data` sits in a run of ≥ `min_run` identical values.
-/// Port of pydynamo `_flat_mask`.
+/// True where `data` sits in a run of at least `min_run` identical values.
+/// The strict form of [`flat_run_mask_with_tolerance`] (tolerance zero),
+/// matching MATLAB `get_chunks` called without a tolerance.
 pub fn flat_run_mask(data: &[f64], min_run: usize) -> Vec<bool> {
     flat_run_mask_with_tolerance(data, min_run, 0.0)
 }
 
-/// Return a mask marking runs of at least `min_run` samples whose full value
-/// span (`max - min`) does not exceed `tolerance`.
+/// Flag runs of near-constant samples of length at least `min_run`. A run
+/// extends while its full span (max − min) stays within `tol`, so a slow
+/// drift is not joined into one run merely because each step is small.
+/// `tol == 0.0` reduces to strict equality. A non-finite sample always ends
+/// the run. This is MATLAB `get_chunks(data, min_len, max_len, tol)`.
 ///
-/// Measuring the full span prevents a gradual drift from being joined into
-/// one run merely because each adjacent step is small. A non-positive
-/// `tolerance` uses strict equality, matching [`flat_run_mask`]. With a
-/// positive tolerance, non-finite samples terminate the current run.
-pub fn flat_run_mask_with_tolerance(data: &[f64], min_run: usize, tolerance: f64) -> Vec<bool> {
+/// A tolerance is needed in practice because artifact detection runs on the
+/// resampled signal, and the resampler leaves small ringing in flat regions.
+/// A truly disconnected or railed segment is then near-constant but never
+/// bit-identical. The tolerance recovers those while staying far below real
+/// EEG variation (flat interior about 0.01 µV against about 20 µV for EEG),
+/// so quiet sleep is not flagged.
+pub fn flat_run_mask_with_tolerance(data: &[f64], min_run: usize, tol: f64) -> Vec<bool> {
     let n = data.len();
-    if n == 0 {
-        return vec![];
-    }
     let mut mask = vec![false; n];
+    if n == 0 {
+        return mask;
+    }
     let mut run_start = 0usize;
     let mut run_min = data[0];
     let mut run_max = data[0];
-
     for i in 1..=n {
-        let same = if i == n {
-            false
-        } else if tolerance > 0.0 {
-            if data[i].is_finite() && run_min.is_finite() {
-                let next_min = run_min.min(data[i]);
-                let next_max = run_max.max(data[i]);
-                next_max - next_min <= tolerance
-            } else {
-                false
-            }
-        } else {
-            data[i] == data[run_start]
+        // Would extending the run to sample i keep its span within tol? A
+        // non-finite sample always breaks the run (handled as bad elsewhere).
+        let extend = i < n && data[i].is_finite() && {
+            let lo = run_min.min(data[i]);
+            let hi = run_max.max(data[i]);
+            (hi - lo) <= tol
         };
-
-        if same {
+        if extend {
             run_min = run_min.min(data[i]);
             run_max = run_max.max(data[i]);
         } else {
             if i - run_start >= min_run {
-                mask[run_start..i].fill(true);
+                for m in mask.iter_mut().take(i).skip(run_start) {
+                    *m = true;
+                }
             }
-            run_start = i;
             if i < n {
+                run_start = i;
                 run_min = data[i];
                 run_max = data[i];
             }
         }
     }
     mask
+}
+
+/// Tolerance for [`flat_run_mask_with_tolerance`] as used by [`detect_artifacts`]: `frac × std`
+/// over the finite samples, `frac = DYNAMO_FLAT_TOL_FRAC` (default 0.02). Big
+/// enough that resampler ringing inside a genuinely flat/disconnected segment
+/// (≈0.01 µV) still reads as flat, but ~1000× below real EEG variation (~20 µV),
+/// so quiet sleep is never flagged. `frac = 0` gives strict equality.
+pub fn flat_tolerance(data: &[f64]) -> f64 {
+    let frac = std::env::var("DYNAMO_FLAT_TOL_FRAC")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| *v >= 0.0)
+        .unwrap_or(0.02);
+    let (mut sum, mut sum2, mut cnt) = (0.0f64, 0.0f64, 0usize);
+    for &v in data {
+        if v.is_finite() {
+            sum += v;
+            sum2 += v * v;
+            cnt += 1;
+        }
+    }
+    let std_dev = if cnt > 1 {
+        ((sum2 - sum * sum / cnt as f64) / (cnt as f64 - 1.0))
+            .max(0.0)
+            .sqrt()
+    } else {
+        0.0
+    };
+    frac * std_dev
 }
 
 /// MATLAB `movmean(x, win)` — centered moving mean with shrinking window
@@ -123,8 +163,10 @@ fn movmean(x: &[f64], win: usize) -> Vec<f64> {
     if win <= 1 || n == 0 {
         return x.to_vec();
     }
-    let half_l = (win - 1) / 2;
-    let half_r = win / 2;
+    // MATLAB places an even-length window one sample toward the past:
+    // samples [i - win/2, i + win/2 - 1]. Odd lengths are symmetric.
+    let half_l = win / 2;
+    let half_r = (win - 1) / 2;
     let mut csum = vec![0.0_f64; n + 1];
     for i in 0..n {
         csum[i + 1] = csum[i] + x[i];
@@ -181,8 +223,10 @@ fn movmedian_two_heap(x: &[f64], win: usize) -> Vec<f64> {
     if win <= 1 || n == 0 {
         return x.to_vec();
     }
-    let half_l = (win - 1) / 2;
-    let half_r = win / 2;
+    // MATLAB places an even-length window one sample toward the past:
+    // samples [i - win/2, i + win/2 - 1]. Odd lengths are symmetric.
+    let half_l = win / 2;
+    let half_r = (win - 1) / 2;
 
     // lo: max-heap (top is largest of the small half).
     // hi: min-heap (top is smallest of the large half).
@@ -318,8 +362,10 @@ fn movmedian_fenwick(x: &[f64], win: usize) -> Vec<f64> {
     if win <= 1 || n == 0 {
         return x.to_vec();
     }
-    let half_l = (win - 1) / 2;
-    let half_r = win / 2;
+    // MATLAB places an even-length window one sample toward the past:
+    // samples [i - win/2, i + win/2 - 1]. Odd lengths are symmetric.
+    let half_l = win / 2;
+    let half_r = (win - 1) / 2;
 
     // 1) Rank-sort x: rank[i] = i's position in sorted order.
     //    sorted_vals[r] gives the r-th smallest value.
@@ -402,7 +448,7 @@ fn movmedian_fenwick(x: &[f64], win: usize) -> Vec<f64> {
 }
 
 /// Median of finite values. Returns NaN for all-NaN input.
-#[cfg(test)]
+#[allow(dead_code)] // used by the test-only reference impl in `mod tests`
 fn median(xs: &[f64]) -> f64 {
     let mut v: Vec<f64> = xs.iter().filter(|x| x.is_finite()).copied().collect();
     if v.is_empty() {
@@ -419,7 +465,7 @@ fn median(xs: &[f64]) -> f64 {
 
 /// MATLAB default `mad(x)`: mean absolute deviation from the mean.
 /// (Not median absolute deviation! pydynamo matches.)
-#[cfg(test)]
+#[allow(dead_code)] // used by the test-only reference impl in `mod tests`
 fn mad_meanabs(xs: &[f64]) -> f64 {
     let finite: Vec<f64> = xs.iter().filter(|x| x.is_finite()).copied().collect();
     if finite.is_empty() {
@@ -429,6 +475,7 @@ fn mad_meanabs(xs: &[f64]) -> f64 {
     finite.iter().map(|&v| (v - mean_).abs()).sum::<f64>() / finite.len() as f64
 }
 
+#[allow(dead_code)] // used by the test-only reference impl in `mod tests`
 fn mean_std(xs: &[f64]) -> (f64, f64) {
     let finite: Vec<f64> = xs.iter().filter(|x| x.is_finite()).copied().collect();
     if finite.is_empty() {
@@ -704,27 +751,50 @@ fn binary_dilate(mask: &[bool], k: usize) -> Vec<bool> {
 }
 
 /// Detect artifacts in an EEG time series. Two-band (BB + HF) detection + flat-
-/// run + outlier-noise flagging. **Does NOT run the slope test** — the caller
-/// must OR in any slope-based mask computed via multitaper elsewhere.
+/// run + outlier-noise flagging, with no slope test (MATLAB
+/// `detect_artifacts(..., 'slope_test', false)`).
 pub fn detect_artifacts(data: &[f64], fs: f64, opts: &ArtifactOpts) -> Vec<bool> {
+    detect_artifacts_with_known_bad(data, fs, opts, None)
+}
+
+/// Detect artifacts given samples already known to be bad, such as the
+/// slope-test mask. Matches `detect_artifacts.m` with `slope_test=true`:
+///
+/// ```text
+/// bad_inds = isnan(data) | isinf(data) | is_flat | bad_slope;
+/// bad_inds = find_outlier_noise(data, bad_inds);
+/// ```
+///
+/// The known-bad samples are part of `bad_inds` from the start. They are
+/// excluded from the outlier-noise mean and standard deviation, interpolated
+/// out of the signal the band filters see, left out of the band z-score
+/// statistics, and always present in the returned mask.
+///
+/// `known_bad`, when given, must have the same length as `data`.
+pub fn detect_artifacts_with_known_bad(
+    data: &[f64],
+    fs: f64,
+    opts: &ArtifactOpts,
+    known_bad: Option<&[bool]>,
+) -> Vec<bool> {
     let n = data.len();
     if n == 0 {
         return vec![];
     }
+    if let Some(mask) = known_bad {
+        assert_eq!(mask.len(), n, "known_bad must have one entry per sample");
+    }
 
-    // Flat runs of ≥ 1 s. Resampling leaves small ringing in genuinely
-    // disconnected segments, so match MATLAB's tolerance of 2% of the finite
-    // signal's sample standard deviation instead of requiring exact equality.
-    let (_, sample_std) = mean_std(data);
-    let flat_tol = 0.02 * sample_std;
-    let flat = flat_run_mask_with_tolerance(
-        data,
-        fs.round().max(1.0) as usize,
-        flat_tol,
-    );
-    let mut bad: Vec<bool> = (0..n)
-        .map(|i| !data[i].is_finite() || flat[i])
-        .collect();
+    // Flat runs of ≥ 1 s, with a data-scaled tolerance (see flat_tolerance).
+    let flat = flat_run_mask_with_tolerance(data, fs.round().max(1.0) as usize, flat_tolerance(data));
+    let mut bad: Vec<bool> = Vec::with_capacity(n);
+    for i in 0..n {
+        let already_known_bad = match known_bad {
+            Some(mask) => mask[i],
+            None => false,
+        };
+        bad.push(!data[i].is_finite() || flat[i] || already_known_bad);
+    }
     bad = find_outlier_noise(data, &bad, 10.0);
 
     // Interp through bad samples so filters don't see NaN / flats.
@@ -775,14 +845,288 @@ pub fn detect_artifacts(data: &[f64], fs: f64, opts: &ArtifactOpts) -> Vec<bool>
     artifacts
 }
 
+/// Slope-test artifact mask — the `slope_test` block of `detect_artifacts.m`.
+///
+/// ```text
+/// [spect, stimes, sfreqs] = multitaper_spectrogram(data, Fs, [1 min(55,Fs/2)], [10,19], [10 5], ...);
+/// B(ii,:) = polyfit(log(sfreqs)', log(spect(:,ii)), 1);
+/// bad_slope = interp1(stimes, double(B(:,1) > slope_crit)', t, 'nearest')';
+/// bad_slope(isnan(bad_slope)) = 1;
+/// ```
+///
+/// A multitaper spectrogram (time-half-bandwidth 10, 19 tapers) is computed
+/// on 10 s windows stepped by 5 s over 1 to `min(55, fs/2)` Hz. Each window
+/// gets a straight-line fit of log power against log frequency. A window
+/// whose slope is above `slope_crit` (MATLAB default −0.5) has a spectrum
+/// too flat to be EEG and is flagged. A window with any non-positive or
+/// non-finite power is flagged too.
+///
+/// Each sample takes the verdict of the nearest window center, an exact
+/// midpoint going to the later window. Samples before the first or after
+/// the last window center are always flagged, as in MATLAB: with the 10 s
+/// window that is the first and last 5 s of every recording.
+///
+/// Returns one flag per sample of `data`. Errors come from the taper or
+/// spectrogram computation.
+pub fn slope_test_artifacts(data: &[f64], fs: f64, slope_crit: f64) -> Result<Vec<bool>, String> {
+    let n_samples = data.len();
+    let window_s = 10.0_f64;
+    let step_s = 5.0_f64;
+    let time_half_bandwidth = 10.0_f64;
+    let n_tapers = 19_usize;
+    let freq_max = (55.0_f64).min(fs / 2.0);
+    let freq_range = (1.0_f64, freq_max);
+
+    let window_samples = (window_s * fs).round() as usize;
+    if window_samples < 4 {
+        return Ok(vec![false; n_samples]);
+    }
+    // FFT length for a 0.1 Hz frequency grid, rounded up to a power of two.
+    // MATLAB arrives at the same length as the next power of two of the
+    // 10 s window (`fs / 0.1` and `10 * fs` are the same number).
+    let frequency_spacing_hz = 0.1_f64;
+    let nfft = ((fs / frequency_spacing_hz).ceil() as usize).next_power_of_two();
+
+    let tapers = dpss_tapers(window_samples, time_half_bandwidth, n_tapers)
+        .map_err(|e| format!("slope test tapers: {}", e))?;
+    let spectrogram = compute_spectrogram(
+        ArrayView1::from(data),
+        tapers.view(),
+        None,
+        &SpectrogramParams {
+            fs,
+            frequency_range: freq_range,
+            window_params: (window_s, step_s),
+            nfft,
+            // MATLAB passes [] for the detrend option here, which its
+            // multitaper wrapper resolves to 'linear'. A constant detrend
+            // would leave drift inside each 10 s window and tilt the fit.
+            detrend: DetrendMode::Linear,
+            weighting: Weighting::Unity,
+        },
+    )
+    .map_err(|e| format!("slope test spectrogram: {}", e))?;
+
+    let power = &spectrogram.mt_spectrogram; // (frequencies, windows)
+    let window_centers = &spectrogram.stimes;
+    let frequencies = &spectrogram.sfreqs;
+    let n_freqs = frequencies.len();
+    let n_windows = window_centers.len();
+    if n_freqs == 0 || n_windows == 0 {
+        return Ok(vec![false; n_samples]);
+    }
+
+    // Least-squares slope of log(power) on log(frequency):
+    //   slope = sum((x - mean_x) * (y - mean_y)) / sum((x - mean_x)^2)
+    // The x side is the same for every window, so it is computed once.
+    let mut log_freq: Vec<f64> = Vec::with_capacity(n_freqs);
+    for &frequency in frequencies.iter() {
+        log_freq.push(frequency.max(1e-30).ln());
+    }
+    let mean_log_freq: f64 = log_freq.iter().sum::<f64>() / n_freqs as f64;
+    let mut sum_squares_x = 0.0_f64;
+    for &x in &log_freq {
+        sum_squares_x += (x - mean_log_freq).powi(2);
+    }
+    if sum_squares_x <= 0.0 || !sum_squares_x.is_finite() {
+        return Ok(vec![false; n_samples]);
+    }
+
+    let mut window_is_bad: Vec<bool> = vec![false; n_windows];
+    let mut log_power: Vec<f64> = Vec::with_capacity(n_freqs);
+    for window in 0..n_windows {
+        log_power.clear();
+        let mut has_unusable_power = false;
+        for freq_index in 0..n_freqs {
+            let value = power[[freq_index, window]];
+            if !(value > 0.0 && value.is_finite()) {
+                has_unusable_power = true;
+                break;
+            }
+            log_power.push(value.ln());
+        }
+        if has_unusable_power {
+            window_is_bad[window] = true;
+            continue;
+        }
+        let mean_log_power: f64 = log_power.iter().sum::<f64>() / n_freqs as f64;
+        let mut sum_cross = 0.0_f64;
+        for freq_index in 0..n_freqs {
+            sum_cross += (log_freq[freq_index] - mean_log_freq) * (log_power[freq_index] - mean_log_power);
+        }
+        let slope = sum_cross / sum_squares_x;
+        window_is_bad[window] = slope > slope_crit;
+    }
+
+    // Spread the per-window verdicts onto the samples.
+    let first_center = window_centers[0];
+    let last_center = window_centers[n_windows - 1];
+    let mut mask: Vec<bool> = vec![false; n_samples];
+    for (sample, flag) in mask.iter_mut().enumerate() {
+        let time = sample as f64 / fs;
+        if time < first_center || time > last_center {
+            *flag = true;
+            continue;
+        }
+        // First window center at or after this sample.
+        let mut low = 0_usize;
+        let mut high = n_windows - 1;
+        while low < high {
+            let middle = (low + high) / 2;
+            if window_centers[middle] < time {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        // Step back to the previous center when it is strictly closer.
+        let mut nearest = low;
+        if nearest > 0 {
+            let distance_previous = (time - window_centers[nearest - 1]).abs();
+            let distance_current = (time - window_centers[nearest]).abs();
+            if distance_previous < distance_current {
+                nearest -= 1;
+            }
+        }
+        *flag = window_is_bad[nearest];
+    }
+    Ok(mask)
+}
+
+/// The full MATLAB default detector, `detect_artifacts(data, Fs)` with
+/// `slope_test = true`: the slope test runs first and its mask is folded
+/// into the bad-sample set before the band tests (see
+/// [`detect_artifacts_with_known_bad`]).
+pub fn detect_artifacts_with_slope_test(
+    data: &[f64],
+    fs: f64,
+    opts: &ArtifactOpts,
+    slope_crit: f64,
+) -> Result<Vec<bool>, String> {
+    let slope_mask = slope_test_artifacts(data, fs, slope_crit)?;
+    Ok(detect_artifacts_with_known_bad(data, fs, opts, Some(&slope_mask)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deterministic noise in (-1, 1) from a 64-bit LCG.
+    fn lcg_noise(state: &mut u64) -> f64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+    }
+
+    /// Ten minutes at 100 Hz: quiet noise, one long loud stretch
+    /// (samples 20000..32000), and one short moderate burst
+    /// (samples 45000..45300).
+    fn signal_with_loud_stretch_and_burst() -> Vec<f64> {
+        let mut state = 0x00C0_FFEE_u64;
+        let mut data = Vec::with_capacity(60_000);
+        for i in 0..60_000 {
+            let mut amplitude = 1.0;
+            if (20_000..32_000).contains(&i) {
+                amplitude = 60.0;
+            }
+            if (45_000..45_300).contains(&i) {
+                amplitude = 12.0;
+            }
+            data.push(amplitude * lcg_noise(&mut state));
+        }
+        data
+    }
+
+    /// White noise has a flat spectrum (slope near 0, above the −0.5
+    /// threshold). Integrated white noise falls off as 1/f² (slope near −2).
+    #[test]
+    fn slope_test_flags_flat_spectra_and_the_recording_edges() {
+        let fs = 100.0;
+        let n = 12_000; // 120 s
+        let mut state = 0x5EED_u64;
+        let mut data = Vec::with_capacity(n);
+        let mut random_walk = 0.0;
+        for i in 0..n {
+            let noise = lcg_noise(&mut state);
+            random_walk += noise;
+            // 40 s to 80 s is white noise, the rest is the random walk.
+            if (4_000..8_000).contains(&i) {
+                data.push(noise);
+            } else {
+                data.push(random_walk);
+            }
+        }
+        let mask = slope_test_artifacts(&data, fs, -0.5).expect("slope test");
+        assert_eq!(mask.len(), n);
+        // Window centers run from 5 s to 115 s. Samples strictly before the
+        // first or strictly after the last center are always flagged.
+        assert!(mask[0] && mask[499]);
+        assert!(mask[n - 1] && mask[n - 499]);
+        // Steep-spectrum stretches pass, the flat-spectrum stretch is flagged.
+        assert!(!mask[2_000], "random walk at 20 s should pass");
+        assert!(mask[6_000], "white noise at 60 s should be flagged");
+        assert!(!mask[10_000], "random walk at 100 s should pass");
+    }
+
+    #[test]
+    fn detector_with_slope_test_is_the_known_bad_detector_on_the_slope_mask() {
+        let data = signal_with_loud_stretch_and_burst();
+        let opts = ArtifactOpts::default();
+        let slope_mask = slope_test_artifacts(&data, 100.0, -0.5).expect("slope test");
+        let expected = detect_artifacts_with_known_bad(&data, 100.0, &opts, Some(&slope_mask));
+        let combined = detect_artifacts_with_slope_test(&data, 100.0, &opts, -0.5).expect("detector");
+        assert_eq!(combined, expected);
+    }
+
+    #[test]
+    fn known_bad_none_is_the_plain_detector() {
+        let data = signal_with_loud_stretch_and_burst();
+        let opts = ArtifactOpts::default();
+        let plain = detect_artifacts(&data, 100.0, &opts);
+        let with_none = detect_artifacts_with_known_bad(&data, 100.0, &opts, None);
+        assert_eq!(plain, with_none);
+    }
+
+    #[test]
+    fn known_bad_samples_are_always_flagged() {
+        let data = signal_with_loud_stretch_and_burst();
+        let mut known_bad = vec![false; data.len()];
+        for flag in known_bad.iter_mut().take(1_500).skip(1_000) {
+            *flag = true; // a quiet stretch no band test would flag
+        }
+        let mask =
+            detect_artifacts_with_known_bad(&data, 100.0, &ArtifactOpts::default(), Some(&known_bad));
+        for i in 1_000..1_500 {
+            assert!(mask[i], "known-bad sample {} missing from the mask", i);
+        }
+    }
+
+    #[test]
+    fn known_bad_samples_change_the_band_statistics() {
+        // Folding a mask in before the band tests is not the same as OR-ing
+        // it on afterwards: with the loud stretch excluded up front, the
+        // thresholds are computed from the quiet data alone.
+        let data = signal_with_loud_stretch_and_burst();
+        let opts = ArtifactOpts::default();
+        let mut known_bad = vec![false; data.len()];
+        for flag in known_bad.iter_mut().take(32_000).skip(20_000) {
+            *flag = true;
+        }
+        let folded_in = detect_artifacts_with_known_bad(&data, 100.0, &opts, Some(&known_bad));
+        let plain = detect_artifacts(&data, 100.0, &opts);
+        let mut or_afterwards = Vec::with_capacity(data.len());
+        for i in 0..data.len() {
+            or_afterwards.push(plain[i] || known_bad[i]);
+        }
+        assert_ne!(folded_in, or_afterwards);
+    }
 
     #[test]
     fn flat_run_detection() {
         let x = vec![1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 3.0];
         // min_run=3 → the first run (4 × 1.0) and last (3 × 3.0) are flat.
+        // tol=0 = strict equality (original behavior).
         let m = flat_run_mask(&x, 3);
         assert_eq!(
             m,
@@ -791,45 +1135,16 @@ mod tests {
     }
 
     #[test]
-    fn flat_run_tolerance_uses_full_run_span() {
-        // Adjacent differences are within tolerance, but the full span is not.
-        // MATLAB get_chunks therefore splits this sequence.
-        let data = [0.0, 0.009, 0.018];
-
-        let mask = flat_run_mask_with_tolerance(&data, 3, 0.01);
-
-        assert!(!mask.iter().any(|&value| value));
-    }
-
-    #[test]
-    fn flat_run_tolerance_recovers_resampled_disconnection() {
-        let mut data: Vec<f64> = (0..2_000)
-            .map(|i| {
-                let x = i as f64;
-                (0.37 * x).sin() + 0.5 * (0.11 * x).cos()
-            })
-            .collect();
-        let (_, sample_std) = mean_std(&data);
-        let flat_tol = 0.02 * sample_std;
-        assert!(
-            !flat_run_mask_with_tolerance(&data, 100, flat_tol)
-                .iter()
-                .any(|&value| value),
-            "ordinary varying EEG must not be marked flat"
-        );
-
-        for (offset, value) in data[800..950].iter_mut().enumerate() {
-            *value = -0.005 + 0.01 * offset as f64 / 149.0;
-        }
-        let (_, sample_std) = mean_std(&data);
-        let mask = flat_run_mask_with_tolerance(&data, 100, 0.02 * sample_std);
-
-        assert!(mask[800..950].iter().all(|&value| value));
-        assert!(!mask[..500].iter().any(|&value| value));
-        assert!(!mask[1_200..].iter().any(|&value| value));
-
-        let artifacts = detect_artifacts(&data, 100.0, &ArtifactOpts::default());
-        assert!(artifacts[800..950].iter().all(|&value| value));
+    fn even_windows_match_matlab() {
+        // MATLAB R2025b:
+        //   movmean([1 2 3 4 5 6], 4)   -> 1.5 2 2.5 3.5 4.5 5
+        //   movmedian([1 5 2 8 3 9], 4) -> 3 2 3.5 4 5.5 8
+        let mean = movmean(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 4);
+        assert_eq!(mean, vec![1.5, 2.0, 2.5, 3.5, 4.5, 5.0]);
+        let median = movmedian(&[1.0, 5.0, 2.0, 8.0, 3.0, 9.0], 4);
+        assert_eq!(median, vec![3.0, 2.0, 3.5, 4.0, 5.5, 8.0]);
+        let median_reference = movmedian_fenwick(&[1.0, 5.0, 2.0, 8.0, 3.0, 9.0], 4);
+        assert_eq!(median_reference, vec![3.0, 2.0, 3.5, 4.0, 5.5, 8.0]);
     }
 
     #[test]
@@ -842,6 +1157,33 @@ mod tests {
         assert!((m[2] - 3.0).abs() < 1e-12);
         assert!((m[3] - 4.0).abs() < 1e-12);
         assert!((m[4] - 4.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn tolerance_flat_catches_resampled_flat_but_not_eeg() {
+        // A genuinely flat/disconnected segment survives resampling as
+        // near-constant (sub-unit ringing), not bit-identical. Exact equality
+        // misses it; a tolerance catches it — while real EEG is never flagged.
+        let min_run = 100usize;
+        let mut data = vec![0.0f64; 500];
+        for i in 0..150 {
+            data[i] = 20.0 * (i as f64 * 0.5).sin();
+        } // EEG (±20)
+        for (i, v) in data.iter_mut().enumerate().take(400).skip(150) {
+            *v = -2048.0 + 0.1 * (((i * 7) % 5) as f64 - 2.0); // flat ± ~0.2
+        }
+        for i in 400..500 {
+            data[i] = 20.0 * (i as f64 * 0.5).sin();
+        } // EEG (±20)
+
+        // Exact equality (tol=0) misses the ringing flat.
+        let exact = flat_run_mask(&data, min_run);
+        assert!(!exact[250], "exact test wrongly caught (or ringing was zero)");
+
+        // Tolerance above the ±0.2 ringing catches the flat, spares the EEG.
+        let m = flat_run_mask_with_tolerance(&data, min_run, 1.0);
+        assert!(m[250], "tolerance should catch the near-constant flat");
+        assert!(!m[50] && !m[450], "real EEG (±20) must not be flagged with tol=1");
     }
 
     #[test]
@@ -925,12 +1267,7 @@ mod tests {
 
         // Sequential reference — mirror the body of detect_artifacts
         // but without rayon::join.
-        let (_, sample_std) = mean_std(&data);
-        let flat = flat_run_mask_with_tolerance(
-            &data,
-            fs.round().max(1.0) as usize,
-            0.02 * sample_std,
-        );
+        let flat = flat_run_mask_with_tolerance(&data, fs.round().max(1.0) as usize, flat_tolerance(&data));
         let mut bad: Vec<bool> = (0..data.len())
             .map(|i| !data[i].is_finite() || flat[i])
             .collect();

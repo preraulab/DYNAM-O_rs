@@ -28,6 +28,30 @@
 use ndarray::{Array2, ArrayView1, ArrayView2};
 use crate::parallel::*;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// `TFPEAKS_DEBUG` per-stage region tallies, summed across all segments of
+/// one `extract_tfpeaks` call (reset at the start of each call). Lets the
+/// caller print a watershed → merge → dur/bw-cut → trim breakdown.
+pub static DBG_WS: AtomicU64 = AtomicU64::new(0);
+pub static DBG_MERGE: AtomicU64 = AtomicU64::new(0);
+pub static DBG_CUT: AtomicU64 = AtomicU64::new(0);
+pub static DBG_TRIM: AtomicU64 = AtomicU64::new(0);
+
+fn tfpeaks_debug() -> bool {
+    std::env::var("TFPEAKS_DEBUG").is_ok()
+}
+
+/// Count distinct positive labels in a label image.
+fn count_labels(a: &Array2<i64>) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    for &v in a.iter() {
+        if v > 0 {
+            seen.insert(v);
+        }
+    }
+    seen.len() as u64
+}
 
 /// Per-segment peak table (one row per surviving label).
 ///
@@ -57,7 +81,7 @@ pub struct SegmentPeaks {
     pub height: Vec<f64>,
     pub volume: Vec<f64>,
     pub segment_num: Vec<f64>,
-    pub bbox: Vec<f64>, // 4 * n (t_tl, f_tl, width_s, height_Hz) in pydynamo format
+    pub bbox: Vec<f64>, // 4 * n (t_tl, f_tl, width_s, height_Hz): exact pixel extent, corner half a bin before the first pixel center
     pub area: Vec<f64>, // sec*Hz per peak (pixel_count * d_time * d_freq)
     pub peakiness: Vec<f64>, // N/(N-1) * (max - mean) / (max - min) of region pixels, [0, 1]
     pub height_data: Vec<Vec<f64>>, // pixel values per peak (interior, NaN-excluded)
@@ -331,7 +355,7 @@ const MOORE_NEW_C_DIR: [usize; 8] = [6, 6, 0, 0, 2, 2, 4, 4];
 /// check fails on those because the trace can revisit start with a
 /// different c_dir mid-circuit, then run away. A `max_steps` cap is kept
 /// as a defense-in-depth net.
-fn moore_trace(
+pub(crate) fn moore_trace(
     labels: ArrayView2<i64>,
     lbl: i64,
     start_r: usize,
@@ -495,9 +519,14 @@ fn compute_peak_props_from_trim(
         let mean_v = a.sum_v / n_px;
         let peakiness =
             (n_px / (n_px - 1.0)) * (a.max_v - mean_v) / (a.max_v - a.min_v);
-        // BoundingBox in pydynamo format: (time_tl, freq_tl, width_s, height_Hz).
-        let t_tl = (a.c_min as f64) * d_time + t0;
-        let f_tl = (a.r_min as f64) * d_freq + f0;
+        // BoundingBox: (time_tl, freq_tl, width_s, height_Hz), the exact
+        // extent of the region's pixels. A pixel at index c is centered on
+        // `c * d_time + t0` and covers half a bin to each side, so the
+        // box starts half a bin before the center of the first pixel and,
+        // with width `n_t * d_time`, ends half a bin after the center of
+        // the last one. The same holds along frequency.
+        let t_tl = (a.c_min as f64 - 0.5) * d_time + t0;
+        let f_tl = (a.r_min as f64 - 0.5) * d_freq + f0;
         let w_s = n_t * d_time;
         let h_hz = n_f * d_freq;
 
@@ -557,10 +586,12 @@ pub fn extract_tfpeaks_segment(
         return Ok((SegmentPeaks::default(), Array2::<i64>::zeros((f, t))));
     }
 
-    // 2) Watershed on -seg_LR.
+    // 2) Watershed on -seg_LR, numbered as MATLAB `runWatershed.m` does.
     let neg: Array2<f64> = seg_lr.mapv(|v| -v);
-    let ws_u16 = crate::matlab_watershed::matlab_watershed_2d(neg.view());
-    let ws_i64: Array2<i64> = ws_u16.mapv(|v| v as i64);
+    let ws_i64: Array2<i64> = crate::matlab_watershed::matlab_run_watershed_2d(neg.view());
+    if tfpeaks_debug() {
+        DBG_WS.fetch_add(count_labels(&ws_i64), Ordering::Relaxed);
+    }
 
     // 3) Merge (interior-only labels).
     let merged_i32 = crate::merge::run(
@@ -570,6 +601,9 @@ pub fn extract_tfpeaks_segment(
         params.max_merges,
     )?;
     let merged_i64: Array2<i64> = merged_i32.mapv(|v| v as i64);
+    if tfpeaks_debug() {
+        DBG_MERGE.fetch_add(count_labels(&merged_i64), Ordering::Relaxed);
+    }
 
     // 4) Border handling. Options:
     //      0 => MATLAB paint-in-label-order (8-conn 1-px dilation, higher
@@ -638,6 +672,10 @@ pub fn extract_tfpeaks_segment(
         }
     }
 
+    if tfpeaks_debug() {
+        DBG_CUT.fetch_add(count_labels(&labels_full), Ordering::Relaxed);
+    }
+
     // 6) Trim on the full-resolution spect.
     let labels_full_i32: Array2<i32> = labels_full.mapv(|v| v as i32);
     let shift_val = if params.trim_shift_val.is_nan() {
@@ -649,6 +687,9 @@ pub fn extract_tfpeaks_segment(
         labels_full_i32.view(), spect, params.trim_vol_thresh, shift_val,
     )?;
     let trimmed_i64: Array2<i64> = trimmed.mapv(|v| v as i64);
+    if tfpeaks_debug() {
+        DBG_TRIM.fetch_add(count_labels(&trimmed_i64), Ordering::Relaxed);
+    }
 
     // 7) Peak properties.
     let peaks = compute_peak_props_from_trim(
@@ -684,6 +725,12 @@ pub fn extract_tfpeaks_segment(
 /// Full top-level: split spect into seg_time segments, extract peaks from
 /// each (in parallel), concatenate, then apply filterStatsTable (dur / bw /
 /// peak_freq / height-dB cuts).
+///
+/// `cancel`, when supplied, is polled at the start of each segment task: if
+/// it returns `true` the call early-returns `Err` without running the
+/// remaining segments' watershed. This keeps a host's Stop control
+/// responsive — a cancelled call returns within ~one segment instead of the
+/// whole multi-segment extract. With `cancel: None` the path is unchanged.
 pub fn extract_tfpeaks(
     spect: ArrayView2<f64>,
     stimes: ArrayView1<f64>,
@@ -691,6 +738,7 @@ pub fn extract_tfpeaks(
     baseline: Option<ArrayView1<f64>>,
     params: &ExtractParams,
     progress_cb: Option<&(dyn Fn(u32, u32) + Sync)>,
+    cancel: Option<&(dyn Fn() -> bool + Sync)>,
 ) -> Result<(SegmentPeaks, Array2<i64>), String> {
     let (f, t) = spect.dim();
     if stimes.len() != t {
@@ -753,10 +801,22 @@ pub fn extract_tfpeaks(
 
     // Parallel extract; collect per-segment results preserving order.
     let n_segs_total = seg_bounds.len() as u32;
+    if tfpeaks_debug() {
+        DBG_WS.store(0, Ordering::Relaxed);
+        DBG_MERGE.store(0, Ordering::Relaxed);
+        DBG_CUT.store(0, Ordering::Relaxed);
+        DBG_TRIM.store(0, Ordering::Relaxed);
+    }
     let done = std::sync::atomic::AtomicU32::new(0);
     let results: Vec<Result<(SegmentPeaks, Array2<i64>), String>> = seg_bounds
         .par_iter()
         .map(|&(si, start, end)| {
+            // Bail before a segment's watershed if the run was cancelled —
+            // keeps a host's Stop responsive within ~one segment instead of
+            // the whole multi-segment extract.
+            if cancel.is_some_and(|c| c()) {
+                return Err("cancelled".to_string());
+            }
             // Make the segment spect contiguous — trim / merge require it.
             let sub_spect = spect_owned
                 .slice(ndarray::s![.., start..end])
@@ -772,6 +832,17 @@ pub fn extract_tfpeaks(
             r
         })
         .collect();
+
+    if tfpeaks_debug() {
+        eprintln!(
+            "[tfdbg]   extract_tfpeaks: {} segs  watershed={} -> merge={} -> dur/bw-cut={} -> trim={}  (regions, summed over segments)",
+            n_segs_total,
+            DBG_WS.load(Ordering::Relaxed),
+            DBG_MERGE.load(Ordering::Relaxed),
+            DBG_CUT.load(Ordering::Relaxed),
+            DBG_TRIM.load(Ordering::Relaxed),
+        );
+    }
 
     // Stitch per-segment labels into a full (F, T) image with running
     // label offset so that peak row k in the concatenated SegmentPeaks
@@ -1084,6 +1155,7 @@ mod tests {
             None,
             &params,
             None,
+            None,
         ) {
             Err(err) => err,
             Ok(_) => panic!("mismatched stimes length was accepted"),
@@ -1096,6 +1168,7 @@ mod tests {
             sfreqs.slice(ndarray::s![..1]),
             None,
             &params,
+            None,
             None,
         ) {
             Err(err) => err,
@@ -1153,7 +1226,7 @@ mod tests {
         };
 
         let (peaks, labels) = extract_tfpeaks(
-            spect.view(), stimes.view(), sfreqs.view(), None, &params, None,
+            spect.view(), stimes.view(), sfreqs.view(), None, &params, None, None,
         ).expect("extract_tfpeaks failed");
 
         // Shape matches the input spect.
@@ -1213,5 +1286,35 @@ mod tests {
                 // (resize-nearest may straddle the cut).
             }
         }
+    }
+
+    /// A cancel callback that always fires makes `extract_tfpeaks` return
+    /// `Err` instead of running every segment's watershed — this is what
+    /// keeps a host's Stop control responsive mid-extract.
+    #[test]
+    fn extract_tfpeaks_cancels() {
+        // dt = 0.1 s, T = 60 s → two segments at seg_time = 30 s.
+        let n_f = 16usize;
+        let n_t = 600usize;
+        let spect = Array2::<f64>::from_elem((n_f, n_t), 1.0);
+        let stimes: Array1<f64> = Array1::from_iter((0..n_t).map(|i| i as f64 * 0.1));
+        let sfreqs: Array1<f64> = Array1::from_iter((0..n_f).map(|i| i as f64 * 0.5));
+        let params = ExtractParams {
+            seg_time: 30.0,
+            downsample_f: 1, downsample_t: 1,
+            merge_thresh: 8.0, max_merges: f64::INFINITY,
+            trim_vol_thresh: 0.8, trim_shift_val: f64::NAN,
+            dur_min: 0.0, dur_max: f64::INFINITY,
+            bw_min: 0.0, bw_max: f64::INFINITY,
+            freq_min: 0.0, freq_max: f64::INFINITY,
+            ht_db_min: f64::NEG_INFINITY,
+            expand_labels_distance: 5,
+        };
+        let cancelled: &(dyn Fn() -> bool + Sync) = &|| true;
+        let r = extract_tfpeaks(
+            spect.view(), stimes.view(), sfreqs.view(), None, &params,
+            None, Some(cancelled),
+        );
+        assert!(r.is_err(), "a cancelled extract_tfpeaks must return Err");
     }
 }
