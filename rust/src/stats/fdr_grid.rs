@@ -47,7 +47,7 @@ impl Test {
 /// Result of an FDR-controlled comparison over a bin grid.
 #[derive(Debug, Clone)]
 pub struct FdrGrid {
-    /// `p_adj < q`, per bin. False wherever the bin was untestable.
+    /// `p_adj <= q`, per bin. False wherever the bin was untestable.
     pub sigbins: Vec<bool>,
     /// Adjusted p per bin; NaN where untestable. Not clipped to 1 — BY
     /// can exceed it and MATLAB does not clip either.
@@ -132,7 +132,9 @@ pub fn fdr_grid(
     let sigbins = r
         .p_adj
         .iter()
-        .map(|p| p.is_finite() && *p < q)
+        // Benjamini-Hochberg rejects at an adjusted p-value equal to q, so
+        // the comparison is inclusive.
+        .map(|p| p.is_finite() && *p <= q)
         .collect();
     Ok(FdrGrid {
         sigbins,
