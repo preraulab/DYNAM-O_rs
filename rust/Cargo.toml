@@ -35,13 +35,11 @@ serde_json = "1"
 nalgebra = { version = "0.34", default-features = false, features = ["std"] }
 levenberg-marquardt = "0.15"
 
-# Pure-Rust multitaper spectrogram. Path is relative so any checkout that
-# sits alongside DYNAM-O (the standard layout under DYNAM-O_toolbox)
-# resolves without the user editing Cargo.toml.
-# Layout assumption:
-#   ~/.../toolboxes/DYNAM-O_rs/rust/Cargo.toml            <-- this file
-#   ~/.../toolboxes/DYNAM-O/toolbox/helper_functions/multitaper_toolbox/rust
-multitaper_rs = { path = "../../DYNAM-O/toolbox/helper_functions/multitaper_toolbox/rust", default-features = false }
+# Pure-Rust multitaper spectrogram, pinned to a commit of its own repo so
+# this crate builds from any checkout with no sibling folders. To develop
+# against a local copy, add a `[patch."https://github.com/preraulab/multitaper_toolbox"]`
+# entry with `multitaper_rs = { path = "..." }` in the consuming workspace.
+multitaper_rs = { git = "https://github.com/preraulab/multitaper_toolbox", rev = "972316c665185eee6e82b089c123885b3ff6450b", default-features = false }
 
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"], optional = true }
 numpy = { version = "0.22", optional = true }

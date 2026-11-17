@@ -840,6 +840,7 @@ dependencies = [
 [[package]]
 name = "multitaper_rs"
 version = "0.1.0"
+source = "git+https://github.com/preraulab/multitaper_toolbox?rev=972316c665185eee6e82b089c123885b3ff6450b#972316c665185eee6e82b089c123885b3ff6450b"
 dependencies = [
  "clap",
  "dyn-stack",
