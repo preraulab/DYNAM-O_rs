@@ -8,7 +8,7 @@ function gen_matlab_pipeline_fixtures(toolbox_dir)
 %       toolbox_dir : char - path to the DYNAM-O MATLAB toolbox checkout -- required
 %
 %   Outputs:
-%       none (writes rust/tests/fixtures/matlab_pipeline/*.f64)
+%       none (writes rust/tests/fixtures/matlab_pipeline/*.f64 and *.u16)
 %
 %   Notes:
 %       Runs the pure-MATLAB pipeline (backend = 'matlab') on a ten-minute
@@ -17,8 +17,9 @@ function gen_matlab_pipeline_fixtures(toolbox_dir)
 %       same inputs and compares stage by stage, so an error in one stage
 %       cannot hide behind or leak into another.
 %
-%       Every file is a flat list of little-endian doubles. Matrices are
-%       written row by row.
+%       Every `.f64` file is a flat list of little-endian doubles and
+%       every `.u16` file a flat list of little-endian 16-bit integers.
+%       Matrices are written row by row.
 %
 %       Generate from a MATLAB tree that includes the BoundingBox pixel
 %       extent fix (preraulab/DYNAM-O #11).
@@ -27,7 +28,7 @@ function gen_matlab_pipeline_fixtures(toolbox_dir)
 %       difference in the regenerated files is a decision to review.
 %
 %   See also: detect_artifacts, computeSOphase, computeSOpower,
-%   computeTFPeaks, extractTFPeaks, computePeakStage
+%   computeTFPeaks, extractTFPeaks, refinePeakFrequency, computePeakStage
 %
 %   ∿∿∿  Prerau Laboratory MATLAB Codebase · sleepEEG.org  ∿∿∿
 
@@ -89,6 +90,7 @@ n_segments_total = floor(numel(stimes) / columns_per_segment);
 % Two segments, one early and one late, to keep the fixture small.
 chosen = round(linspace(2, n_segments_total - 1, 2));
 all_peak_times = [];
+all_peaks = zeros(0, 10);
 for k = 1:numel(chosen)
     first_column = (chosen(k) - 1) * columns_per_segment + 1;
     columns = first_column:(first_column + columns_per_segment - 1);
@@ -108,13 +110,113 @@ for k = 1:numel(chosen)
     write_f64(out_dir, [prefix '_stimes'], seg_times);
     write_f64(out_dir, [prefix '_peaks'], peaks');    % one peak after another
     all_peak_times = [all_peak_times; peaks(:, 1)]; %#ok<AGROW>
+    all_peaks = [all_peaks; peaks]; %#ok<AGROW>
     fprintf('segment %d: %d x %d, %d peaks\n', k, size(img, 1), size(img, 2), size(peaks, 1));
 end
 write_f64(out_dir, 'sfreqs', sfreqs);
 write_f64(out_dir, 'extract_params', [merge_thresh, downsample_spect, dur_min, bw_min, trim_vol, trim_shift]);
 write_f64(out_dir, 'n_segments', numel(chosen));
 
-%% Stage 4: per-peak stage, SO-power, and SO-phase (computePeak*.m)
+%% Stage 4: peak frequency refinement (refinePeakFrequency.m)
+% Events are the extracted peaks that sit at least half a refinement
+% window (2 s) inside the recording. Columns 7 to 10 are the BoundingBox.
+refine_freq_range = [sfreqs(1), sfreqs(end)];
+% The events go in time order, as runSegmentedData sorts them, because
+% hann_event_spectra requires increasing event times.
+inside = all_peaks(:, 1) >= 2 & all_peaks(:, 1) <= t(end) - 2;
+events = sortrows(all_peaks(inside, :), 1);
+event_time = events(:, 1);
+event_bbox = events(:, 7:10);
+event_table = table(event_time, nan(size(event_time)), event_bbox, ...
+    'VariableNames', {'PeakTime', 'PeakFrequency', 'BoundingBox'});
+refined_table = refinePeakFrequency(data, Fs, event_table, refine_freq_range, [], false, 'spline_interp', true, 'matlab');
+write_f64(out_dir, 'refine_freq_range', refine_freq_range);
+write_f64(out_dir, 'refine_event_time', event_time);
+write_f64(out_dir, 'refine_event_bbox', event_bbox');   % one event after another
+write_f64(out_dir, 'refine_frequency', refined_table.PeakFrequency);
+fprintf('refinement: %d events, %d removed\n', numel(event_time), sum(~isfinite(refined_table.PeakFrequency)));
+
+%% Stage 5: the pass-two mask
+% The first pass finds regions on the short-window spectrogram. The second
+% pass keeps only the pixels inside those regions and off their traced
+% contours. This stage saves the first-pass regions as a label image and
+% the keep/zero decision for every second-pass pixel, over the first two
+% segments of the recording.
+[~, spect_first, stimes_first, sfreqs_first, ~, ~, ~, ~, baseline_first] = computeTFPeaks(data, Fs, stage_times, stage_vals, ...
+    'backend', 'matlab', 'verbose', false, 'double_watershed', false);
+assert(isequal(sfreqs_first(:), sfreqs(:)), 'the two passes do not share a frequency axis');
+dt_first = stimes_first(2) - stimes_first(1);
+first_columns = 1:(2 * floor(seg_time / dt_first));
+spect_first = double(spect_first(:, first_columns));
+stimes_first = stimes_first(first_columns);
+
+% First-pass floors for a 1 s window with a time half-bandwidth of 2:
+% half the window, and half the 4 Hz spectral resolution.
+first_dur_min = 0.5;
+first_bw_min = 2;
+first_features = {'PeakTime', 'PeakFrequency', 'Duration', 'Bandwidth', 'Height'};
+[~, regions, borders] = runSegmentedData(spect_first, stimes_first, sfreqs, double(baseline_first), seg_time, downsample_spect, ...
+    first_features, first_dur_min, first_bw_min, merge_thresh, inf, trim_vol, 0, false, false, 'backend', 'matlab');
+
+label_image = zeros(size(spect_first));
+for k = 1:numel(regions)
+    label_image(regions{k}) = k;
+end
+
+% Second-pass columns that fall inside the stretch the first pass covered.
+second_columns = find(stimes >= stimes_first(1) & stimes <= stimes_first(end));
+stimes_second = stimes(second_columns);
+n_rows = size(spect_first, 1);
+n_second = numel(second_columns);
+
+% The masking rule, as computeTFPeaks applies it: region and border pixel
+% indices are shifted from the first-pass grid onto the second-pass grid.
+dt_second = stimes_second(2) - stimes_second(1);
+index_shift = round((stimes_second(1) - stimes_first(1)) / dt_second) * n_rows;
+region_indices = cat(1, regions{:}) - index_shift;
+region_indices = region_indices(region_indices >= 1 & region_indices <= n_rows * n_second);
+border_indices = cat(1, borders{:}) - index_shift;
+border_indices = border_indices(border_indices >= 1 & border_indices <= n_rows * n_second);
+kept = false(n_rows, n_second);
+kept(region_indices) = true;
+kept(border_indices) = false;
+
+write_f64(out_dir, 'mask_dims', [n_rows, numel(first_columns), n_second]);
+write_f64(out_dir, 'mask_stimes_first', stimes_first);
+write_f64(out_dir, 'mask_stimes_second', stimes_second);
+write_u16(out_dir, 'mask_labels', label_image');   % row by row
+write_u16(out_dir, 'mask_kept', double(kept)');    % row by row
+fprintf('mask: %d regions, %d of %d second-pass pixels kept\n', numel(regions), sum(kept(:)), numel(kept));
+
+%% Stage 6: slow-oscillation power (computeSOpower.m)
+% Every option is given explicitly so the fixture does not move when a
+% toolbox default does. The slow-oscillation spectrogram is recomputed
+% here with the same call computeSOpower makes, because computeSOpower
+% does not return it.
+so_power_band = [0.3 1.5];
+so_power_tapers = [15 29];
+so_power_window = [30 15];
+so_power_outlier = 3;
+so_power_norm = 'p2shift1234';
+[so_power_full, so_power_full_times] = computeSOpower(data, Fs, stage_times, stage_vals, ...
+    'isexcluded', artifacts(:), 'SO_freqrange', so_power_band, 'tapers', so_power_tapers, ...
+    'window_params', so_power_window, 'SOpower_outlier_threshold', so_power_outlier, ...
+    'norm_method', so_power_norm, 'retain_Fs', true);
+assert(numel(so_power_full) == numel(data), 'SO-power is not on the EEG sample grid');
+excluded_data = data;
+excluded_data(artifacts) = nan;
+[so_spect, so_spect_times, so_spect_freqs] = multitaper_spectrogram_dynamo(excluded_data, Fs, so_power_band, ...
+    so_power_tapers, so_power_window, [], 'linear', [], false, false);
+write_f64(out_dir, 'sopower_spect_dims', size(so_spect));
+write_f64(out_dir, 'sopower_spect', double(so_spect)');   % row by row
+write_f64(out_dir, 'sopower_spect_times', so_spect_times);
+write_f64(out_dir, 'sopower_spect_freqs', so_spect_freqs);
+write_f64(out_dir, 'sopower_outlier', so_power_outlier);
+write_f64(out_dir, 'sopower_norm', double(so_power_full(:)));
+fprintf('SO-power: %d x %d spectrogram, %d NaN of %d output samples\n', size(so_spect, 1), size(so_spect, 2), ...
+    sum(isnan(so_power_full)), numel(so_power_full));
+
+%% Stage 7: per-peak stage, SO-power, and SO-phase (computePeak*.m)
 [so_power, so_power_times] = computeSOpower(data, Fs);
 % Both series go to double for the same reason as the segments above
 % (computeSOphase returns single precision).
@@ -194,6 +296,16 @@ data(swing) = data(swing) + 400 * sin(2 * pi * 0.3 * (t(swing) - 450));
 stage_times = 0:30:(duration_s - 30);
 pattern = [5 3 2 2 1 1 1 2 2 4 4 2 1 1 2 3 5 2 2 4];
 stage_vals = pattern(1:numel(stage_times));
+end
+
+function write_u16(out_dir, name, values)
+% Small whole numbers (labels, yes/no masks) as little-endian 16-bit
+% integers, a quarter of the size of doubles.
+assert(all(values(:) >= 0 & values(:) <= 65535 & values(:) == round(values(:))), '%s does not fit 16-bit integers', name);
+file_id = fopen(fullfile(out_dir, [name '.u16']), 'w', 'ieee-le');
+assert(file_id > 0, 'cannot open %s for writing', name);
+fwrite(file_id, values(:), 'uint16');
+fclose(file_id);
 end
 
 function write_f64(out_dir, name, values)
