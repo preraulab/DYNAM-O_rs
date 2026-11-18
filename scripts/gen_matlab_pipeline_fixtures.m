@@ -121,9 +121,12 @@ write_f64(out_dir, 'n_segments', numel(chosen));
 % Events are the extracted peaks that sit at least half a refinement
 % window (2 s) inside the recording. Columns 7 to 10 are the BoundingBox.
 refine_freq_range = [sfreqs(1), sfreqs(end)];
+% The events go in time order, as runSegmentedData sorts them, because
+% hann_event_spectra requires increasing event times.
 inside = all_peaks(:, 1) >= 2 & all_peaks(:, 1) <= t(end) - 2;
-event_time = all_peaks(inside, 1);
-event_bbox = all_peaks(inside, 7:10);
+events = sortrows(all_peaks(inside, :), 1);
+event_time = events(:, 1);
+event_bbox = events(:, 7:10);
 event_table = table(event_time, nan(size(event_time)), event_bbox, ...
     'VariableNames', {'PeakTime', 'PeakFrequency', 'BoundingBox'});
 refined_table = refinePeakFrequency(data, Fs, event_table, refine_freq_range, [], false, 'spline_interp', true, 'matlab');

@@ -455,11 +455,14 @@ fn pass_two_mask_matches_matlab() {
 /// removal, the 2nd-percentile shift over stages 1 to 4, and the return to
 /// the EEG sample grid.
 ///
-/// Tolerance: NaN in the same places, values within 1e-5 dB. MATLAB sums
-/// the spectrogram in single precision, which alone moves the result by
-/// about 1e-6 dB.
+/// Tolerance: NaN in the same places, values within 5e-5 dB. MATLAB holds
+/// the band power in single precision and `nanpow2db` computes
+/// `(10*log10(y) + 300) - 300`. Near 300 a single-precision step is
+/// 3.05e-5, so each MATLAB value is rounded by up to 1.5e-5 dB, and the
+/// percentile shift subtracts a second value rounded the same way.
 #[test]
 fn so_power_matches_matlab() {
+    const SO_POWER_TOLERANCE_DB: f64 = 5e-5;
     let fs = read_f64("fs")[0];
     let stage_times = read_f64("stage_times");
     let stage_vals = read_f64("stage_vals");
@@ -514,7 +517,7 @@ fn so_power_matches_matlab() {
         }
         n_finite += 1;
         assert!(
-            (kernel_value - matlab_value).abs() <= 1e-5,
+            (kernel_value - matlab_value).abs() <= SO_POWER_TOLERANCE_DB,
             "SO-power at sample {}: kernel {}, MATLAB {}",
             i, kernel_value, matlab_value
         );
