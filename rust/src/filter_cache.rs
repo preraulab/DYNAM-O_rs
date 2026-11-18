@@ -287,7 +287,7 @@ fn resolve_sophase_sos(fs: f64, band: (f64, f64)) -> Result<Array2<f64>, FilterE
 
     // Genuinely unknown band — fall back to a pure-Rust cheby1 bandpass (avoids a
     // sci-rs dep; reuses filter_design.rs). NOT bit-equivalent to the MATLAB
-    // elliptic design (~0.93 cosine similarity), so this is now rare: it only
+    // elliptic design (~0.93 cosine similarity). It only
     // fires for a band that is neither on disk nor in the embedded set. Because
     // the caller dedupes through SOPHASE_SOS_CACHE, this warning fires at most
     // once per (fs, band) per process — not per subject × channel.
@@ -408,8 +408,9 @@ mod tests {
     fn every_embedded_fs_covers_all_default_bands() {
         // Each sampling rate present in the embedded set must carry all six
         // canonical bands, so no (fs, band) pair a real cohort presents at a
-        // known rate ever degrades to the cheby1 fallback. Fs=64 is the
-        // regression case: 64 Hz recordings hit the fallback until 2026-09.
+        // known rate ever degrades to the cheby1 fallback. Fs=64 is
+        // checked by name because 64 Hz recordings are common in the lab
+        // cohorts.
         let bands = [(0.3, 1.0), (0.3, 1.5), (0.3, 5.0), (0.5, 1.0), (0.5, 1.5), (0.5, 5.0)];
         let mut fss: Vec<u32> = EMBEDDED_FILTERS
             .iter()

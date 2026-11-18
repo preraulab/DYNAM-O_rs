@@ -6,7 +6,7 @@
 //!   1. `watershed(-img, 8)` — invert so histogram *peaks* become catchment
 //!      basins, then flood-label (MATLAB `runWatershed`).
 //!   2. Build a region-adjacency graph (`Ldata2graph`).
-//!   3. Iteratively merge neighbouring regions whose edge weight exceeds
+//!   3. Iteratively merge neighboring regions whose edge weight exceeds
 //!      `merge_thresh` (`mergeWshedSegment`).
 //!   4. Drop regions failing a pre-trim duration / bandwidth cut.
 //!   5. Trim each surviving region to `trim_vol` of its peak volume
@@ -54,11 +54,11 @@ pub struct HistPeakParams {
     /// Floor level from which trim volume is measured. NaN → `min(img)`,
     /// matching MATLAB `trim_shift = min(img(:))`.
     pub trim_shift: f64,
-    /// Minimum allowed span along the frequency (column) axis. MATLAB
+    /// Minimum allowed span along the SO-feature (row) axis. MATLAB
     /// default (`extracthistpeaks.m:69-72`): `dur_min = 5`.
     pub dur_min: f64,
-    /// Minimum allowed span along the SO-feature (row) axis. MATLAB default
-    /// (`extracthistpeaks.m:74-77`): `bw_min = 2`.
+    /// Minimum allowed span along the frequency (column) axis. MATLAB
+    /// default (`extracthistpeaks.m:74-77`): `bw_min = 2`.
     pub bw_min: f64,
     /// Minimum allowed peak height (max-min over region pixels, linear).
     /// MATLAB default (`extracthistpeaks.m:79-82`): `height_min = 2`.
@@ -275,7 +275,7 @@ fn bwlabel_8(mask: &Array2<bool>) -> Array2<i64> {
 /// Extract peak regions from a 2-D SO-power / SO-phase histogram.
 ///
 /// `hist` is the histogram with `rows = so_bins.len()` and
-/// `cols = freq_bins.len()`. `so_bins` / `freq_bins` are the bin-centre
+/// `cols = freq_bins.len()`. `so_bins` / `freq_bins` are the bin-center
 /// axes — their spacing drives the dur/bw filters and their first value
 /// anchors the per-region centroids.
 ///
@@ -677,7 +677,7 @@ fn jet_color(t: f64) -> [u8; 3] {
     //   blue  peaks over t ∈ 0 .. [3/8, 5/8]
     // Implemented via the canonical jet interpolant.
     let chan = |t: f64, center: f64| -> f64 {
-        // Triangle of half-width 1/4 centred at `center`, clamped to [0,1].
+        // Triangle of half-width 1/4 centered at `center`, clamped to [0,1].
         (1.5 - (4.0 * (t - center)).abs()).clamp(0.0, 1.0)
     };
     let r = chan(t, 0.75);
@@ -690,18 +690,17 @@ fn jet_color(t: f64) -> [u8; 3] {
     ]
 }
 
-/// Deterministic label-index shuffle, mirroring MATLAB
-/// `label2rgb(..., 'shuffle')`. MATLAB seeds its RNG with a fixed value so
-/// the permutation is reproducible; the exact permutation is an internal
-/// detail. We instead apply a deterministic hash-based scramble of the
-/// `1..=n` indices, which gives the same *purpose* (visually adjacent
-/// labels get well-separated colours) while being reproducible and not
-/// depending on MATLAB's RNG.
+/// Deterministic label-index scramble, standing in for the shuffle of
+/// MATLAB `label2rgb(..., 'shuffle')`. It serves the same purpose, which is
+/// to give visually adjacent labels well-separated colors. It is not
+/// MATLAB's permutation, so the colors differ from MATLAB's, and two labels
+/// can land on the same color. Only the rendered image is affected. No
+/// number in the peak table depends on it.
 fn shuffled_index(label: i64, n: usize) -> usize {
     if n == 0 {
         return 0;
     }
-    // Multiplicative hash → spread consecutive labels far apart in colour
+    // Multiplicative hash that spreads consecutive labels far apart in color
     // space. 2654435761 is Knuth's multiplicative-hash constant.
     let h = (label as u64).wrapping_mul(2_654_435_761);
     (h % (n as u64)) as usize
@@ -716,12 +715,10 @@ fn shuffled_index(label: i64, n: usize) -> usize {
 ///
 /// Output shape is `(rows, cols, 3)`, `u8` per channel.
 ///
-/// Note: MATLAB's `extracthistpeaks.m:281-283` additionally overrides
-/// background pixels to RGB `[100,100,100]` (a neutral grey) AFTER
-/// `label2rgb`. The task asks for `label2rgb` semantics with a neutral
-/// background; we keep the pure `label2rgb` `'k'` (black) background here
-/// so this function is a faithful `label2rgb` port. Callers wanting the
-/// grey background can overwrite zero-label pixels themselves.
+/// MATLAB `extracthistpeaks.m:281-283` then repaints background pixels gray
+/// `[100,100,100]`. This function stops at `label2rgb` and leaves them
+/// black. A caller that wants the gray background overwrites the zero-label
+/// pixels.
 pub fn label_to_rgb_jet(labels: ArrayView2<i64>) -> Array3<u8> {
     let (h, w) = labels.dim();
     let mut out = Array3::<u8>::zeros((h, w, 3));
@@ -737,7 +734,7 @@ pub fn label_to_rgb_jet(labels: ArrayView2<i64>) -> Array3<u8> {
         return out;
     }
     // Map each label id to a dense rank 0..n-1, then shuffle that rank and
-    // sample jet. Dense ranking makes the colours independent of any gaps
+    // sample jet. Dense ranking makes the colors independent of any gaps
     // in the label numbering.
     let rank: HashMap<i64, usize> = uniq
         .iter()
@@ -752,7 +749,8 @@ pub fn label_to_rgb_jet(labels: ArrayView2<i64>) -> Array3<u8> {
             }
             let dense = rank[&v];
             let shuf = shuffled_index(dense as i64, n);
-            // Sample jet at the centre of the shuf-th of n equal slices.
+            // Sample jet at `shuf / (n - 1)`, so the ranks span the whole
+            // colormap. A single region takes the middle.
             let t = if n == 1 {
                 0.5
             } else {
@@ -863,11 +861,11 @@ mod tests {
             assert_eq!(again, labels, "extract_hist_peaks is not deterministic");
         }
 
-        // Each planted blob centre should land inside some region.
+        // Each planted blob center should land inside some region.
         for (rc, cc) in [(20usize, 25usize), (58, 90), (40, 60)] {
             assert!(
                 labels[[rc, cc]] > 0,
-                "blob centre ({}, {}) lost its label",
+                "blob center ({}, {}) lost its label",
                 rc,
                 cc
             );
@@ -925,12 +923,12 @@ mod tests {
         // Labeled pixels → non-black.
         let p1 = [rgb[[1, 1, 0]], rgb[[1, 1, 1]], rgb[[1, 1, 2]]];
         assert_ne!(p1, [0, 0, 0], "label 1 should not be black");
-        // Same label → same colour.
+        // Same label → same color.
         let p1b = [rgb[[1, 2, 0]], rgb[[1, 2, 1]], rgb[[1, 2, 2]]];
-        assert_eq!(p1, p1b, "same label must map to same colour");
-        // Distinct labels → distinct colours.
+        assert_eq!(p1, p1b, "same label must map to same color");
+        // Distinct labels → distinct colors.
         let p2 = [rgb[[2, 3, 0]], rgb[[2, 3, 1]], rgb[[2, 3, 2]]];
-        assert_ne!(p1, p2, "distinct labels should differ in colour");
+        assert_ne!(p1, p2, "distinct labels should differ in color");
     }
 
     #[test]

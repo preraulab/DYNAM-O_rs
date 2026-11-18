@@ -28,7 +28,7 @@
 //!
 //! **Dollar-escapes `$label$`** match a literal EDF channel name that
 //! contains operator characters (`-`, spaces). Use `$C3-A2$` to mean
-//! "the channel literally labelled `C3-A2`" rather than the expression
+//! "the channel literally labeled `C3-A2`" rather than the expression
 //! `C3 - A2`. This mirrors `read_EDF.m:133–135`.
 //!
 //! **Linearity rule** (matches `read_EDF.m:73–79`): each term in the
@@ -713,7 +713,7 @@ pub fn collect_leaf_labels(
     }
     // Also include leaves from references that aren't reached by any
     // channel — defensive: lets the user define a reference now and a
-    // channel that uses it later without surprising load behaviour.
+    // channel that uses it later without surprising load behavior.
     for ast in ref_asts.values() {
         walk(ast, &ref_asts, &ref_names, &mut out, &mut seen, &mut visiting);
     }

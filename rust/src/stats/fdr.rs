@@ -159,7 +159,7 @@ mod tests {
         }
     }
 
-    /// The behaviour SOPH maps depend on: untestable pixels must not
+    /// The behavior SOPH maps depend on: untestable pixels must not
     /// count toward m, or half the map would dilute the other half.
     #[test]
     fn non_finite_p_are_excluded_from_the_family() {

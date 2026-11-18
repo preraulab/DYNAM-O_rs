@@ -14,14 +14,32 @@
 //!   * FDR families containing NaN p-values, which must not count toward m.
 //!
 //! Regenerate with `scripts/gen_matlab_parity.m` if the MATLAB side ever
-//! changes; a diff in these files is a deliberate decision, not a detail.
+//! changes. A diff in these files is a decision to review.
 
 use dynamo_rs::stats::{fdr, ranksum::ranksum};
 
-fn parse_vec(s: &str) -> Vec<f64> {
-    s.split_whitespace()
-        .map(|t| if t.eq_ignore_ascii_case("nan") { f64::NAN } else { t.parse().unwrap() })
-        .collect()
+/// Parse a space-separated list of numbers, where "NaN" in any case is NaN.
+fn parse_vec(text: &str) -> Vec<f64> {
+    let mut values = Vec::new();
+    for token in text.split_whitespace() {
+        if token.eq_ignore_ascii_case("nan") {
+            values.push(f64::NAN);
+        } else {
+            values.push(token.parse().unwrap());
+        }
+    }
+    values
+}
+
+/// The finite values of both samples together.
+fn finite_values_of(x: &[f64], y: &[f64]) -> Vec<f64> {
+    let mut finite_values = Vec::new();
+    for &value in x.iter().chain(y.iter()) {
+        if value.is_finite() {
+            finite_values.push(value);
+        }
+    }
+    finite_values
 }
 
 /// Relative comparison that treats NaN == NaN, since "untestable" is a
@@ -30,7 +48,10 @@ fn agrees(got: f64, want: f64, tol: f64) -> bool {
     if got.is_nan() || want.is_nan() {
         return got.is_nan() && want.is_nan();
     }
+    // 1e-300 keeps the division finite when MATLAB's value is 0.
     let scale = want.abs().max(1e-300);
+    // Differences under 1e-15 pass outright. They are below double rounding
+    // for p-values near 0.
     (got - want).abs() / scale <= tol || (got - want).abs() <= 1e-15
 }
 
@@ -41,18 +62,19 @@ fn ranksum_matches_matlab_on_300_random_cases() {
     let mut worst = 0.0f64;
     let mut worst_case = String::new();
     for line in body.lines().skip(1) {
-        let f: Vec<&str> = line.split(',').collect();
-        assert_eq!(f.len(), 6, "malformed fixture row: {}", line);
-        let case = f[0];
-        let want: f64 = f[3].parse().unwrap();
-        let x = parse_vec(f[4]);
-        let y = parse_vec(f[5]);
+        // Columns: case, n1, n2, p, x, y
+        let fields: Vec<&str> = line.split(',').collect();
+        assert_eq!(fields.len(), 6, "malformed fixture row: {}", line);
+        let case = fields[0];
+        let want: f64 = fields[3].parse().unwrap();
+        let x = parse_vec(fields[4]);
+        let y = parse_vec(fields[5]);
 
         let got = ranksum(&x, &y).p;
         assert!(
             agrees(got, want, 1e-9),
             "case {} (n = {} vs {}): rust {:.17e} vs matlab {:.17e}",
-            case, f[1], f[2], got, want
+            case, fields[1], fields[2], got, want
         );
         if want.is_finite() && want > 0.0 {
             let rel = (got - want).abs() / want;
@@ -100,19 +122,23 @@ fn fdr_matches_matlab_on_random_families() {
 #[test]
 fn fixture_covers_both_sides_of_the_exact_switch() {
     let body = include_str!("fixtures/parity_ranksum.csv");
-    let (mut small, mut large, mut tied) = (0, 0, 0);
+    let mut small = 0;
+    let mut large = 0;
+    let mut tied = 0;
     for line in body.lines().skip(1) {
-        let f: Vec<&str> = line.split(',').collect();
-        let x = parse_vec(f[4]);
-        let y = parse_vec(f[5]);
-        let n = x.iter().filter(|v| v.is_finite()).count()
-            + y.iter().filter(|v| v.is_finite()).count();
+        // Columns: case, n1, n2, p, x, y
+        let fields: Vec<&str> = line.split(',').collect();
+        let x = parse_vec(fields[4]);
+        let y = parse_vec(fields[5]);
+        let mut all = finite_values_of(&x, &y);
+        // MATLAB `ranksum` uses the exact method below 20 pooled
+        // observations and the normal approximation from 20 up.
+        let n = all.len();
         if n < 20 {
             small += 1;
         } else {
             large += 1;
         }
-        let mut all: Vec<f64> = x.iter().chain(y.iter()).copied().filter(|v| v.is_finite()).collect();
         all.sort_by(|a, b| a.partial_cmp(b).unwrap());
         if all.windows(2).any(|w| w[0] == w[1]) {
             tied += 1;

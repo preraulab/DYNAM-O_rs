@@ -120,7 +120,7 @@ impl Graph {
                     Some(s) => s,
                     None => continue,
                 };
-                // 8-neighbour rim → border pixels of region v (any label ≠ v).
+                // 8-neighbor rim → border pixels of region v (any label ≠ v).
                 for dy in -1i32..=1 {
                     for dx in -1i32..=1 {
                         if dx == 0 && dy == 0 {
@@ -137,7 +137,7 @@ impl Graph {
                         }
                     }
                 }
-                // 5×5 (2-pixel Chebyshev) dilation → neighbour region labels.
+                // 5×5 (2-pixel Chebyshev) dilation → neighbor region labels.
                 for dy in -2i32..=2 {
                     for dx in -2i32..=2 {
                         if dx == 0 && dy == 0 {

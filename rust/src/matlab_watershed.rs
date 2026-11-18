@@ -166,7 +166,7 @@ pub fn matlab_watershed_2d(img: ArrayView2<f64>) -> Array2<u16> {
         .collect();
     let _ = n_labels;
 
-    // 3) Seed the FIFO priority queue with all neighbors of labelled pixels
+    // 3) Seed the FIFO priority queue with all neighbors of labeled pixels
     let mut seen = vec![false; n];
     let mut heap: BinaryHeap<QueueItem> = BinaryHeap::with_capacity(n);
     let mut order_counter: u64 = 0;

@@ -21,9 +21,9 @@
 //! Both widths are genuine standard deviations, but they get there by
 //! different routes, so they are NOT symmetric under rescaling:
 //!
-//! * `ys` (`fstd`) is a σ because of the explicit `-0.5` above. Squaring
-//!   the denominator (DYNAM-O PR #71, 2026-07-20) was necessary but
-//!   not sufficient — without the one half the width was `sqrt(2)·σ`.
+//! * `ys` (`fstd`) is a σ because of the explicit `-0.5` above. The
+//!   squared denominator alone would make the width `sqrt(2)·σ`. The one
+//!   half makes it σ.
 //! * `xs` (`recikappa`) is ALREADY a σ with no half needed, because the
 //!   von Mises factor is its own small-angle Gaussian:
 //!   `exp(κ(cos Δ - 1)) → exp(-Δ²/(2·xs²))`. It carries the half
@@ -52,9 +52,8 @@
 //! (each frequency row divided by its own sum so every row sums to 1).
 //! Production phase paths mirror this: they pass `unit_row=true` to
 //! [`eval_model`] and phase paramfit CSVs are written with
-//! `unit_row: 1.0`. (DYNAM-O briefly ran `'problem', false` between
-//! commits `5f99677` and `1761463`; that un-normalized fit washed the
-//! modes out and was reverted.)
+//! `unit_row: 1.0`. An un-normalized fit (`'problem', false`) washes the
+//! modes out, so it is not used.
 //!
 //! The `unit_row=false` branch is kept for the parity kernel tests. The
 //! numerical Jacobian is used in both branches — row coupling makes the
