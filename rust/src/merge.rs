@@ -244,9 +244,13 @@ pub fn run_with_borders(
     let mut with_borders = Array2::<i32>::zeros((h, w));
     {
         let wb = with_borders.as_slice_mut().unwrap();
-        let mut ordered: Vec<(i32, usize)> = (0..graph.regions.len())
-            .filter_map(|slot| graph.regions[slot].as_ref().map(|r| (r.label, slot)))
-            .collect();
+        // Every live region as (label, slot), to be painted in label order.
+        let mut ordered: Vec<(i32, usize)> = Vec::new();
+        for slot in 0..graph.regions.len() {
+            if let Some(region) = &graph.regions[slot] {
+                ordered.push((region.label, slot));
+            }
+        }
         ordered.sort_by_key(|&(lbl, _)| lbl);
         for (_, slot) in ordered {
             let r = graph.regions[slot].as_ref().unwrap();
@@ -289,13 +293,17 @@ pub fn run_all_px(
 ) -> Result<Array2<i32>, String> {
     let (interior_only, graph) =
         run_inner(labels, values, merge_thresh, max_merges, MergeRules::PairwiseOnly)?;
-    let (h, w) = (interior_only.nrows(), interior_only.ncols());
+    let (h, w) = interior_only.dim();
     let mut out = Array2::<i32>::zeros((h, w));
     {
         let flat = out.as_slice_mut().unwrap();
-        let mut ordered: Vec<(i32, usize)> = (0..graph.regions.len())
-            .filter_map(|slot| graph.regions[slot].as_ref().map(|r| (r.label, slot)))
-            .collect();
+        // Every live region as (label, slot), to be painted in label order.
+        let mut ordered: Vec<(i32, usize)> = Vec::new();
+        for slot in 0..graph.regions.len() {
+            if let Some(region) = &graph.regions[slot] {
+                ordered.push((region.label, slot));
+            }
+        }
         ordered.sort_by_key(|&(lbl, _)| lbl);
         for (_, slot) in ordered {
             let r = graph.regions[slot].as_ref().unwrap();
@@ -376,20 +384,25 @@ fn matlab_prctile(values: impl Iterator<Item = f64>, p: f64) -> f64 {
     if n == 1 {
         return xs[0];
     }
-    let pos = |i: usize| 100.0 * (i as f64 + 0.5) / n as f64;
-    if p <= pos(0) {
+    /// Percentile that sorted sample `i` of `n` sits at: the midpoint of
+    /// its 1/n share, which is MATLAB `prctile`'s convention.
+    fn percentile_of_sample(i: usize, n: usize) -> f64 {
+        100.0 * (i as f64 + 0.5) / n as f64
+    }
+    if p <= percentile_of_sample(0, n) {
         return xs[0];
     }
-    if p >= pos(n - 1) {
+    if p >= percentile_of_sample(n - 1, n) {
         return xs[n - 1];
     }
     // Find the bracketing samples.
     let mut i = 0;
-    while i + 1 < n && pos(i + 1) < p {
+    while i + 1 < n && percentile_of_sample(i + 1, n) < p {
         i += 1;
     }
-    let (p0, p1) = (pos(i), pos(i + 1));
-    let t = (p - p0) / (p1 - p0);
+    let percentile_below = percentile_of_sample(i, n);
+    let percentile_above = percentile_of_sample(i + 1, n);
+    let t = (p - percentile_below) / (percentile_above - percentile_below);
     xs[i] + t * (xs[i + 1] - xs[i])
 }
 

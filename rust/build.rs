@@ -167,11 +167,15 @@ fn generate_embedded_filters(crate_dir: &str) {
     let filters_dir = std::path::Path::new(crate_dir).join("..").join("data_matlab_filters");
     let mut entries: Vec<String> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&filters_dir) {
-        let mut names: Vec<String> = rd
-            .flatten()
-            .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|n| n.ends_with(".npy"))
-            .collect();
+        // Names of the `.npy` filter files in the directory.
+        let mut names: Vec<String> = Vec::new();
+        for entry in rd.flatten() {
+            if let Ok(name) = entry.file_name().into_string() {
+                if name.ends_with(".npy") {
+                    names.push(name);
+                }
+            }
+        }
         names.sort();
         for name in names {
             // Absolute path so include_bytes! resolves from OUT_DIR.
