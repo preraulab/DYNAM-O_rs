@@ -1,9 +1,9 @@
-//! Port of MATLAB `extracthistpeaks.m` — watershed segmentation of a 2-D
+//! Port of MATLAB `extracthistpeaks.m`. Watershed segmentation of a 2-D
 //! SO-power / SO-phase histogram.
 //!
 //! `extracthistpeaks.m` runs, on a small 2-D histogram `img` (rows = SO
 //! feature axis, cols = frequency axis):
-//!   1. `watershed(-img, 8)` — invert so histogram *peaks* become catchment
+//!   1. `watershed(-img, 8)`. Invert so histogram *peaks* become catchment
 //!      basins, then flood-label (MATLAB `runWatershed`).
 //!   2. Build a region-adjacency graph (`Ldata2graph`).
 //!   3. Iteratively merge neighboring regions whose edge weight exceeds
@@ -20,18 +20,17 @@
 //! `extract_pipeline.rs`, minus segmentation / downsampling / resize (a
 //! SOPH is a single small array). We therefore reuse the same building
 //! blocks:
-//!   * `matlab_watershed::matlab_watershed_2d`  — step 1
-//!   * `merge::run`                             — step 3 (via the adjacency
-//!                                                graph it builds internally)
-//!   * `trim::trim_all_regions`                 — step 5
+//!   * `matlab_watershed::matlab_watershed_2d`: step 1
+//!   * `merge::run`: step 3 (via the adjacency graph it builds internally)
+//!   * `trim::trim_all_regions`: step 5
 //!
 //! Axis convention. MATLAB calls `extracthistpeaks(SOPH, x, y)` with
 //! `x = SO_bins` (the columns of MATLAB's `(freq, SO)` image) and
 //! `y = freq_bins` (the rows). So `dt = x(2)-x(1)` is the SO spacing and
-//! `df = y(2)-y(1)` is the frequency spacing; the `dur_min` filter cuts
+//! `df = y(2)-y(1)` is the frequency spacing. The `dur_min` filter cuts
 //! on the SO span and `bw_min` cuts on the frequency span.
 //!
-//! This port takes `hist` as `(rows = SO bins, cols = freq bins)` — the
+//! This port takes `hist` as `(rows = SO bins, cols = freq bins)`. The
 //! transpose of MATLAB's image, matching how the DYNAM-O SOPH TIFFs are
 //! stored. So here `dur` (= `dur_min`) is the ROW span and `bw`
 //! (= `bw_min`) is the COLUMN span.
@@ -100,7 +99,7 @@ pub struct HistPeak {
     pub bandwidth: f64,
 }
 
-/// Separable 2-D Gaussian blur (`sigma` in bins; non-finite → 0). Filter
+/// Separable 2-D Gaussian blur (`sigma` in bins, non-finite → 0). Filter
 /// radius `ceil(2σ)` matches MATLAB `imgaussfilt`'s default FilterSize.
 pub fn gaussian_blur(hist: ArrayView2<f64>, sigma_row: f64, sigma_col: f64) -> Array2<f64> {
     fn kernel(sigma: f64) -> Vec<f64> {
@@ -218,7 +217,7 @@ fn accumulate_regions(
 }
 
 /// Extract peak regions from a 2-D SO-power / SO-phase histogram, label
-/// image only — see [`extract_hist_peaks_with_stats`] for the per-region
+/// image only. See [`extract_hist_peaks_with_stats`] for the per-region
 /// statistics.
 pub fn extract_hist_peaks(
     hist: ArrayView2<f64>,
@@ -229,7 +228,7 @@ pub fn extract_hist_peaks(
     extract_hist_peaks_with_stats(hist, so_bins, freq_bins, params).0
 }
 
-/// 8-connected connected-component labeling of a boolean mask — the
+/// 8-connected connected-component labeling of a boolean mask. The
 /// MATLAB `bwlabel(_, 8)` equivalent. Components are numbered in
 /// column-major first-encounter order (MATLAB's scan order), so the
 /// label ids match MATLAB's for downstream label-ordered tie-breaks.
@@ -276,7 +275,7 @@ fn bwlabel_8(mask: &Array2<bool>) -> Array2<i64> {
 ///
 /// `hist` is the histogram with `rows = so_bins.len()` and
 /// `cols = freq_bins.len()`. `so_bins` / `freq_bins` are the bin-center
-/// axes — their spacing drives the dur/bw filters and their first value
+/// axes. Their spacing drives the dur/bw filters and their first value
 /// anchors the per-region centroids.
 ///
 /// Returns `(label_image, peaks)`. The label image is the same shape as
@@ -307,7 +306,7 @@ pub fn extract_hist_peaks_with_stats(
     // Bin spacings. `hist` is `(rows = SO, cols = freq)`. In MATLAB
     // `extracthistpeaks(SOPH, x = SO_bins, y = freq_bins)` the duration
     // filter uses `dt = x(2)-x(1)` (the SO axis) and the bandwidth filter
-    // uses `df = y(2)-y(1)` (the frequency axis) — so `dur` is an SO span
+    // uses `df = y(2)-y(1)` (the frequency axis). So `dur` is an SO span
     // and `bw` is a frequency span.
     let d_row = if so_bins.len() >= 2 {
         so_bins[1] - so_bins[0]
@@ -328,7 +327,7 @@ pub fn extract_hist_peaks_with_stats(
     // ---- 1) Watershed on the inverted histogram. -------------------------
     // MATLAB `runWatershed` runs `watershed(-data, 8)`: inverting turns
     // histogram peaks into catchment basins. NaN handling: MATLAB zeroes
-    // NaNs before watershed and zeroes their labels after; we substitute
+    // NaNs before watershed and zeroes their labels after. We substitute
     // 0.0 for NaN in the watershed input (label cleanup happens implicitly
     // because trim/stats skip NaN pixels).
     let neg: Array2<f64> = img.mapv(|v| if v.is_nan() { 0.0 } else { -v });
@@ -336,7 +335,7 @@ pub fn extract_hist_peaks_with_stats(
     // `runWatershed.m`: after `watershed(-data)`, zero the NaN pixels'
     // labels (`Ldata(nan_idx)=0`) and re-label the connected components
     // (`Ldata=bwlabel(Ldata)`). Zeroing NaN pixels can split a basin, so
-    // this is not a no-op — it must run before the graph is built.
+    // this is not a no-op. It must run before the graph is built.
     let mut ws_mask = Array2::<bool>::from_elem((h, w), false);
     for r in 0..h {
         for c in 0..w {
@@ -376,8 +375,8 @@ pub fn extract_hist_peaks_with_stats(
 
     // ---- 4) Pre-trim duration / bandwidth cut. ---------------------------
     // MATLAB `extracthistpeaks.m`: drops regions whose SO span (`*dt`,
-    // the column axis in MATLAB's `(freq, SO)` image — here the ROW axis)
-    // fails `dur_min`, or whose frequency span (`*df` — here the COLUMN
+    // the column axis in MATLAB's `(freq, SO)` image, here the ROW axis)
+    // fails `dur_min`, or whose frequency span (`*df`, here the COLUMN
     // axis) fails `bw_min`, BEFORE trimming. Uses `(max-min)*Δ`.
     if params.dur_min > 0.0 || params.bw_min > 0.0 {
         let accum = accumulate_regions(labels.view(), img.view());
@@ -604,7 +603,7 @@ fn compute_peak_stats(
     peaks
 }
 
-/// Periodic-phase watershed — mirrors `param_basis_phase.m`'s SO-phase
+/// Periodic-phase watershed. Mirrors `param_basis_phase.m`'s SO-phase
 /// pre-processing: triple the histogram along the phase axis
 /// (`[SOPhH SOPhH(:,2:end-1) SOPhH]`) so regions can wrap across ±π,
 /// blur with `imgaussfilt(_, gauss_filt_std)`, watershed the tripled
@@ -617,7 +616,7 @@ fn compute_peak_stats(
 /// per-region stats whose SO-phase centroid lands in `[-π, π]`.
 ///
 /// Keeping only the central-period regions is the net effect of MATLAB's
-/// `uniquetol` wraparound de-dup — each real region appears once per
+/// `uniquetol` wraparound de-dup. Each real region appears once per
 /// period in the tripled grid, and exactly one copy has its centroid in
 /// `[-π, π]`.
 pub fn extract_hist_peaks_phase(
@@ -837,6 +836,17 @@ mod tests {
         (img, so_bins, freq_bins)
     }
 
+    /// The distinct region labels in a label image, leaving out background 0.
+    fn distinct_labels(labels: &Array2<i64>) -> BTreeSet<i64> {
+        let mut found: BTreeSet<i64> = BTreeSet::new();
+        for &label in labels.iter() {
+            if label > 0 {
+                found.insert(label);
+            }
+        }
+        found
+    }
+
     #[test]
     fn extract_hist_peaks_finds_blobs_deterministically() {
         let (img, so_bins, freq_bins) = synthetic_hist();
@@ -859,24 +869,16 @@ mod tests {
         );
         assert_eq!(labels.dim(), img.dim());
 
-        let n_regions = {
-            let mut s: BTreeSet<i64> = BTreeSet::new();
-            for &v in labels.iter() {
-                if v > 0 {
-                    s.insert(v);
-                }
-            }
-            s
-        };
+        let region_labels = distinct_labels(&labels);
         // Three planted blobs → at least three regions, all non-zero.
         assert!(
-            n_regions.len() >= 3,
+            region_labels.len() >= 3,
             "expected >= 3 regions, got {}",
-            n_regions.len()
+            region_labels.len()
         );
         // Labels are dense 1..=N.
-        let expected: BTreeSet<i64> = (1..=n_regions.len() as i64).collect();
-        assert_eq!(n_regions, expected, "labels must be dense 1..=N");
+        let expected: BTreeSet<i64> = (1..=region_labels.len() as i64).collect();
+        assert_eq!(region_labels, expected, "labels must be dense 1..=N");
 
         // Determinism: repeated runs produce a byte-identical label image.
         for _ in 0..5 {
@@ -913,8 +915,7 @@ mod tests {
         };
         let labels =
             extract_hist_peaks(img.view(), &so_bins, &freq_bins, &params);
-        let n = labels.iter().copied().collect::<BTreeSet<_>>();
-        let n_regions = n.iter().filter(|&&v| v > 0).count();
+        let n_regions = distinct_labels(&labels).len();
         assert!(
             n_regions <= 2,
             "height filter should drop the weak blob, got {} regions",

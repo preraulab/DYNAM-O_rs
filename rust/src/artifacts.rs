@@ -1,4 +1,4 @@
-//! Artifact detection — port of pydynamo `artifacts.py::detect_artifacts`
+//! Artifact detection. Port of pydynamo `artifacts.py::detect_artifacts`
 //! (and MATLAB `toolbox/helper_functions/artifact_detection/detect_artifacts.m`)
 //! with default parameters.
 //!
@@ -103,11 +103,12 @@ pub fn flat_run_mask_with_tolerance(data: &[f64], min_run: usize, tol: f64) -> V
     for i in 1..=n {
         // Would extending the run to sample i keep its span within tol? A
         // non-finite sample always breaks the run (handled as bad elsewhere).
-        let extend = i < n && data[i].is_finite() && {
-            let lo = run_min.min(data[i]);
-            let hi = run_max.max(data[i]);
-            (hi - lo) <= tol
-        };
+        let mut extend = false;
+        if i < n && data[i].is_finite() {
+            let min_if_extended = run_min.min(data[i]);
+            let max_if_extended = run_max.max(data[i]);
+            extend = (max_if_extended - min_if_extended) <= tol;
+        }
         if extend {
             run_min = run_min.min(data[i]);
             run_max = run_max.max(data[i]);
@@ -168,17 +169,14 @@ pub fn flat_tolerance(data: &[f64]) -> f64 {
     frac * std_dev
 }
 
-/// MATLAB `movmean(x, win)` — centered moving mean with shrinking window
+/// MATLAB `movmean(x, win)`. Centered moving mean with shrinking window
 /// at the endpoints (partial means on the edges).
 fn movmean(x: &[f64], win: usize) -> Vec<f64> {
     let n = x.len();
     if win <= 1 || n == 0 {
         return x.to_vec();
     }
-    // MATLAB places an even-length window one sample toward the past:
-    // samples [i - win/2, i + win/2 - 1]. Odd lengths are symmetric.
-    let half_l = win / 2;
-    let half_r = (win - 1) / 2;
+    let (half_l, half_r) = crate::signal::matlab_window_halves(win);
     let mut csum = vec![0.0_f64; n + 1];
     for i in 0..n {
         csum[i + 1] = csum[i] + x[i];
@@ -192,13 +190,13 @@ fn movmean(x: &[f64], win: usize) -> Vec<f64> {
     out
 }
 
-/// MATLAB `movmedian(x, win)` — centered moving median with shrinking
+/// MATLAB `movmedian(x, win)`. Centered moving median with shrinking
 /// window at the endpoints.
 ///
 /// Implementation: two-heap with lazy deletion (max-heap of the lower
 /// half + min-heap of the upper half, rebalanced after every
 /// insert/remove). All operations are O(log W) where W is the window
-/// size, with a ~300 KB working set for W ≈ 40 000 — fits in L2 cache,
+/// size, with a ~300 KB working set for W ≈ 40 000. Fits in L2 cache,
 /// which is the dominant performance win vs the previous Fenwick-BIT-
 /// over-the-full-n implementation (BIT size N = 5 M ⇒ ~40 MB working
 /// set, mostly cache-missing).
@@ -215,7 +213,7 @@ fn movmedian_two_heap(x: &[f64], win: usize) -> Vec<f64> {
     use std::collections::{BinaryHeap, HashMap};
 
     /// Total-ordering wrapper around f64. Uses `partial_cmp` and falls
-    /// back to `Equal` for NaN — matches the Fenwick reference impl.
+    /// back to `Equal` for NaN. Matches the Fenwick reference impl.
     #[derive(Copy, Clone, Debug)]
     struct Of(f64);
     impl PartialEq for Of { fn eq(&self, o: &Self) -> bool { self.0.to_bits() == o.0.to_bits() } }
@@ -235,10 +233,7 @@ fn movmedian_two_heap(x: &[f64], win: usize) -> Vec<f64> {
     if win <= 1 || n == 0 {
         return x.to_vec();
     }
-    // MATLAB places an even-length window one sample toward the past:
-    // samples [i - win/2, i + win/2 - 1]. Odd lengths are symmetric.
-    let half_l = win / 2;
-    let half_r = (win - 1) / 2;
+    let (half_l, half_r) = crate::signal::matlab_window_halves(win);
 
     // lo: max-heap (top is largest of the small half).
     // hi: min-heap (top is smallest of the large half).
@@ -374,10 +369,7 @@ fn movmedian_fenwick(x: &[f64], win: usize) -> Vec<f64> {
     if win <= 1 || n == 0 {
         return x.to_vec();
     }
-    // MATLAB places an even-length window one sample toward the past:
-    // samples [i - win/2, i + win/2 - 1]. Odd lengths are symmetric.
-    let half_l = win / 2;
-    let half_r = (win - 1) / 2;
+    let (half_l, half_r) = crate::signal::matlab_window_halves(win);
 
     // 1) Rank-sort x: rank[i] = i's position in sorted order.
     //    sorted_vals[r] gives the r-th smallest value.
@@ -507,13 +499,13 @@ fn mean_std(xs: &[f64]) -> (f64, f64) {
 /// including the input `bad`.
 ///
 /// Implementation:
-/// * Reuse a single `good_vals` buffer across iterations — saves ~5 MB
+/// * Reuse a single `good_vals` buffer across iterations. Saves ~5 MB
 ///   alloc+free per iteration on a 5 M-sample series.
 /// * Use `select_nth_unstable_by` for the median instead of a full sort.
 ///   O(n) average vs O(n log n). For n ≈ 4.6 M this is the dominant
-///   win — saves ~150-250 ms per iteration on the BB band.
+///   win. Saves ~150-250 ms per iteration on the BB band.
 /// * For even-n medians, after the partition pass `buf[..k]` contains
-///   the k smallest values (unordered); the max of that range is the
+///   the k smallest values (unordered). The max of that range is the
 ///   (k-1)-th order statistic. Saves the second select call.
 /// * Bit-identical to the previous "filter → sort → index" path because
 ///   `select_nth_unstable` returns the same scalar value at index `k`
@@ -558,7 +550,7 @@ pub fn iterative_robust_zscore(
                     0.5 * (lower_max + mid_val)
                 };
                 // MAD = mean absolute deviation from the mean (not from
-                // the median — matches MATLAB default `mad(x)`).
+                // the median, matching MATLAB default `mad(x)`).
                 let mean_ = buf.iter().sum::<f64>() / n as f64;
                 let mad = buf.iter().map(|&v| (v - mean_).abs()).sum::<f64>() / n as f64;
                 (med, mad)
@@ -669,7 +661,7 @@ fn compute_band_artifacts(
     detrend_on: bool,
     zscore_method: ZScoreMethod,
 ) -> Vec<bool> {
-    // Sub-step timing — log at `info` level so it surfaces in the
+    // Sub-step timing. Log at `info` level so it surfaces in the
     // Tauri stderr stream with default `RUST_LOG=info`. Lets us see
     // where the per-band budget actually goes (filter, Hilbert, smooth,
     // z-score) on a real recording.
@@ -741,7 +733,7 @@ fn binary_dilate(mask: &[bool], k: usize) -> Vec<bool> {
         return mask.to_vec();
     }
     let mut out = vec![false; n];
-    // Find runs of True; expand each run by k on both sides.
+    // Find runs of True. Expand each run by k on both sides.
     let mut i = 0;
     while i < n {
         if mask[i] {
@@ -812,7 +804,7 @@ pub fn detect_artifacts_with_known_bad(
     // Interp through bad samples so filters don't see NaN / flats.
     let data_fixed = interp_bad_samples(data, &bad);
 
-    // Run the BB and HF bands concurrently — they're independent
+    // Run the BB and HF bands concurrently. They're independent
     // (different filter design, separate copy of `data_fixed`), and
     // each one is sequential internally, so `rayon::join` halves the
     // wall-clock for this phase on any machine with ≥2 cores. The
@@ -857,7 +849,7 @@ pub fn detect_artifacts_with_known_bad(
     artifacts
 }
 
-/// Slope-test artifact mask — the `slope_test` block of `detect_artifacts.m`.
+/// Slope-test artifact mask. The `slope_test` block of `detect_artifacts.m`.
 ///
 /// ```text
 /// [spect, stimes, sfreqs] = multitaper_spectrogram(data, Fs, [1 min(55,Fs/2)], [10,19], [10 5], ...);
@@ -1175,7 +1167,7 @@ mod tests {
     fn tolerance_flat_catches_resampled_flat_but_not_eeg() {
         // A genuinely flat/disconnected segment survives resampling as
         // near-constant (sub-unit ringing), not bit-identical. Exact equality
-        // misses it; a tolerance catches it — while real EEG is never flagged.
+        // misses it. A tolerance catches it, and real EEG is never flagged.
         let min_run = 100usize;
         let mut data = vec![0.0f64; 500];
         // EEG (±20)
@@ -1255,7 +1247,7 @@ mod tests {
     fn parallel_band_dispatch_is_bit_identical_to_sequential() {
         // Build a 5-minute synthetic 100 Hz signal with embedded
         // high-frequency bursts (band-HF artifacts) and a flat run.
-        // Run detect_artifacts twice — once via the public API (which
+        // Run detect_artifacts twice. Once via the public API (which
         // uses rayon::join when the `parallel` feature is on), and
         // once via direct sequential band calls. Both must produce
         // bit-identical masks because each band is a pure function of
@@ -1279,7 +1271,7 @@ mod tests {
         let opts = ArtifactOpts::default();
         let via_api = detect_artifacts(&data, fs, &opts);
 
-        // Sequential reference — mirror the body of detect_artifacts
+        // Sequential reference. Mirror the body of detect_artifacts
         // but without rayon::join.
         let flat = flat_run_mask_with_tolerance(&data, fs.round().max(1.0) as usize, flat_tolerance(&data));
         let mut bad: Vec<bool> = (0..data.len())

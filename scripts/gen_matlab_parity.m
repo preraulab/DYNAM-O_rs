@@ -17,11 +17,11 @@
 %       samples containing NaN, and FDR families containing NaN p-values.
 %
 %       fdr_bh is nested inside FDR_1D.m and so is not callable from
-%       outside it; a verbatim copy is appended to the bottom of this file
-%       as fdr_bh_ref. If FDR_1D's copy ever changes, re-copy it here.
+%       outside it. A verbatim copy is appended to the bottom of this file
+%       as fdr_bh_ref. If FDR_1D's copy changes, re-copy it here.
 %
-%       A diff in the regenerated fixtures means the MATLAB reference
-%       moved -- treat that as a decision to make, not a file to commit.
+%       Regenerate only when the MATLAB reference changes on purpose. A
+%       difference in the regenerated files is a decision to review.
 %
 %   See also: FDR_1D, FDR_2D, ranksum
 %
@@ -31,54 +31,82 @@ this_dir = fileparts(mfilename('fullpath'));
 out_dir  = fullfile(this_dir, '..', 'rust', 'tests', 'fixtures');
 assert(isfolder(out_dir), 'fixture dir not found: %s', out_dir);
 
-% Generate randomized ranksum cases spanning both branches, ties, and NaNs.
+% Ranksum cases spanning both branches, ties, and NaNs. The random draws
+% happen in a fixed order (n1, n2, style, x, y), so the fixture is
+% reproducible from the seed.
 rng(2026);
-out = fopen(fullfile(out_dir, 'parity_ranksum.csv'),'w');
+out = fopen(fullfile(out_dir, 'parity_ranksum.csv'), 'w');
 fprintf(out, 'case,n1,n2,p,x,y\n');
-ncase = 0;
+n_ranksum_cases = 0;
 for trial = 1:300
-    n1 = randi([1 25]); n2 = randi([1 25]);
+    n1 = randi([1 25]);
+    n2 = randi([1 25]);
     style = randi(4);
     switch style
-        case 1, x = randn(1,n1);            y = randn(1,n2) + 0.6;      % continuous
-        case 2, x = randi([1 4],1,n1);      y = randi([1 4],1,n2);      % heavy ties
-        case 3, x = round(randn(1,n1),1);   y = round(randn(1,n2)+0.3,1); % light ties
-        case 4, x = [randn(1,max(1,n1-2)) nan(1,min(2,n1))];            % with NaNs
-                y = [randn(1,max(1,n2-2))+0.4 nan(1,min(2,n2))];
-                n1 = numel(x); n2 = numel(y);
+        case 1
+            % Continuous values, y shifted up.
+            x = randn(1, n1);
+            y = randn(1, n2) + 0.6;
+        case 2
+            % Heavy ties: integers 1 to 4.
+            x = randi([1 4], 1, n1);
+            y = randi([1 4], 1, n2);
+        case 3
+            % Light ties: values rounded to one decimal.
+            x = round(randn(1, n1), 1);
+            y = round(randn(1, n2) + 0.3, 1);
+        case 4
+            % Up to two NaN at the end of each sample.
+            x = [randn(1, max(1, n1 - 2)), nan(1, min(2, n1))];
+            y = [randn(1, max(1, n2 - 2)) + 0.4, nan(1, min(2, n2))];
+            n1 = numel(x);
+            n2 = numel(y);
     end
-    if all(isnan(x)) || all(isnan(y)), continue; end
-    if sum(isfinite(x))==0 || sum(isfinite(y))==0, continue; end
+    % Skip a draw with no usable value on one side.
+    if all(isnan(x)) || all(isnan(y))
+        continue;
+    end
     p = ranksum(x, y);
-    ncase = ncase + 1;
-    fprintf(out, '%d,%d,%d,%.17g,%s,%s\n', ncase, n1, n2, p, ...
-        strjoin(arrayfun(@(v) sprintf('%.17g',v), x, 'uni', 0), ' '), ...
-        strjoin(arrayfun(@(v) sprintf('%.17g',v), y, 'uni', 0), ' '));
+    n_ranksum_cases = n_ranksum_cases + 1;
+    fprintf(out, '%d,%d,%d,%.17g,%s,%s\n', n_ranksum_cases, n1, n2, p, ...
+        numbers_to_text(x), numbers_to_text(y));
 end
 fclose(out);
-fprintf('wrote %d ranksum cases\n', ncase);
+fprintf('wrote %d ranksum cases\n', n_ranksum_cases);
 
-% FDR fixtures across both methods and several family shapes
-out = fopen(fullfile(out_dir, 'parity_fdr.csv'),'w');
+% FDR cases across both methods and several family sizes.
+out = fopen(fullfile(out_dir, 'parity_fdr.csv'), 'w');
 fprintf(out, 'case,method,q,p,padj\n');
-nf = 0;
+fdr_methods = {'pdep', 'dep'};
+q = 0.1;
+n_fdr_cases = 0;
 for trial = 1:60
-    m = randi([1 200]);
-    p = rand(1, m).^randi([1 4]);
-    if mod(trial,3)==0                     % sprinkle NaNs
-        p(randperm(m, max(1,floor(m/5)))) = nan;
+    family_size = randi([1 200]);
+    % Raising uniform draws to a power of 1 to 4 pushes p-values toward 0.
+    p = rand(1, family_size) .^ randi([1 4]);
+    % Every third family gets NaN in about a fifth of its entries.
+    if mod(trial, 3) == 0
+        n_nan = max(1, floor(family_size / 5));
+        p(randperm(family_size, n_nan)) = nan;
     end
-    for ms = {'pdep','dep'}
-        q = 0.1;
-        [~,~,~,padj] = fdr_bh_ref(p, q, ms{1});
-        nf = nf + 1;
-        fprintf(out, '%d,%s,%.17g,%s,%s\n', nf, ms{1}, q, ...
-            strjoin(arrayfun(@(v) sprintf('%.17g',v), p, 'uni', 0), ' '), ...
-            strjoin(arrayfun(@(v) sprintf('%.17g',v), padj, 'uni', 0), ' '));
+    for method_index = 1:numel(fdr_methods)
+        method = fdr_methods{method_index};
+        [~, ~, ~, p_adjusted] = fdr_bh_ref(p, q, method);
+        n_fdr_cases = n_fdr_cases + 1;
+        fprintf(out, '%d,%s,%.17g,%s,%s\n', n_fdr_cases, method, q, ...
+            numbers_to_text(p), numbers_to_text(p_adjusted));
     end
 end
 fclose(out);
-fprintf('wrote %d fdr cases\n', nf);
+fprintf('wrote %d fdr cases\n', n_fdr_cases);
+
+function text = numbers_to_text(values)
+% The values as text with 17 significant digits, separated by spaces.
+text = strtrim(sprintf('%.17g ', values));
+end
+
+% Verbatim copy of fdr_bh from FDR_1D.m. Do not edit it. Re-copy it if
+% FDR_1D changes.
 function [h, crit_p, adj_ci_cvrg, adj_p]=fdr_bh_ref(pvals,q,method,report)
 
 if nargin<1

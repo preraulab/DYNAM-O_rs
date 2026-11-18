@@ -30,8 +30,8 @@
 //!   intrinsically. Never rescale it alongside `ys`.
 //!
 //! The reported `FreqStd`/`SOphaseStd` columns, the mode-volume integral,
-//! and the peak-containment geometry all consume these directly as σ —
-//! there is no variance⇄σ transform at any boundary.
+//! and the peak-containment geometry all consume these directly as σ.
+//! There is no variance⇄σ transform at any boundary.
 //!
 //! Parameter layout (flat vector, length `6N + 3`):
 //!
@@ -56,7 +56,7 @@
 //! modes out, so it is not used.
 //!
 //! The `unit_row=false` branch is kept for the parity kernel tests. The
-//! numerical Jacobian is used in both branches — row coupling makes the
+//! numerical Jacobian is used in both branches. Row coupling makes the
 //! analytic Jacobian expensive to write and the LM is solver-bound
 //! anyway, so it isn't worth the added complexity.
 
@@ -137,7 +137,7 @@ impl<'a> ResidualsAndJacobian for VmGaussProblem<'a> {
 
     fn jacobian(&self, params: &[f64], out: &mut DMatrix<f64>) {
         // Numerical Jacobian via central differences. Analytic forms exist
-        // but are tedious — and at the per-pixel grid sizes we operate on
+        // but are tedious, and at the per-pixel grid sizes we operate on
         // (n_x ~ 60, n_y ~ 100), numerical Jacobian compute is ≤10% of
         // LM total time. We'll revisit if profiling demands it.
         let n_p = self.n_params();
@@ -277,7 +277,7 @@ mod tests {
         let y: f64 = 11.0;
         let dy = y - fm;
         let kappa = 1.0 / (rk * rk);
-        // The ½ is on the Gaussian factor only; the von Mises factor is
+        // The ½ is on the Gaussian factor only. The von Mises factor is
         // already its own half-form and is written here unchanged.
         let expected = a * (-0.5 * (dy * dy) / (fs * fs)).exp()
             * (kappa * ((x - pp + dy * th.sin()).cos() - 1.0)).exp();

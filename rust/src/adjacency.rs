@@ -22,8 +22,8 @@ pub struct Region {
     /// MATLAB `Ldata2graph`'s `rgn{}` = `interior ∪ border`, carried
     /// through merges by *union* (`mergeRegions`: `regions{a}=unique([…])`).
     /// Unlike `border` (kept as a symmetric difference for edge weights),
-    /// `all_px` accumulates every pixel — including the now-interior
-    /// 0-lines between absorbed sub-regions — so the cut / trim / stats
+    /// `all_px` accumulates every pixel, including the now-interior
+    /// 0-lines between absorbed sub-regions, so the cut / trim / stats
     /// see a solid region, exactly as `extracthistpeaks.m` does.
     pub all_px: Vec<u32>,
     pub neighbors: BTreeSet<i32>,
@@ -31,9 +31,9 @@ pub struct Region {
 
 #[derive(Debug, Default)]
 pub struct Graph {
-    /// `regions[i]` — the i-th region (1:1 with dense slot indices).
+    /// `regions[i]`. The i-th region (1:1 with dense slot indices).
     pub regions: Vec<Option<Region>>,
-    /// label → slot index. Filled lazily; unused labels have sentinel -1.
+    /// label → slot index. Filled lazily. Unused labels have sentinel -1.
     pub label_to_slot: std::collections::HashMap<i32, usize>,
     pub height: usize,
     pub width: usize,
@@ -102,12 +102,12 @@ impl Graph {
 
     /// Per region (mirrors MATLAB `Ldata2graph.m`):
     /// - `border` = every pixel 8-adjacent to the region whose label differs
-    ///   from the region's own label — i.e. the `conv2(sub_img,[1 1 1;1 -8
+    ///   from the region's own label. I.e. the `conv2(sub_img,[1 1 1;1 -8
     ///   1;1 1 1])>0` rim, which is *all* non-self pixels around the region
     ///   (watershed-0-line pixels AND pixels of other regions). MATLAB then
     ///   redefines `rgn{} = interior ∪ border`.
     /// - `neighbors` = every other region label appearing within a 2-pixel
-    ///   (Chebyshev) dilation of the region — MATLAB's 5×5 `H_dilate`,
+    ///   (Chebyshev) dilation of the region. MATLAB's 5×5 `H_dilate`,
     ///   excluding 0 and the region itself.
     fn fill_borders_and_neighbors(&mut self, raw: &[i64], h: usize, w: usize) {
         for y in 0..h {
@@ -164,18 +164,30 @@ impl Graph {
             if let Some(r) = self.regions[slot].as_mut() {
                 r.border.sort_unstable();
                 r.border.dedup();
-                // interior is already sorted (row-major fill); merge with border.
+                // interior is already sorted (row-major fill). Merge with border.
                 let mut all = Vec::with_capacity(r.interior.len() + r.border.len());
-                let (mut i, mut j) = (0usize, 0usize);
-                while i < r.interior.len() && j < r.border.len() {
-                    match r.interior[i].cmp(&r.border[j]) {
-                        std::cmp::Ordering::Less => { all.push(r.interior[i]); i += 1; }
-                        std::cmp::Ordering::Greater => { all.push(r.border[j]); j += 1; }
-                        std::cmp::Ordering::Equal => { all.push(r.interior[i]); i += 1; j += 1; }
+                let mut interior_pos = 0usize;
+                let mut border_pos = 0usize;
+                while interior_pos < r.interior.len() && border_pos < r.border.len() {
+                    match r.interior[interior_pos].cmp(&r.border[border_pos]) {
+                        std::cmp::Ordering::Less => {
+                            all.push(r.interior[interior_pos]);
+                            interior_pos += 1;
+                        }
+                        std::cmp::Ordering::Greater => {
+                            all.push(r.border[border_pos]);
+                            border_pos += 1;
+                        }
+                        // A pixel in both lists is kept once.
+                        std::cmp::Ordering::Equal => {
+                            all.push(r.interior[interior_pos]);
+                            interior_pos += 1;
+                            border_pos += 1;
+                        }
                     }
                 }
-                all.extend_from_slice(&r.interior[i..]);
-                all.extend_from_slice(&r.border[j..]);
+                all.extend_from_slice(&r.interior[interior_pos..]);
+                all.extend_from_slice(&r.border[border_pos..]);
                 r.all_px = all;
             }
         }

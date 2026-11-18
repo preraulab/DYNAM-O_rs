@@ -38,7 +38,7 @@ fn sosfilt_single_section(sec: &[f64; 6], x: &mut [f64], mut z0: f64, mut z1: f6
 }
 
 /// Steady-state initial conditions for one section, for a unit step input
-/// (MATLAB `filtfilt.m`, `getCoeffsAndInitialConditions`; the same values
+/// (MATLAB `filtfilt.m`, `getCoeffsAndInitialConditions`, the same values
 /// as `scipy.signal.lfilter_zi`). Multiplying them by the first input
 /// sample starts the filter as if that value had been held forever, which
 /// removes the start-up transient for a constant offset.
@@ -226,7 +226,7 @@ pub fn unwrap(p: &[f64], discont: f64) -> Vec<f64> {
     let mut offset = 0.0f64;
     out.push(p[0]);
     for i in 1..n {
-        // delta uses ORIGINAL-adjacent samples (p[i] - p[i-1]); the jump
+        // delta uses ORIGINAL-adjacent samples (p[i] - p[i-1]). The jump
         // location is determined by raw input, consistent with numpy.unwrap.
         let delta = p[i] - p[i - 1];
         if delta > discont {
@@ -242,8 +242,18 @@ pub fn unwrap(p: &[f64], discont: f64) -> Vec<f64> {
 }
 
 // ---------------------------------------------------------------------------
-// movmean  (centered window, partial at edges — MATLAB `movmean`)
+// movmean  (centered window, partial at edges, MATLAB `movmean`)
 // ---------------------------------------------------------------------------
+
+/// How many samples a moving window of length `win` reaches to the left and
+/// to the right of its center sample, as MATLAB `movmean` and `movmedian`
+/// place it. An even-length window sits one sample toward the past, covering
+/// samples `[i - win/2, i + win/2 - 1]`. An odd-length window is symmetric.
+pub(crate) fn matlab_window_halves(win: usize) -> (usize, usize) {
+    let half_left = win / 2;
+    let half_right = (win - 1) / 2;
+    (half_left, half_right)
+}
 
 /// Running mean with centered window of length `win`. Edges use partial
 /// windows (as MATLAB `movmean(x, win)`).
@@ -252,10 +262,7 @@ pub fn movmean(x: &[f64], win: usize) -> Vec<f64> {
     if win <= 1 || n == 0 {
         return x.to_vec();
     }
-    // MATLAB places an even-length window one sample toward the past:
-    // samples [i - win/2, i + win/2 - 1]. Odd lengths are symmetric.
-    let half_l = win / 2;
-    let half_r = (win - 1) / 2;
+    let (half_l, half_r) = matlab_window_halves(win);
     // Prefix sum for O(N) window query.
     let mut csum = vec![0.0f64; n + 1];
     for i in 0..n {

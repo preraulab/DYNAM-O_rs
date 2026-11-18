@@ -21,8 +21,8 @@ function gen_matlab_pipeline_fixtures(toolbox_dir)
 %       every `.u16` file a flat list of little-endian 16-bit integers.
 %       Matrices are written row by row.
 %
-%       Generate from a MATLAB tree that includes the BoundingBox pixel
-%       extent fix (preraulab/DYNAM-O #11).
+%       Requires a MATLAB tree whose BoundingBox is the exact pixel
+%       extent, with the corner half a bin before the first pixel center.
 %
 %       Regenerate only when the MATLAB reference changes on purpose. A
 %       difference in the regenerated files is a decision to review.
@@ -88,18 +88,28 @@ dt = stimes(2) - stimes(1);
 columns_per_segment = floor(seg_time / dt);
 n_segments_total = floor(numel(stimes) / columns_per_segment);
 % Two segments, one early and one late, to keep the fixture small.
-chosen = round(linspace(2, n_segments_total - 1, 2));
+chosen = [2, n_segments_total - 1];
 all_peak_times = [];
-all_peaks = zeros(0, 10);
+% Each peak is ten numbers: PeakTime, PeakFrequency, Height, Volume,
+% Duration, Bandwidth, then the four BoundingBox values.
+n_values_per_peak = 10;
+% 8-connectivity for the watershed and for the trim, and no cap on the
+% number of merges.
+conn_wshed = 8;
+conn_trim = 8;
+max_merges = inf;
+all_peaks = zeros(0, n_values_per_peak);
 for k = 1:numel(chosen)
     first_column = (chosen(k) - 1) * columns_per_segment + 1;
     columns = first_column:(first_column + columns_per_segment - 1);
     img = divided(:, columns);
     seg_times = stimes(columns);
-    stats = extractTFPeaks(img, seg_times(:)', sfreqs(:), features, k, 8, merge_thresh, inf, ...
-        downsample_spect, dur_min, bw_min, trim_vol, trim_shift, 8, [], [], 0, '', 0);
+    % The trailing arguments leave the bounds and the merge rule at their
+    % defaults and switch off verbose output and plotting.
+    stats = extractTFPeaks(img, seg_times(:)', sfreqs(:), features, k, conn_wshed, merge_thresh, max_merges, ...
+        downsample_spect, dur_min, bw_min, trim_vol, trim_shift, conn_trim, [], [], 0, '', 0);
     if isempty(stats)
-        peaks = zeros(0, 10);
+        peaks = zeros(0, n_values_per_peak);
     else
         peaks = [stats.PeakTime, stats.PeakFrequency, stats.Height, stats.Volume, stats.Duration, ...
             stats.Bandwidth, stats.BoundingBox];
@@ -129,7 +139,14 @@ event_time = events(:, 1);
 event_bbox = events(:, 7:10);
 event_table = table(event_time, nan(size(event_time)), event_bbox, ...
     'VariableNames', {'PeakTime', 'PeakFrequency', 'BoundingBox'});
-refined_table = refinePeakFrequency(data, Fs, event_table, refine_freq_range, [], false, 'spline_interp', true, 'matlab');
+% Positional arguments after the frequency range: default time axis, no
+% plot, spline interpolation of the spectrum, peaks at the box edge
+% removed, and the pure-MATLAB backend.
+default_time_axis = [];
+plot_on = false;
+remove_edge_peaks = true;
+refined_table = refinePeakFrequency(data, Fs, event_table, refine_freq_range, default_time_axis, plot_on, ...
+    'spline_interp', remove_edge_peaks, 'matlab');
 write_f64(out_dir, 'refine_freq_range', refine_freq_range);
 write_f64(out_dir, 'refine_event_time', event_time);
 write_f64(out_dir, 'refine_event_bbox', event_bbox');   % one event after another
@@ -155,8 +172,11 @@ stimes_first = stimes_first(first_columns);
 first_dur_min = 0.5;
 first_bw_min = 2;
 first_features = {'PeakTime', 'PeakFrequency', 'Duration', 'Bandwidth', 'Height'};
+% The first pass measures trim volume from zero, and runs without
+% verbose output or plotting.
+first_trim_shift = 0;
 [~, regions, borders] = runSegmentedData(spect_first, stimes_first, sfreqs, double(baseline_first), seg_time, downsample_spect, ...
-    first_features, first_dur_min, first_bw_min, merge_thresh, inf, trim_vol, 0, false, false, 'backend', 'matlab');
+    first_features, first_dur_min, first_bw_min, merge_thresh, max_merges, trim_vol, first_trim_shift, false, false, 'backend', 'matlab');
 
 label_image = zeros(size(spect_first));
 for k = 1:numel(regions)
@@ -205,6 +225,8 @@ so_power_norm = 'p2shift1234';
 assert(numel(so_power_full) == numel(data), 'SO-power is not on the EEG sample grid');
 excluded_data = data;
 excluded_data(artifacts) = nan;
+% Arguments after the window: default FFT length, linear detrend,
+% default weighting, no plot, no verbose output.
 [so_spect, so_spect_times, so_spect_freqs] = multitaper_spectrogram_dynamo(excluded_data, Fs, so_power_band, ...
     so_power_tapers, so_power_window, [], 'linear', [], false, false);
 write_f64(out_dir, 'sopower_spect_dims', size(so_spect));
@@ -217,6 +239,8 @@ fprintf('SO-power: %d x %d spectrogram, %d NaN of %d output samples\n', size(so_
     sum(isnan(so_power_full)), numel(so_power_full));
 
 %% Stage 7: per-peak stage, SO-power, and SO-phase (computePeak*.m)
+% Toolbox defaults are fine here. This series is only an input: it is
+% saved and both sides interpolate the same saved values.
 [so_power, so_power_times] = computeSOpower(data, Fs);
 % Both series go to double for the same reason as the segments above
 % (computeSOphase returns single precision).
@@ -229,10 +253,18 @@ so_phase_times_row = so_phase_times(:)';
 % differ between implementations: on grid samples, exactly halfway
 % between samples, and around both ends of each grid.
 eeg_step = 1 / Fs;
-probes = [t(1:997:end), t(1:1501:end) + eeg_step / 2, ...
-    so_power_times(1) + (-2:0.5:2) * (so_power_times(2) - so_power_times(1)), ...
-    so_power_times(end) + (-2:0.5:2) * (so_power_times(2) - so_power_times(1)), ...
-    t(1) + (0:0.5:2) * eeg_step, t(end) - (0:0.5:2) * eeg_step];
+so_power_step = so_power_times(2) - so_power_times(1);
+% The strides 997 and 1501 are primes, so the probes spread over the
+% recording without lining up with epochs or spectrogram windows.
+on_grid_probes = t(1:997:end);
+midpoint_probes = t(1:1501:end) + eeg_step / 2;
+% Two grid steps either side of each end of the SO-power grid, in half steps.
+power_start_probes = so_power_times(1) + (-2:0.5:2) * so_power_step;
+power_end_probes = so_power_times(end) + (-2:0.5:2) * so_power_step;
+% The first and last two EEG samples, in half steps.
+eeg_start_probes = t(1) + (0:0.5:2) * eeg_step;
+eeg_end_probes = t(end) - (0:0.5:2) * eeg_step;
+probes = [on_grid_probes, midpoint_probes, power_start_probes, power_end_probes, eeg_start_probes, eeg_end_probes];
 query_times = sort([all_peak_times(:)', probes]);
 query_times = query_times(query_times >= t(1) & query_times <= t(end));
 
@@ -265,14 +297,20 @@ rng(20261117, 'twister');
 n = Fs * duration_s;
 t = (0:n - 1)' / Fs;
 
+% 1/f-like background: a random walk with its slow drift (4 s moving
+% mean) removed, scaled to 6 uV, plus 3 uV of white noise.
 white = randn(n, 1);
 background = cumsum(white);
 background = background - movmean(background, 4 * Fs);
 background = 6 * background / std(background) + 3 * randn(n, 1);
 
+% Slow oscillation near 0.8 Hz, up to 35 uV, with a slow frequency wobble.
+% Its depth rises from half to full and back over the recording.
 depth = 0.5 + 0.5 * sin(2 * pi * t / duration_s - pi / 2) .^ 2;
 slow_oscillation = 35 * depth .* sin(2 * pi * 0.8 * t + 0.6 * sin(2 * pi * 0.05 * t));
 
+% Sigma bursts every 9 s: 12 uV, 12 to 15 Hz, 0.8 to 1.6 s long, each
+% under a Hann window.
 sigma = zeros(n, 1);
 burst_starts = 5:9:(duration_s - 5);
 for k = 1:numel(burst_starts)
@@ -285,6 +323,8 @@ end
 
 data = background + slow_oscillation + sigma;
 
+% Artifacts: a 4 s flat run, 2 s of 150 uV noise, and a 3 s swing of
+% 400 uV at 0.3 Hz.
 flat_run = t >= 120 & t < 124;
 data(flat_run) = data(find(flat_run, 1));
 noisy = t >= 300 & t < 302;
@@ -301,7 +341,9 @@ end
 function write_u16(out_dir, name, values)
 % Small whole numbers (labels, yes/no masks) as little-endian 16-bit
 % integers, a quarter of the size of doubles.
-assert(all(values(:) >= 0 & values(:) <= 65535 & values(:) == round(values(:))), '%s does not fit 16-bit integers', name);
+is_in_range = values(:) >= 0 & values(:) <= 65535;
+is_whole = values(:) == round(values(:));
+assert(all(is_in_range & is_whole), '%s does not fit 16-bit integers', name);
 file_id = fopen(fullfile(out_dir, [name '.u16']), 'w', 'ieee-le');
 assert(file_id > 0, 'cannot open %s for writing', name);
 fwrite(file_id, values(:), 'uint16');
@@ -309,6 +351,7 @@ fclose(file_id);
 end
 
 function write_f64(out_dir, name, values)
+% Values as little-endian doubles, in column order.
 file_id = fopen(fullfile(out_dir, [name '.f64']), 'w', 'ieee-le');
 assert(file_id > 0, 'cannot open %s for writing', name);
 fwrite(file_id, double(values(:)), 'double');

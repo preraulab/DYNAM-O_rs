@@ -1,4 +1,4 @@
-//! Port of `read_staging.m` — sleep-stage CSV/TSV parser.
+//! Port of `read_staging.m`. Sleep-stage CSV/TSV parser.
 //!
 //! Reads a delimited text file, takes two columns (time and stage string),
 //! maps stage strings to numeric codes with the MATLAB default table, and
@@ -61,18 +61,18 @@ pub struct StagingOpts {
     pub header_lines: usize,
     pub delimiter: char,
     pub epoch_dur: f64,
-    /// Optional start-time 'HH:MM:SS [AM|PM]' string — only used for Case 3.
+    /// Optional start-time 'HH:MM:SS [AM|PM]' string. Only used for Case 3.
     pub start_time: Option<String>,
-    /// Length of the recording in seconds, when the caller knows it — only
+    /// Length of the recording in seconds, when the caller knows it. Only
     /// used for Case 3 together with `start_time`. It lets the reader tell
     /// a first scored epoch after midnight from staging that starts before
     /// the recording does (see the next-day rule in `read_staging`).
     pub recording_duration: Option<f64>,
     /// Per-stage label aliases in canonical order
     /// `[artifact, wake, REM, N1, N2, N3, unknown]`. Each inner list is
-    /// the set of strings (case-insensitive) that map to that stage —
+    /// the set of strings (case-insensitive) that map to that stage. It
     /// matches MATLAB `read_staging`'s `stage_vals` parameter. A
-    /// length-7 list overrides the built-in default table; any other
+    /// length-7 list overrides the built-in default table. Any other
     /// length (incl. empty) falls back to the defaults.
     pub stage_vals: Vec<Vec<String>>,
 }
@@ -113,7 +113,7 @@ fn split_line(line: &str, delim: char) -> Vec<String> {
     out
 }
 
-/// MATLAB `read_staging` default `stage_vals` — 7 alias lists in
+/// MATLAB `read_staging` default `stage_vals`: 7 alias lists in
 /// canonical order [artifact, wake, REM, N1, N2, N3, unknown].
 const DEFAULT_STAGE_VALS: [&[&str]; 7] = [
     &["art", "artifact", "a", "6"],
@@ -130,9 +130,9 @@ const DEFAULT_STAGE_VALS: [&[&str]; 7] = [
 const STAGE_CODES: [i32; 7] = [6, 5, 4, 3, 2, 1, 0];
 
 /// Build the case-insensitive alias→code lookup. A length-7 `custom`
-/// list overrides the defaults; any other length falls back to the
+/// list overrides the defaults. Any other length falls back to the
 /// MATLAB default table. When two stage slots share an alias the
-/// later (higher-numbered) slot wins — matches MATLAB's overwrite order.
+/// later (higher-numbered) slot wins. Matches MATLAB's overwrite order.
 fn build_stage_map(custom: &[Vec<String>]) -> HashMap<String, i32> {
     let mut map: HashMap<String, i32> = HashMap::new();
     if custom.len() == 7 {
@@ -156,13 +156,13 @@ fn build_stage_map(custom: &[Vec<String>]) -> HashMap<String, i32> {
 
 /// Strip a leading ISO 8601 / RFC 3339 date prefix, returning the
 /// time-of-day portion. Handles both separators:
-///   - `2014-06-26T01:29:29.420000` (T separator — strict ISO 8601)
-///   - `2014-06-26 01:29:29.420000` (space separator — RFC 3339 §5.6)
+///   - `2014-06-26T01:29:29.420000` (T separator, strict ISO 8601)
+///   - `2014-06-26 01:29:29.420000` (space separator, RFC 3339 §5.6)
 ///
 /// The space form is only stripped when the part before the space
 /// looks like a date (contains `-` or `/` and otherwise only digits/
 /// separators), so a bare `"12:00:00 AM"` time-of-day is not
-/// mis-handled — the AM/PM-side space stays intact and the AM/PM
+/// mis-handled. The AM/PM-side space stays intact and the AM/PM
 /// branch downstream sees it.
 fn strip_date_prefix(s: &str) -> &str {
     if let Some(i) = s.rfind('T') {
@@ -181,7 +181,7 @@ fn strip_date_prefix(s: &str) -> &str {
 
 /// Strip a trailing timezone marker (`Z` or `+HH:MM` / `-HH:MM` /
 /// `+HHMM` / `-HHMM`). We only care about wall-clock time, so any
-/// timezone offset is silently dropped. Heuristic — only treats a
+/// timezone offset is silently dropped. Heuristic: it only treats a
 /// trailing `+`/`-` as a TZ marker when it's followed by digits (so
 /// it doesn't strip a `-` inside a negative second field, which
 /// wouldn't be valid anyway).
@@ -213,7 +213,7 @@ fn strip_tz_suffix(s: &str) -> &str {
 /// Parse 'HH:MM:SS[.ff] [AM|PM]' → seconds of day. Also accepts EDF's
 /// "hh.mm.ss" (dot-separated). ISO 8601 datetime inputs
 /// (`2014-06-26T01:29:29.420000`, with or without trailing TZ) are
-/// also accepted — the date and timezone are stripped before parsing,
+/// also accepted. The date and timezone are stripped before parsing,
 /// and only the wall-clock time-of-day is returned. Returns `None`
 /// for empty / unparseable input.
 ///
@@ -226,8 +226,8 @@ pub fn parse_time_of_day(t: &str) -> Option<f64> {
         return None;
     }
     // ISO 8601 / RFC 3339 date-time inputs (`2014-06-26T01:29:29.420000`,
-    // `2014-06-26 01:29:29.420000+05:30`) — we only care about the
-    // wall-clock time-of-day; the date drops and the timezone is
+    // `2014-06-26 01:29:29.420000+05:30`). We only care about the
+    // wall-clock time-of-day. The date drops and the timezone is
     // ignored. The midnight-wrap detector in `read_staging` reconstructs
     // cross-day runs from time-of-day deltas, so dropping the date
     // here loses no information for the cohort use case.
@@ -250,7 +250,7 @@ pub fn parse_time_of_day(t: &str) -> Option<f64> {
     }
 
     // Staging clock times use "HH:MM:SS"; EDF start times use "hh.mm.ss" (dots,
-    // per the EDF spec). Split on whichever separator is present — prefer ':'
+    // per the EDF spec). Split on whichever separator is present. Prefer ':'
     // so a fractional-second "HH:MM:SS.s" keeps its decimal.
     let sep = if core.contains(':') { ':' } else { '.' };
     let parts: Vec<&str> = core.split(sep).collect();
@@ -290,7 +290,7 @@ pub fn read_staging<P: AsRef<Path>>(
     // staging files in Windows-1252 / Latin-1 (degree signs, em-dashes in
     // the metadata header), which `read_to_string` rejects. The actual data
     // rows are pure ASCII (Wake/N1/N2/...), so a lossy decode produces
-    // correct results — invalid bytes become U+FFFD and only show up in
+    // correct results. Invalid bytes become U+FFFD and only show up in
     // the metadata header that we skip anyway.
     let raw = std::fs::read(path.as_ref()).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -470,7 +470,7 @@ pub fn read_staging<P: AsRef<Path>>(
         times_all = out.iter().map(|v| v - t0 + start_offset).collect();
     }
 
-    // Stage codes; drop unmatched rows (MATLAB does `~unmatched_idx`).
+    // Stage codes. Drop unmatched rows (MATLAB does `~unmatched_idx`).
     let stage_map = build_stage_map(&opts.stage_vals);
     let mut times: Vec<f64> = Vec::new();
     let mut vals: Vec<f64> = Vec::new();

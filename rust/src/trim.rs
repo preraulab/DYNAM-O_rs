@@ -146,7 +146,7 @@ pub fn trim_all_regions(
         let vmin = vals.iter().cloned().fold(f64::INFINITY, f64::min);
         let vmax = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         if vmin == vmax {
-            // Constant region — keep as-is
+            // Constant region. Keep as-is
             for &p in pixels { out_slice[p as usize] = label; }
             continue;
         }

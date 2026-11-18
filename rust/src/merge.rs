@@ -46,9 +46,19 @@ impl Ord for HeapEntry {
         if w != Ordering::Equal {
             return w;
         }
-        // Tie-break: earlier insertion_order wins — invert so BinaryHeap pops it first.
+        // Tie-break: earlier insertion_order wins. Invert so BinaryHeap pops it first.
         other.insertion_order.cmp(&self.insertion_order)
     }
+}
+
+/// One row of MATLAB's `ematr` as the de-duplication step sees it: where
+/// the row sits in the table and which way it points.
+#[derive(Clone, Copy)]
+struct TableRow {
+    /// Row position in `ematr`. A smaller position is earlier in the table.
+    position: u64,
+    /// The row as MATLAB stores it, `[merge_to, merge_from]`.
+    oriented: (i32, i32),
 }
 
 /// Bookkeeping for one edge, mirroring its row in MATLAB's `ematr`.
@@ -67,16 +77,18 @@ struct EdgeMeta {
 }
 
 /// Two-pointer intersection of two sorted `Vec<u32>`. Returns `None` when
-/// the intersection is empty (regions not actually adjacent); otherwise
+/// the intersection is empty (regions not actually adjacent). Otherwise
 /// `Some(max)` of `values` over the intersecting indices. NaN values are
-/// ignored (MATLAB `max` is omitnan); an all-NaN intersection → `Some(NaN)`.
+/// ignored (MATLAB `max` is omitnan). An all-NaN intersection → `Some(NaN)`.
 fn sorted_intersect_max(a: &[u32], b: &[u32], values: &[f64]) -> Option<f64> {
-    let (mut i, mut j) = (0usize, 0usize);
+    let mut i = 0usize;
+    let mut j = 0usize;
     let mut found_any = false;
     let mut mx = f64::NEG_INFINITY;
     let mut any_finite = false;
     while i < a.len() && j < b.len() {
-        let (ai, bj) = (a[i], b[j]);
+        let ai = a[i];
+        let bj = b[j];
         if ai == bj {
             found_any = true;
             let v = values[ai as usize];
@@ -147,7 +159,7 @@ fn sorted_max_over_two(a: &[u32], b: &[u32], values: &[f64]) -> f64 {
 
 /// Symmetric merge weight (matches pyDYNAM-O's edge_weight after bug fix).
 /// Returns None when the two regions' border intersection is empty (= not
-/// actually adjacent — "diagonal neighbor" case).
+/// actually adjacent, the "diagonal neighbor" case).
 fn edge_weight(
     ra: &Region,
     rb: &Region,
@@ -170,7 +182,7 @@ fn merge_regions(dst: &mut Region, src: Region) {
     dst.interior = sorted_union(&dst.interior, &src.interior);
     dst.border = sorted_symdiff(&dst.border, &src.border);
     // `all_px` (MATLAB `regions{a}=unique([regions{a};regions{b}])`):
-    // pure union — keeps the now-interior 0-lines the symdiff border drops.
+    // pure union. Keeps the now-interior 0-lines the symdiff border drops.
     dst.all_px = sorted_union(&dst.all_px, &src.all_px);
     // neighbors: union, excluding the absorbed src label
     for n in src.neighbors {
@@ -180,9 +192,11 @@ fn merge_regions(dst: &mut Region, src: Region) {
     dst.neighbors.remove(&dst.label);
 }
 
+/// Union of two sorted lists, sorted, with each shared value kept once.
 fn sorted_union(a: &[u32], b: &[u32]) -> Vec<u32> {
     let mut out = Vec::with_capacity(a.len() + b.len());
-    let (mut i, mut j) = (0usize, 0usize);
+    let mut i = 0usize;
+    let mut j = 0usize;
     while i < a.len() && j < b.len() {
         if a[i] < b[j] {
             out.push(a[i]);
@@ -201,9 +215,11 @@ fn sorted_union(a: &[u32], b: &[u32]) -> Vec<u32> {
     out
 }
 
+/// Values that are in exactly one of two sorted lists, sorted.
 fn sorted_symdiff(a: &[u32], b: &[u32]) -> Vec<u32> {
     let mut out = Vec::with_capacity(a.len() + b.len());
-    let (mut i, mut j) = (0usize, 0usize);
+    let mut i = 0usize;
+    let mut j = 0usize;
     while i < a.len() && j < b.len() {
         if a[i] < b[j] {
             out.push(a[i]);
@@ -239,7 +255,7 @@ pub fn run_with_borders(
     let w = interior_only.ncols();
     // Build with-borders variant. Iterate regions sorted by label (1..N),
     // painting interior first then border, so shared border pixels claimed
-    // by two surviving regions get the higher-label one's paint last — matches
+    // by two surviving regions get the higher-label one's paint last. Matches
     // MATLAB's `for ii=1..N; Ldata(rgn{ii})=ii; end` iteration order.
     let mut with_borders = Array2::<i32>::zeros((h, w));
     {
@@ -279,7 +295,7 @@ pub fn run(
 /// This is the pixel set `extracthistpeaks.m` carries into the dur/bw
 /// cut, `trimWshedRegions`, and `computePeakStatsTable`. Regions are
 /// painted in ascending-label order so a pixel shared by two regions'
-/// `all_px` lists takes the higher label — matching MATLAB's
+/// `all_px` lists takes the higher label, matching MATLAB's
 /// `for ii=1:N; Ldata(regions{ii})=ii; end`.
 ///
 /// This entry point is the SOPH mode-peak finder's and merges under
@@ -370,7 +386,7 @@ pub fn run_regions(
     Ok(merged)
 }
 
-/// MATLAB `prctile(x, p)` for a vector — the default "exact" method.
+/// MATLAB `prctile(x, p)` for a vector. The default "exact" method.
 /// The i-th (0-based) sorted value sits at percentile `100*(i+0.5)/n`;
 /// targets below/above the first/last sample clamp, others interpolate
 /// linearly. NaNs are ignored, matching MATLAB. Empty input → 0.0.
@@ -435,7 +451,7 @@ fn run_inner(
     let mut heap:         BinaryHeap<HeapEntry> = BinaryHeap::new();
     let mut next_order: u64 = 0;
 
-    // Helper closures would need to borrow mutably; use local macros-via-fn instead.
+    // Helper closures would need to borrow mutably. Use local macros-via-fn instead.
     // We inline the insert/update logic at the three places it's needed.
 
     // --- Seed: for each edge (ra_label, n) with n > ra_label, compute weight. ---
@@ -481,7 +497,7 @@ fn run_inner(
     // MATLAB `mergeWshedSegment.m:184-185`: a NaN `merge_thresh` means
     // "merge down to the 95th percentile of the initial edge weights".
     // `extracthistpeaks` callers (`param_basis_opts.m`) pass exactly that
-    // — `watershed_params(1) = nan`.
+    // value, `watershed_params(1) = nan`.
     let merge_thresh = if merge_thresh.is_nan() {
         matlab_prctile(edge_weights.values().copied(), 95.0)
     } else {
@@ -529,7 +545,7 @@ fn run_inner(
                 // merge_thresh`, so an edge exactly at the threshold does
                 // not merge.
                 if e.weight <= merge_thresh { break; }
-                // MATLAB: `mrg_to = ematr(row,1); mrg_from = ematr(row,2)`.
+                // MATLAB sets `mrg_to = ematr(row,1)` and `mrg_from = ematr(row,2)`.
                 let oriented = edge_meta[&e.edge].oriented;
                 dst_label = oriented.0;
                 src_label = oriented.1;
@@ -551,7 +567,7 @@ fn run_inner(
         // src relabeled to dst). MATLAB relabels these rows in place, and
         // one of them survives the de-duplication below when it sits
         // earlier in the table than dst's own row to the same neighbor.
-        let mut src_rows: HashMap<i32, (u64, (i32, i32))> = HashMap::new();
+        let mut src_rows: HashMap<i32, TableRow> = HashMap::new();
         for nb in &absorbed_neighbors {
             if *nb == dst_label {
                 continue;
@@ -562,7 +578,11 @@ fn run_inner(
                 let (row_to, row_from) = meta.oriented;
                 let relabeled_to = if row_to == src_label { dst_label } else { row_to };
                 let relabeled_from = if row_from == src_label { dst_label } else { row_from };
-                src_rows.insert(*nb, (meta.insertion_order, (relabeled_to, relabeled_from)));
+                let relabeled_row = TableRow {
+                    position: meta.insertion_order,
+                    oriented: (relabeled_to, relabeled_from),
+                };
+                src_rows.insert(*nb, relabeled_row);
             }
         }
         {
@@ -572,7 +592,7 @@ fn run_inner(
         graph.label_to_slot.remove(&src_label);
 
         // Remove every edge touching src_label. Iterate src_label's neighbors
-        // (known from absorbed_neighbors) — this replaces the old O(|E|) retain.
+        // (known from absorbed_neighbors). This replaces the old O(|E|) retain.
         for nb in &absorbed_neighbors {
             let key = (src_label.min(*nb), src_label.max(*nb));
             if edge_weights.remove(&key).is_some() {
@@ -656,19 +676,27 @@ fn run_inner(
                     // `[dst nb]` / `[nb dst]`: the one earlier in the table,
                     // between dst's own row and src's relabeled row. It
                     // keeps its orientation.
-                    let dst_row: Option<(u64, (i32, i32))> = if edge_weights.contains_key(&key) {
+                    let dst_row: Option<TableRow> = if edge_weights.contains_key(&key) {
                         let existing = edge_meta[&key];
-                        Some((existing.insertion_order, existing.oriented))
+                        Some(TableRow {
+                            position: existing.insertion_order,
+                            oriented: existing.oriented,
+                        })
                     } else {
                         None
                     };
-                    let src_row: Option<(u64, (i32, i32))> = src_rows.get(&nb).copied();
+                    let src_row: Option<TableRow> = src_rows.get(&nb).copied();
                     let oriented = match (dst_row, src_row) {
-                        (Some((dst_position, dst_oriented)), Some((src_position, src_oriented))) => {
-                            if dst_position < src_position { dst_oriented } else { src_oriented }
+                        (Some(dst), Some(src)) => {
+                            if dst.position < src.position {
+                                dst.oriented
+                            } else {
+                                src.oriented
+                            }
                         }
-                        (Some((_, dst_oriented)), None) => dst_oriented,
-                        (None, Some((_, src_oriented))) => src_oriented,
+                        (Some(dst), None) => dst.oriented,
+                        (None, Some(src)) => src.oriented,
+                        // A new edge with no row yet starts as `[lower, higher]`.
                         (None, None) => key,
                     };
                     let existing_meta: Option<EdgeMeta> = edge_meta.get(&key).copied();
@@ -859,7 +887,7 @@ mod tests {
 
     #[test]
     fn trivially_merges() {
-        // Two regions separated by a 0-line; large thresh prevents merging.
+        // Two regions separated by a 0-line. Large thresh prevents merging.
         // Small (negative) thresh forces all merges.
         let labels = array![[1i64, 1, 0, 2, 2], [1, 1, 0, 2, 2]];
         let data = array![[10.0f64, 10.0, 5.0, 10.0, 10.0], [10.0, 10.0, 5.0, 10.0, 10.0]];
