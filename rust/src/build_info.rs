@@ -15,7 +15,7 @@
 //! over a byte-identical ABI, which is exactly the class of change the
 //! sha makes visible.
 
-/// The kernel build identity, e.g. `0.2.1+ab12cd34ef56.dirty`.
+/// The kernel build identity, e.g. `0.2.2+ab12cd34ef56.dirty`.
 pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("DYNAMO_GIT_SHA"));
 
 /// Runtime accessor for [`VERSION`] — the `kernel_version` stamp value.
