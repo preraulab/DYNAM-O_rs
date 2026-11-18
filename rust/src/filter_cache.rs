@@ -412,14 +412,22 @@ mod tests {
         // checked by name because 64 Hz recordings are common in the lab
         // cohorts.
         let bands = [(0.3, 1.0), (0.3, 1.5), (0.3, 5.0), (0.5, 1.0), (0.5, 1.5), (0.5, 5.0)];
-        let mut fss: Vec<u32> = EMBEDDED_FILTERS
-            .iter()
-            .filter_map(|(n, _)| {
-                n.strip_prefix("sophase_sos_Fs")
-                    .and_then(|r| r.split('_').next())
-                    .and_then(|s| s.parse().ok())
-            })
-            .collect();
+        // Sampling rate of each embedded filter, read from its name
+        // (`sophase_sos_Fs<rate>_...`).
+        let mut fss: Vec<u32> = Vec::new();
+        for (name, _) in EMBEDDED_FILTERS.iter() {
+            let after_prefix = match name.strip_prefix("sophase_sos_Fs") {
+                Some(rest) => rest,
+                None => continue,
+            };
+            let rate_text = match after_prefix.split('_').next() {
+                Some(text) => text,
+                None => continue,
+            };
+            if let Ok(rate) = rate_text.parse::<u32>() {
+                fss.push(rate);
+            }
+        }
         fss.sort_unstable();
         fss.dedup();
         assert!(fss.contains(&64), "Fs=64 missing from embedded set: {fss:?}");

@@ -413,10 +413,14 @@ pub fn extract_hist_peaks_with_stats(
     // ---- 5) Trim each region to `trim_vol` of its peak volume. -----------
     let labels_i32: Array2<i32> = labels.mapv(|v| v as i32);
     let shift_val = if params.trim_shift.is_nan() {
-        img.iter()
-            .cloned()
-            .filter(|v| !v.is_nan())
-            .fold(f64::INFINITY, f64::min)
+        // Smallest non-NaN value of the image (MATLAB `min(img(:))`).
+        let mut image_min = f64::INFINITY;
+        for &value in img.iter() {
+            if !value.is_nan() && value < image_min {
+                image_min = value;
+            }
+        }
+        image_min
     } else {
         params.trim_shift
     };
@@ -478,7 +482,15 @@ pub fn extract_hist_peaks_with_stats(
     for (k, lbl) in surviving.iter().enumerate() {
         remap.insert(*lbl, (k as i64) + 1);
     }
-    let out = trimmed.mapv(|v| if v > 0 { *remap.get(&v).unwrap_or(&0) } else { 0 });
+    // Survivors take their new number. Every other pixel becomes background.
+    let mut out = Array2::<i64>::zeros(trimmed.dim());
+    for ((row, col), &old_label) in trimmed.indexed_iter() {
+        if old_label > 0 {
+            if let Some(&new_label) = remap.get(&old_label) {
+                out[[row, col]] = new_label;
+            }
+        }
+    }
 
     // ---- 8) Per-region stats (`computePeakStatsTable`). ------------------
     let stats = compute_peak_stats(
@@ -507,32 +519,37 @@ fn compute_peak_stats(
     d_row: f64,
     d_col: f64,
 ) -> Vec<HistPeak> {
-    struct Acc {
+    /// Running totals for one region over its finite pixels.
+    struct RegionTotals {
+        /// Sum of the pixel values.
         sum_v: f64,
+        /// Sum of row index times value, for the value-weighted centroid.
         sum_rv: f64,
+        /// Sum of column index times value, for the value-weighted centroid.
         sum_cv: f64,
         min_v: f64,
         max_v: f64,
-        r0: usize,
-        r1: usize,
-        c0: usize,
-        c1: usize,
-        any: bool,
+        row_min: usize,
+        row_max: usize,
+        col_min: usize,
+        col_max: usize,
+        has_pixels: bool,
     }
-    let mut acc: Vec<Acc> = (0..n)
-        .map(|_| Acc {
+    let mut acc: Vec<RegionTotals> = Vec::with_capacity(n);
+    for _ in 0..n {
+        acc.push(RegionTotals {
             sum_v: 0.0,
             sum_rv: 0.0,
             sum_cv: 0.0,
             min_v: f64::INFINITY,
             max_v: f64::NEG_INFINITY,
-            r0: usize::MAX,
-            r1: 0,
-            c0: usize::MAX,
-            c1: 0,
-            any: false,
-        })
-        .collect();
+            row_min: usize::MAX,
+            row_max: 0,
+            col_min: usize::MAX,
+            col_max: 0,
+            has_pixels: false,
+        });
+    }
     let (h, w) = labels.dim();
     for r in 0..h {
         for c in 0..w {
@@ -545,39 +562,46 @@ fn compute_peak_stats(
                 continue; // MATLAB `Ldata` excludes NaN pixels
             }
             let a = &mut acc[(lbl - 1) as usize];
-            a.any = true;
+            a.has_pixels = true;
             a.sum_v += v;
             a.sum_rv += r as f64 * v;
             a.sum_cv += c as f64 * v;
             a.min_v = a.min_v.min(v);
             a.max_v = a.max_v.max(v);
-            a.r0 = a.r0.min(r);
-            a.r1 = a.r1.max(r);
-            a.c0 = a.c0.min(c);
-            a.c1 = a.c1.max(c);
+            a.row_min = a.row_min.min(r);
+            a.row_max = a.row_max.max(r);
+            a.col_min = a.col_min.min(c);
+            a.col_max = a.col_max.max(c);
         }
     }
     let so0 = so_bins.first().copied().unwrap_or(0.0);
     let fq0 = freq_bins.first().copied().unwrap_or(0.0);
-    acc.into_iter()
-        .enumerate()
-        .filter(|(_, a)| a.any)
-        .map(|(i, a)| {
-            let (crow, ccol) = if a.sum_v.abs() > 0.0 {
-                (a.sum_rv / a.sum_v, a.sum_cv / a.sum_v)
-            } else {
-                ((a.r0 + a.r1) as f64 / 2.0, (a.c0 + a.c1) as f64 / 2.0)
-            };
-            HistPeak {
-                label: i as i64 + 1,
-                height: a.max_v - a.min_v,
-                so_feature: so0 + crow * d_row,
-                peak_freq: fq0 + ccol * d_col,
-                duration: (a.r1 - a.r0 + 1) as f64 * d_row,
-                bandwidth: (a.c1 - a.c0 + 1) as f64 * d_col,
-            }
-        })
-        .collect()
+    let mut peaks: Vec<HistPeak> = Vec::new();
+    for (i, a) in acc.iter().enumerate() {
+        if !a.has_pixels {
+            continue;
+        }
+        // Value-weighted centroid. A region whose values sum to zero has no
+        // weighted centroid, so it takes the middle of its extent.
+        let centroid_row;
+        let centroid_col;
+        if a.sum_v.abs() > 0.0 {
+            centroid_row = a.sum_rv / a.sum_v;
+            centroid_col = a.sum_cv / a.sum_v;
+        } else {
+            centroid_row = (a.row_min + a.row_max) as f64 / 2.0;
+            centroid_col = (a.col_min + a.col_max) as f64 / 2.0;
+        }
+        peaks.push(HistPeak {
+            label: i as i64 + 1,
+            height: a.max_v - a.min_v,
+            so_feature: so0 + centroid_row * d_row,
+            peak_freq: fq0 + centroid_col * d_col,
+            duration: (a.row_max - a.row_min + 1) as f64 * d_row,
+            bandwidth: (a.col_max - a.col_min + 1) as f64 * d_col,
+        });
+    }
+    peaks
 }
 
 /// Periodic-phase watershed — mirrors `param_basis_phase.m`'s SO-phase
@@ -647,13 +671,18 @@ pub fn extract_hist_peaks_phase(
     let mut uniq: Vec<i64> = central.iter().copied().filter(|&v| v > 0).collect();
     uniq.sort_unstable();
     uniq.dedup();
-    let remap: HashMap<i64, i64> = uniq
-        .iter()
-        .enumerate()
-        .map(|(i, &l)| (l, i as i64 + 1))
-        .collect();
+    // Renumber the labels present in the central period 1..=N in
+    // ascending order.
+    let mut remap: HashMap<i64, i64> = HashMap::with_capacity(uniq.len());
+    for (k, lbl) in uniq.iter().enumerate() {
+        remap.insert(*lbl, (k as i64) + 1);
+    }
     for v in central.iter_mut() {
-        *v = if *v > 0 { remap[v] } else { 0 };
+        if *v > 0 {
+            *v = remap[v];
+        } else {
+            *v = 0;
+        }
     }
 
     let pi = std::f64::consts::PI;
@@ -736,11 +765,10 @@ pub fn label_to_rgb_jet(labels: ArrayView2<i64>) -> Array3<u8> {
     // Map each label id to a dense rank 0..n-1, then shuffle that rank and
     // sample jet. Dense ranking makes the colors independent of any gaps
     // in the label numbering.
-    let rank: HashMap<i64, usize> = uniq
-        .iter()
-        .enumerate()
-        .map(|(i, &lbl)| (lbl, i))
-        .collect();
+    let mut rank: HashMap<i64, usize> = HashMap::with_capacity(uniq.len());
+    for (k, lbl) in uniq.iter().enumerate() {
+        rank.insert(*lbl, k);
+    }
     for r in 0..h {
         for c in 0..w {
             let v = labels[[r, c]];
