@@ -81,8 +81,12 @@ pub struct SegmentPeaks {
     pub height: Vec<f64>,
     pub volume: Vec<f64>,
     pub segment_num: Vec<f64>,
-    pub bbox: Vec<f64>, // 4 * n (t_tl, f_tl, width_s, height_Hz): exact pixel extent, corner half a bin before the first pixel center
-    pub area: Vec<f64>, // sec*Hz per peak (pixel_count * d_time * d_freq)
+    /// Four values per peak (t_tl, f_tl, width_s, height_Hz). The box is the
+    /// exact pixel extent, with the corner half a bin before the first pixel
+    /// center.
+    pub bbox: Vec<f64>,
+    /// Area per peak in s*Hz (pixel_count * d_time * d_freq).
+    pub area: Vec<f64>,
     pub peakiness: Vec<f64>, // N/(N-1) * (max - mean) / (max - min) of region pixels, [0, 1]
     pub height_data: Vec<Vec<f64>>, // pixel values per peak (interior, NaN-excluded)
     pub boundaries_xy: Vec<Vec<f64>>, // interleaved (t, f) pairs per peak
@@ -242,7 +246,7 @@ pub fn matlab_paint_labels_in_order(labels: ArrayView2<i64>) -> Array2<i64> {
 /// fill with the nearest label. Ties are broken by the lowest label id.
 ///
 /// Implemented via multi-source BFS (4-connectivity, stops after `d` steps).
-/// This approximates Euclidean distance but matches the behaviour needed
+/// This approximates Euclidean distance but matches the behavior needed
 /// to plug the watershed 0-line — for distance=5 it is effectively
 /// equivalent (skimage itself computes a distance transform which gives
 /// the same result on thin separators).
@@ -729,8 +733,8 @@ pub fn extract_tfpeaks_segment(
 /// `cancel`, when supplied, is polled at the start of each segment task: if
 /// it returns `true` the call early-returns `Err` without running the
 /// remaining segments' watershed. This keeps a host's Stop control
-/// responsive — a cancelled call returns within ~one segment instead of the
-/// whole multi-segment extract. With `cancel: None` the path is unchanged.
+/// responsive. A canceled call returns within about one segment instead of
+/// the whole multi-segment extract. With `cancel: None` every segment runs.
 pub fn extract_tfpeaks(
     spect: ArrayView2<f64>,
     stimes: ArrayView1<f64>,
@@ -811,7 +815,7 @@ pub fn extract_tfpeaks(
     let results: Vec<Result<(SegmentPeaks, Array2<i64>), String>> = seg_bounds
         .par_iter()
         .map(|&(si, start, end)| {
-            // Bail before a segment's watershed if the run was cancelled —
+            // Bail before a segment's watershed if the run was canceled —
             // keeps a host's Stop responsive within ~one segment instead of
             // the whole multi-segment extract.
             if cancel.is_some_and(|c| c()) {
@@ -1252,7 +1256,7 @@ mod tests {
             "label set {:?} != expected {:?}", seen, expected);
 
         // Each planted blob should be associated with some non-zero label
-        // at its centre, with the peak time near the planted column.
+        // at its center, with the peak time near the planted column.
         for (fc, tc) in &blobs {
             let lbl = labels[[*fc, *tc]];
             assert!(lbl > 0, "blob at ({},{}) lost its label", fc, tc);
@@ -1310,11 +1314,11 @@ mod tests {
             ht_db_min: f64::NEG_INFINITY,
             expand_labels_distance: 5,
         };
-        let cancelled: &(dyn Fn() -> bool + Sync) = &|| true;
+        let always_cancel: &(dyn Fn() -> bool + Sync) = &|| true;
         let r = extract_tfpeaks(
             spect.view(), stimes.view(), sfreqs.view(), None, &params,
-            None, Some(cancelled),
+            None, Some(always_cancel),
         );
-        assert!(r.is_err(), "a cancelled extract_tfpeaks must return Err");
+        assert!(r.is_err(), "a canceled extract_tfpeaks must return Err");
     }
 }

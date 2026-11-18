@@ -250,7 +250,7 @@ pub fn read_main_header<R: Read>(f: &mut R) -> Result<EdfHeader, EdfError> {
 /// for a 30-signal EDF this was ~330 round-trips per file — easily 10×
 /// slower than MATLAB's `read_EDF` MEX, which reads through a buffered
 /// libc `FILE*`. Reading the whole block in one syscall and parsing in
-/// memory matches the MEX's effective behaviour.
+/// memory matches the MEX's effective behavior.
 pub fn read_signal_headers<R: Read>(f: &mut R, nsig: usize) -> Result<Vec<SignalHeader>, EdfError> {
     let block_size = 256 * nsig;
     let mut block = vec![0u8; block_size];
@@ -462,7 +462,7 @@ pub fn read_edf_all<P: AsRef<Path>>(path: P) -> Result<EdfData, EdfError> {
 /// header are silently absent from the result — the caller decides how
 /// to report misses (the CLI's downstream `select_channel` call surfaces
 /// them as `channel not found, skipping`, matching the per-channel-miss
-/// behaviour of MATLAB `read_EDF`'s `'Channels'` arg).
+/// behavior of MATLAB `read_EDF`'s `'Channels'` arg).
 ///
 /// Memory profile: same constant-size raw-record buffer
 /// (`bytes_per_rec`) regardless of `wanted_labels.len()`, but `data` is

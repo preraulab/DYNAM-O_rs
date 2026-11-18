@@ -127,18 +127,30 @@ pub fn flat_run_mask_with_tolerance(data: &[f64], min_run: usize, tol: f64) -> V
     mask
 }
 
-/// Tolerance for [`flat_run_mask_with_tolerance`] as used by [`detect_artifacts`]: `frac × std`
-/// over the finite samples, `frac = DYNAMO_FLAT_TOL_FRAC` (default 0.02). Big
-/// enough that resampler ringing inside a genuinely flat/disconnected segment
-/// (≈0.01 µV) still reads as flat, but ~1000× below real EEG variation (~20 µV),
-/// so quiet sleep is never flagged. `frac = 0` gives strict equality.
+/// Fraction of the signal's standard deviation used as the flat-run
+/// tolerance when `DYNAMO_FLAT_TOL_FRAC` is not set.
+const DEFAULT_FLAT_TOL_FRAC: f64 = 0.02;
+
+/// Tolerance for [`flat_run_mask_with_tolerance`] as used by
+/// [`detect_artifacts`]. It is `frac × std` over the finite samples, where
+/// `frac` comes from the `DYNAMO_FLAT_TOL_FRAC` environment variable and
+/// defaults to 0.02. That is large enough for resampler ringing inside a
+/// flat or disconnected segment (about 0.01 µV) to still read as flat. It
+/// is about 1000 times below real EEG variation (about 20 µV), so quiet
+/// sleep is never flagged. `frac = 0` gives strict equality.
 pub fn flat_tolerance(data: &[f64]) -> f64 {
-    let frac = std::env::var("DYNAMO_FLAT_TOL_FRAC")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|v| *v >= 0.0)
-        .unwrap_or(0.02);
-    let (mut sum, mut sum2, mut cnt) = (0.0f64, 0.0f64, 0usize);
+    // Use the environment value only when it parses as a non-negative number.
+    let mut frac = DEFAULT_FLAT_TOL_FRAC;
+    if let Ok(text) = std::env::var("DYNAMO_FLAT_TOL_FRAC") {
+        if let Ok(value) = text.parse::<f64>() {
+            if value >= 0.0 {
+                frac = value;
+            }
+        }
+    }
+    let mut sum = 0.0f64;
+    let mut sum2 = 0.0f64;
+    let mut cnt = 0usize;
     for &v in data {
         if v.is_finite() {
             sum += v;
@@ -1126,7 +1138,7 @@ mod tests {
     fn flat_run_detection() {
         let x = vec![1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 3.0];
         // min_run=3 → the first run (4 × 1.0) and last (3 × 3.0) are flat.
-        // tol=0 = strict equality (original behavior).
+        // tol=0 is strict equality.
         let m = flat_run_mask(&x, 3);
         assert_eq!(
             m,
@@ -1166,15 +1178,17 @@ mod tests {
         // misses it; a tolerance catches it — while real EEG is never flagged.
         let min_run = 100usize;
         let mut data = vec![0.0f64; 500];
+        // EEG (±20)
         for i in 0..150 {
             data[i] = 20.0 * (i as f64 * 0.5).sin();
-        } // EEG (±20)
+        }
         for (i, v) in data.iter_mut().enumerate().take(400).skip(150) {
             *v = -2048.0 + 0.1 * (((i * 7) % 5) as f64 - 2.0); // flat ± ~0.2
         }
+        // EEG (±20)
         for i in 400..500 {
             data[i] = 20.0 * (i as f64 * 0.5).sin();
-        } // EEG (±20)
+        }
 
         // Exact equality (tol=0) misses the ringing flat.
         let exact = flat_run_mask(&data, min_run);

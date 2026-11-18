@@ -327,6 +327,8 @@ enum MergeRules {
 /// One region left after merging, as pixel lists (flat row-major indices).
 #[derive(Debug, Clone)]
 pub struct MergedRegion {
+    /// Label the region carries after merging (the label of the region it
+    /// merged into).
     pub label: i32,
     /// MATLAB `regions{}`: every pixel of the region, interior and border.
     pub all_px: Vec<u32>,
@@ -475,7 +477,7 @@ fn run_inner(
     if std::env::var("HISTPEAKS_DEBUG").is_ok() {
         let n_finite = edge_weights.values().filter(|v| v.is_finite()).count();
         eprintln!(
-            "[merge] {} neighbour-pairs, {} edges ({} finite), merge_thresh={:.6}",
+            "[merge] {} neighbor-pairs, {} edges ({} finite), merge_thresh={:.6}",
             n_pairs,
             edge_weights.len(),
             n_finite,

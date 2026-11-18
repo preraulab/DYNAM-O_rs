@@ -506,7 +506,7 @@ mod tests {
 
     #[test]
     fn time_of_day_accepts_colon_and_dot_formats() {
-        // EDF-spec start time "hh.mm.ss" (dots) — the format that regressed.
+        // EDF-spec start time "hh.mm.ss" (dots).
         assert_eq!(parse_time_of_day("22.12.52"), Some(22.0 * 3600.0 + 12.0 * 60.0 + 52.0));
         // Colon start time (some exporters write the non-standard form).
         assert_eq!(parse_time_of_day("21:46:23"), Some(21.0 * 3600.0 + 46.0 * 60.0 + 23.0));
@@ -523,14 +523,13 @@ mod tests {
 
     /// ISO 8601 / RFC 3339 datetime inputs: date prefix and TZ suffix
     /// must both be stripped so the existing HH:MM:SS[.fff] path takes
-    /// over. The actual report was a Compumedics-derived staging CSV
-    /// whose time column contained values like
-    /// `2014-06-26T01:29:29.420000` — date drops, microseconds keep
-    /// their fractional component.
+    /// over. Compumedics-derived staging CSVs write the time column as
+    /// `2014-06-26T01:29:29.420000`. The date drops and the microseconds
+    /// keep their fractional component.
     #[test]
     fn time_of_day_accepts_iso8601_datetime() {
         let h_m_s = 1.0 * 3600.0 + 29.0 * 60.0 + 29.42;
-        // T separator, no TZ — the form from the user report.
+        // T separator, no TZ.
         assert_eq!(parse_time_of_day("2014-06-26T01:29:29.420000"), Some(h_m_s));
         // T separator, Z suffix (UTC).
         assert_eq!(parse_time_of_day("2014-06-26T01:29:29.420000Z"), Some(h_m_s));
@@ -546,9 +545,6 @@ mod tests {
         assert_eq!(parse_time_of_day("2014-06-26"), None);
     }
 
-    /// The space-separator branch in `strip_date_prefix` must NOT
-    /// strip the AM/PM space of a bare time-of-day. Regression guard
-    /// for `12:00:00 AM` etc.
     /// Write a two-column staging file with clock times and read it back
     /// against the given recording start and length.
     fn read_clock_staging(
@@ -627,8 +623,10 @@ mod tests {
         assert!(staging.times.contains(&next_day_offset), "times: {:?}", staging.times);
     }
 
+    /// The space-separator branch in `strip_date_prefix` must NOT
+    /// strip the AM/PM space of a bare time-of-day such as `12:00:00 AM`.
     #[test]
-    fn time_of_day_ampm_with_space_unchanged() {
+    fn time_of_day_keeps_the_ampm_space() {
         assert_eq!(parse_time_of_day("12:00:00 AM"), Some(0.0));
         assert_eq!(parse_time_of_day("12:00:00 PM"), Some(12.0 * 3600.0));
         assert_eq!(parse_time_of_day("10:19:22 PM"), Some(22.0 * 3600.0 + 19.0 * 60.0 + 22.0));
