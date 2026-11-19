@@ -403,19 +403,20 @@ mod tests {
             (1, 6),
             vec![0.06, 10.2, 1.2, PI - 0.04, 1.0, 0.30],
         ).unwrap();
-        let historical_fstd_lower = 1.0 / 2.0_f64.sqrt();
-        let historical_fstd_upper = 7.5_f64.sqrt();
+        // The fit runs under the default shape bounds. Only the bounds on
+        // the phase center vary between the two cases below.
+        let shape = crate::paramfit::defaults::default_phase_mode_shape_bounds();
         for (label, phase_lower, phase_upper) in [
             ("two-period", -2.0 * PI, 2.0 * PI),
             ("unbounded", f64::NEG_INFINITY, f64::INFINITY),
         ] {
             let lower = Array2::from_shape_vec(
                 (1, 6),
-                vec![0.001, 2.0, historical_fstd_lower, phase_lower, PI / 5.0, -PI / 3.0],
+                vec![0.001, 2.0, shape.fstd_lower, phase_lower, shape.pstd_lower, shape.theta_lower],
             ).unwrap();
             let upper = Array2::from_shape_vec(
                 (1, 6),
-                vec![1.0, 18.0, historical_fstd_upper, phase_upper, 2.0 * PI, PI / 3.0],
+                vec![1.0, 18.0, shape.fstd_upper, phase_upper, shape.pstd_upper, shape.theta_upper],
             ).unwrap();
 
             let out = fit_vmgauss(
