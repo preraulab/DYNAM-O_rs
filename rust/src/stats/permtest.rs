@@ -123,6 +123,34 @@ fn nanmean_rows(data: &[f64], n_bins: usize, cols: &[usize], n_obs: usize) -> Ve
     out
 }
 
+/// Order two values ascending, with every NaN after every number and all
+/// NaN equal to each other. This is a total order, and it is the order
+/// MATLAB's `sort` produces.
+fn compare_nan_last(a: &f64, b: &f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if a.is_nan() && b.is_nan() {
+        return Ordering::Equal;
+    }
+    if a.is_nan() {
+        return Ordering::Greater;
+    }
+    if b.is_nan() {
+        return Ordering::Less;
+    }
+    if a < b {
+        Ordering::Less
+    } else if a > b {
+        Ordering::Greater
+    } else {
+        Ordering::Equal
+    }
+}
+
+/// Sort a slice ascending in place, with NaN last.
+fn sort_ascending_nan_last(values: &mut [f64]) {
+    values.sort_by(compare_nan_last);
+}
+
 /// Indices of the observations (columns) that have a finite value in at
 /// least one bin. `data` is row-major `(n_bins, n_obs)`. This is MATLAB's
 /// `g(:, any(~isnan(g)))`.
@@ -215,13 +243,13 @@ pub fn gpermtest(
         }
     }
 
-    // Per-bin sorted null, ascending. A comparison involving NaN is
-    // reported as Greater, which is meant to place NaN at the end of the
-    // row. That comparator is not a total order when a row contains NaN.
+    // Per-bin sorted null, ascending, with NaN at the end of the row as
+    // MATLAB's `sort` places it. A NaN entry is a shuffle that left one
+    // side of that bin with no finite value.
     let mut sorted = null_mat.clone();
     for bin in 0..n_bins {
         let row = &mut sorted[bin * iterations..(bin + 1) * iterations];
-        row.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater));
+        sort_ascending_nan_last(row);
     }
 
     let out_crit = (alpha * iterations as f64).ceil() as usize;
@@ -297,6 +325,38 @@ pub fn gpermtest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sort_places_nan_last_like_matlab() {
+        let mut values = vec![f64::NAN, 3.0, 1.0, f64::NAN, 2.0, 0.0, f64::NAN, 1.0];
+        sort_ascending_nan_last(&mut values);
+        assert_eq!(&values[..5], &[0.0, 1.0, 1.0, 2.0, 3.0]);
+        assert!(values[5].is_nan());
+        assert!(values[6].is_nan());
+        assert!(values[7].is_nan());
+    }
+
+    /// A bin that is mostly missing gives NaN null entries on the shuffles
+    /// that leave one side of it empty. The test must still run, and the
+    /// fully observed bin must keep a finite bound.
+    #[test]
+    fn runs_when_a_bin_has_nan_null_entries() {
+        let n_bins = 2;
+        let n_obs = 6;
+        // Bin 0 is fully observed. Bin 1 has one finite value per group.
+        let mut g1 = vec![f64::NAN; n_bins * n_obs];
+        let mut g2 = vec![f64::NAN; n_bins * n_obs];
+        for obs in 0..n_obs {
+            g1[obs] = obs as f64;
+            g2[obs] = obs as f64 + 0.5;
+        }
+        g1[n_obs] = 1.0;
+        g2[n_obs] = 2.0;
+
+        let result = gpermtest(&g1, &g2, n_bins, 0.05, 500, 7).unwrap();
+        assert!(result.acceptance_bounds[0].is_finite());
+        assert!(!result.sigbins[1]);
+    }
 
     fn two_groups(n_bins: usize, n: usize, shift_bin: Option<usize>) -> (Vec<f64>, Vec<f64>) {
         let mut g1 = Vec::new();

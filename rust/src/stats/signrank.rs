@@ -108,8 +108,7 @@ pub fn signrank(x: &[f64], y: &[f64]) -> f64 {
             continue;
         }
         // MATLAB `epsdiff = eps(x) + eps(y)`. `ulp(v)` is the gap from |v|
-        // to the next larger double, which is what eps() returns for a
-        // nonzero finite value.
+        // to the next larger double, which is what eps() returns.
         let pair_eps = ulp(*a) + ulp(*b);
         if d.abs() <= pair_eps {
             continue; // zero difference
@@ -151,13 +150,10 @@ pub fn signrank(x: &[f64], y: &[f64]) -> f64 {
 }
 
 /// Spacing at `v`: the gap from |v| to the next larger double, which is the
-/// MATLAB `eps(v)` of a nonzero finite scalar. Returns `f64::MIN_POSITIVE`
-/// for zero.
+/// MATLAB `eps(v)` of a finite scalar. For zero that is the smallest
+/// positive double, 2^-1074, as in MATLAB.
 fn ulp(v: f64) -> f64 {
     let a = v.abs();
-    if a == 0.0 {
-        return f64::MIN_POSITIVE;
-    }
     let next = f64::from_bits(a.to_bits() + 1);
     next - a
 }
@@ -165,6 +161,16 @@ fn ulp(v: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ulp_matches_matlab_eps() {
+        // eps(1) = 2^-52, eps(0) = 2^-1074, eps(2^-1074) = 2^-1074.
+        assert_eq!(ulp(1.0), f64::EPSILON);
+        assert_eq!(ulp(-1.0), f64::EPSILON);
+        let smallest_positive = f64::from_bits(1);
+        assert_eq!(ulp(0.0), smallest_positive);
+        assert_eq!(ulp(smallest_positive), smallest_positive);
+    }
 
     #[test]
     fn drops_nan_and_zero_differences() {
