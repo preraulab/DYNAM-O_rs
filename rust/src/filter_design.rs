@@ -7,14 +7,23 @@
 //! Steps (mirror scipy.signal.iirfilter):
 //!   1. `cheb1ap(N, rp)` → analog prototype zeros/poles/gain.
 //!   2. `lp2hp_zpk` / `lp2lp_zpk` / `lp2bp_zpk` frequency transform (warped).
-//!   3. `bilinear_zpk` with `fs=2` (prewarp to normalized rad/sample domain).
-//!   4. `zpk2sos` using scipy's pairing heuristic.
+//!   3. `bilinear_zpk` at the true sampling rate `fs`. The critical
+//!      frequencies are prewarped with `2*fs*tan(pi*f/fs)` beforehand.
+//!   4. `zpk_to_sos`: conjugate pairing, then pole pair i takes zero pair i.
 //!
-//! Only highpass and bandpass are implemented — that's all DYNAM-O uses.
+//! Highpass, lowpass and bandpass are implemented.
 
 use realfft::num_complex::Complex64;
 
+/// Complex number type used for zeros and poles.
 type C = Complex64;
+
+/// A zero or pole whose imaginary part is below this counts as real.
+const REAL_TOL: f64 = 1e-12;
+
+/// Two values within this distance (per component) of being conjugates are
+/// paired as a conjugate pair.
+const CONJ_TOL: f64 = 1e-9;
 
 /// Chebyshev Type I analog lowpass prototype (Wn=1 rad/s).
 /// Returns (zeros, poles, gain). Zeros is always empty (all-pole).
@@ -45,7 +54,7 @@ fn cheb1ap(n: usize, rp: f64) -> (Vec<C>, Vec<C>, f64) {
 }
 
 /// Lowpass-to-highpass frequency transform (analog ZPK).
-/// s ← wo/s. Zeros at s=0 of multiplicity (len(p) - len(z)) are added;
+/// s ← wo/s. Zeros at s=0 of multiplicity (len(p) - len(z)) are added,
 /// then each original zero z_k maps to wo/z_k and similarly for poles.
 fn lp2hp_zpk(z: &[C], p: &[C], k: f64, wo: f64) -> (Vec<C>, Vec<C>, f64) {
     let degree = p.len() as isize - z.len() as isize;
@@ -70,7 +79,6 @@ fn lp2hp_zpk(z: &[C], p: &[C], k: f64, wo: f64) -> (Vec<C>, Vec<C>, f64) {
 }
 
 /// Lowpass-to-lowpass analog frequency transform: s ← s/wo.
-#[allow(dead_code)]
 fn lp2lp_zpk(z: &[C], p: &[C], k: f64, wo: f64) -> (Vec<C>, Vec<C>, f64) {
     let degree = p.len() as isize - z.len() as isize;
     let z_new: Vec<C> = z.iter().map(|&zz| zz * wo).collect();
@@ -80,7 +88,6 @@ fn lp2lp_zpk(z: &[C], p: &[C], k: f64, wo: f64) -> (Vec<C>, Vec<C>, f64) {
 }
 
 /// Lowpass-to-bandpass analog transform: s ← (s^2 + wo^2) / (bw*s).
-#[allow(dead_code)]
 fn lp2bp_zpk(z: &[C], p: &[C], k: f64, wo: f64, bw: f64) -> (Vec<C>, Vec<C>, f64) {
     let degree = p.len() as isize - z.len() as isize;
     // Each zero/pole splits into a conjugate pair.
@@ -134,18 +141,18 @@ fn bilinear_zpk(z: &[C], p: &[C], k: f64, fs: f64) -> (Vec<C>, Vec<C>, f64) {
 fn zpk_pair_to_section(zs: &[C], ps: &[C]) -> [f64; 6] {
     // (z - z1)(z - z2) = z^2 - (z1+z2)z + z1*z2
     let (b1, b2) = if zs.len() == 2 {
-        let s = -(zs[0] + zs[1]);
-        let p = zs[0] * zs[1];
-        (s.re, p.re)
+        let neg_sum = -(zs[0] + zs[1]);
+        let product = zs[0] * zs[1];
+        (neg_sum.re, product.re)
     } else if zs.len() == 1 {
         (-zs[0].re, 0.0)
     } else {
         (0.0, 0.0)
     };
     let (a1, a2) = if ps.len() == 2 {
-        let s = -(ps[0] + ps[1]);
-        let p = ps[0] * ps[1];
-        (s.re, p.re)
+        let neg_sum = -(ps[0] + ps[1]);
+        let product = ps[0] * ps[1];
+        (neg_sum.re, product.re)
     } else if ps.len() == 1 {
         (-ps[0].re, 0.0)
     } else {
@@ -154,9 +161,10 @@ fn zpk_pair_to_section(zs: &[C], ps: &[C]) -> [f64; 6] {
     [1.0, b1, b2, 1.0, a1, a2]
 }
 
-/// Group zeros and poles into conjugate pairs (scipy-style): each complex
-/// pole paired with its conjugate; real poles paired with each other (or
-/// standalone). Same for zeros. Returns a vector of (zeros_in_pair, poles_in_pair).
+/// Group a list of zeros OR poles into conjugate pairs: each complex value
+/// is paired with its conjugate, and real values are paired with each other
+/// (or left standalone). Returns one inner vector per group, holding two
+/// values (or one).
 fn pair_conjugates(items: &[C]) -> Vec<Vec<C>> {
     let mut used = vec![false; items.len()];
     let mut out: Vec<Vec<C>> = Vec::new();
@@ -165,11 +173,11 @@ fn pair_conjugates(items: &[C]) -> Vec<Vec<C>> {
             continue;
         }
         let zi = items[i];
-        if zi.im.abs() < 1e-12 {
-            // real. look for another real to pair.
+        if zi.im.abs() < REAL_TOL {
+            // Real: look for another real to pair with.
             let mut pair_idx = None;
             for j in (i + 1)..items.len() {
-                if !used[j] && items[j].im.abs() < 1e-12 {
+                if !used[j] && items[j].im.abs() < REAL_TOL {
                     pair_idx = Some(j);
                     break;
                 }
@@ -186,12 +194,12 @@ fn pair_conjugates(items: &[C]) -> Vec<Vec<C>> {
                 }
             }
         } else {
-            // complex. find conjugate.
+            // Complex: find its conjugate.
             let mut pair_idx = None;
             for j in (i + 1)..items.len() {
                 if !used[j]
-                    && (items[j].re - zi.re).abs() < 1e-9
-                    && (items[j].im + zi.im).abs() < 1e-9
+                    && (items[j].re - zi.re).abs() < CONJ_TOL
+                    && (items[j].im + zi.im).abs() < CONJ_TOL
                 {
                     pair_idx = Some(j);
                     break;
@@ -214,9 +222,10 @@ fn pair_conjugates(items: &[C]) -> Vec<Vec<C>> {
     out
 }
 
-/// Simple ZPK→SOS conversion using scipy's "nearest" pairing heuristic:
-/// pair poles with their conjugates; match each pole-pair with the nearest
-/// zero-pair; distribute gain on the first section.
+/// Simple ZPK→SOS conversion. Poles and zeros are each grouped into
+/// conjugate pairs. The pole pairs are ordered so the one closest to the
+/// unit circle comes last, and the i-th pole pair in that order gets the
+/// i-th zero pair. The gain goes on the first section.
 ///
 /// This is sufficient for our use case (all-pole Chebyshev filter → all zero
 /// pairs end up at DC or Nyquist after lp2hp+bilinear).
@@ -227,7 +236,7 @@ pub fn zpk_to_sos(z: &[C], p: &[C], k: f64) -> Vec<[f64; 6]> {
     let mut p_pairs = pair_conjugates(p);
     let mut z_pairs = pair_conjugates(z);
 
-    // Want same number of sections; pad missing pairs with empty zeros.
+    // Want same number of sections. Pad missing pairs with empty zeros.
     while z_pairs.len() < p_pairs.len() {
         z_pairs.push(Vec::new());
     }
@@ -235,26 +244,28 @@ pub fn zpk_to_sos(z: &[C], p: &[C], k: f64) -> Vec<[f64; 6]> {
         p_pairs.push(Vec::new());
     }
 
-    // Sort pole pairs by proximity to unit circle (most peaky last) so the
-    // most resonant section runs last — matches scipy convention.
-    let pole_radius = |pair: &Vec<C>| -> f64 {
-        pair.iter().map(|p| (p.norm() - 1.0).abs()).fold(f64::INFINITY, f64::min)
+    // Sort pole pairs by distance from the unit circle, farthest first, so
+    // the most resonant section runs last. This matches the scipy convention.
+    let distance_from_unit_circle = |pair: &Vec<C>| -> f64 {
+        let mut smallest = f64::INFINITY;
+        for pole in pair.iter() {
+            smallest = f64::min(smallest, (pole.norm() - 1.0).abs());
+        }
+        smallest
     };
     let mut pole_order: Vec<usize> = (0..p_pairs.len()).collect();
     pole_order.sort_by(|&a, &b| {
-        pole_radius(&p_pairs[b])
-            .partial_cmp(&pole_radius(&p_pairs[a]))
+        distance_from_unit_circle(&p_pairs[b])
+            .partial_cmp(&distance_from_unit_circle(&p_pairs[a]))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    // The padding above made z_pairs and p_pairs the same length, so every
+    // section index has a zero pair.
     let mut sections: Vec<[f64; 6]> = Vec::with_capacity(p_pairs.len());
-    for (i, pi) in pole_order.iter().enumerate() {
-        let ps = &p_pairs[*pi];
-        let zs = if i < z_pairs.len() {
-            &z_pairs[i]
-        } else {
-            &z_pairs[0]
-        };
+    for (i, pair_idx) in pole_order.iter().enumerate() {
+        let ps = &p_pairs[*pair_idx];
+        let zs = &z_pairs[i];
         sections.push(zpk_pair_to_section(zs, ps));
     }
     // Apply overall gain on the first section.
@@ -266,15 +277,17 @@ pub fn zpk_to_sos(z: &[C], p: &[C], k: f64) -> Vec<[f64; 6]> {
     sections
 }
 
-/// `cheby1(order, rp, passband_hz, btype, fs, output='sos')` — scipy.
-/// `btype`: `"highpass"` or `"lowpass"` or `"bandpass"`. For bandpass pass
-/// the passband as `[lo, hi]`.
+/// scipy's `cheby1(order, rp, wn, btype, fs, output='sos')`.
+///
+/// `rp` is the passband ripple in dB. `wn` holds the critical frequencies
+/// in Hz: one for `"highpass"` / `"lowpass"`, `[lo, hi]` for `"bandpass"`.
+/// Panics on any other `btype`.
 pub fn cheby1_sos(order: usize, rp: f64, wn: &[f64], btype: &str, fs: f64) -> Vec<[f64; 6]> {
     // Step 1: analog prototype (Wn = 1 rad/s).
     let (z_lp, p_lp, k_lp) = cheb1ap(order, rp);
 
     // Step 2: prewarp the critical frequencies to analog domain.
-    // wn_digital / fs ∈ (0, 1); warp: w_analog = 2*fs * tan(pi * wn / fs).
+    // f / fs ∈ (0, 0.5). Warp: w_analog = 2*fs * tan(pi * f / fs).
     let warp = |f: f64| 2.0 * fs * (std::f64::consts::PI * f / fs).tan();
 
     // Step 3: frequency transform.

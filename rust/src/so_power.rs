@@ -6,7 +6,7 @@
 //! SO-power time series.
 //!
 //! Why the split: the multitaper spectrogram is the dominant cost and already
-//! has acceleration options in both ecosystems — MATLAB ships
+//! has acceleration options in both ecosystems. MATLAB ships
 //! `multitaper_spectrogram_mex`, pydynamo has an optional Rust backend via
 //! the `multitaper_rs` crate. Keeping this function spect-in / power-out means
 //! we don't re-implement DPSS here, and the same Rust implementation can be
@@ -20,11 +20,11 @@
 use crate::baseline::nanpercentile_hazen;
 use crate::peak_assign::{interp_linear_padded, interp_previous};
 
-/// Normalization method — one of:
-///   * `Shift { ptile, stages }`  — "p{N}shift{S}" (e.g. p2shift1234).
+/// Normalization method, one of:
+///   * `Shift { ptile, stages }`: "p{N}shift{S}" (e.g. p2shift1234).
 ///     Subtract `ptile`-th percentile of SOpower_db over the given stages.
-///   * `Percent` — (x - p1) / (p99 - p1)
-///   * `None_` — return SOpower_db unchanged
+///   * `Percent`: (x - p1) / (p99 - p1)
+///   * `None_`: return SOpower_db unchanged
 #[derive(Debug, Clone)]
 pub enum NormMethod {
     Shift { ptile: f64, stages: Vec<i32> },
@@ -39,16 +39,21 @@ impl NormMethod {
         let lower = s.to_ascii_lowercase();
         // "p{N}shift{S}" where N is 0–100 and S is a string of digits 1–5.
         if let Some(rest) = lower.strip_prefix('p') {
-            if let Some(idx) = rest.find("shift") {
-                let ptile_str = &rest[..idx];
-                let stages_str = &rest[idx + 5..];
+            if let Some(shift_pos) = rest.find("shift") {
+                let ptile_str = &rest[..shift_pos];
+                let stages_str = &rest[shift_pos + "shift".len()..];
                 if let Ok(ptile) = ptile_str.parse::<f64>() {
                     if (0.0..=100.0).contains(&ptile) && !stages_str.is_empty() {
-                        let mut stages: Vec<i32> = stages_str
-                            .chars()
-                            .filter_map(|c| c.to_digit(10).map(|d| d as i32))
-                            .filter(|&d| (1..=5).contains(&d))
-                            .collect();
+                        // Keep the stage digits 1..=5 and ignore any other character.
+                        let mut stages: Vec<i32> = Vec::new();
+                        for ch in stages_str.chars() {
+                            if let Some(digit) = ch.to_digit(10) {
+                                let stage = digit as i32;
+                                if (1..=5).contains(&stage) {
+                                    stages.push(stage);
+                                }
+                            }
+                        }
                         stages.sort_unstable();
                         stages.dedup();
                         if !stages.is_empty() {
@@ -59,6 +64,8 @@ impl NormMethod {
             }
         }
         match lower.as_str() {
+            // Bare "shift" is the MATLAB default "p2shift1234": the 2nd
+            // percentile over stages 1 to 4.
             "shift" => Some(NormMethod::Shift {
                 ptile: 2.0,
                 stages: vec![1, 2, 3, 4],
@@ -72,17 +79,20 @@ impl NormMethod {
 
 /// Output of `so_power_from_spectrogram`.
 pub struct SoPowerOut {
-    /// Normalized SO-power, length = retain_Fs ? eeg_times.len() : stimes.len().
+    /// Normalized SO-power. Length is eeg_times.len() when `retain_fs`, else stimes.len().
     pub so_power_norm: Vec<f64>,
     /// Time stamps matching `so_power_norm`.
     pub so_power_times: Vec<f64>,
-    /// Stage per output sample (0 where unstaged or excluded).
+    /// Stage per output sample (0 outside the staging range, all 1 when no
+    /// staging is given).
     pub so_power_stages: Vec<f64>,
-    /// The percentile value used (Shift: single p; Percent: (p1, p99)). `None`
+    /// The percentile value used (Shift: single p, Percent: (p1, p99)). `None`
     /// if `NormMethod::None_` or if normalization was bypassed (degenerate).
     pub ptile: Option<PtileUsed>,
 }
 
+/// Percentile value(s) the normalization used: one for Shift, the (p1, p99)
+/// pair for Percent.
 #[derive(Debug, Clone, Copy)]
 pub enum PtileUsed {
     Single(f64),
@@ -93,22 +103,24 @@ pub enum PtileUsed {
 /// over the SO band.
 ///
 /// Inputs:
-/// * `so_spect` — row-major (F, T) spectrogram. NaN entries propagate (nansum).
-/// * `stimes`   — window-center times (length T), *relative to start of input*.
-///                Absolute times are computed as `stimes + eeg_times[0]`.
-/// * `sfreqs`   — frequency bin centers (length F). Only `df = sfreqs[1]-sfreqs[0]`
-///                is used here (the band-integration multiplier).
-/// * `eeg_times`— the EEG sample time axis (length N). Used for time_range
-///                defaults and (if `retain_fs`) upsampling.
-/// * `isexcluded` — per-EEG-sample artifact mask (length N). Upsampled output
-///                  has NaN wherever `isexcluded[i]`.
-/// * `stage_times`, `stage_vals` — sleep staging to interpolate onto the
-///                  output time grid (previous-neighbor step). Pass empty
-///                  slices to default stages to all-1.
-/// * `time_range` — `(t_start, t_end)` used for percentile normalization scope.
-/// * `outlier_threshold` — |z| >= threshold → NaN (3.0 in pydynamo).
-/// * `norm_method`
-/// * `retain_fs`  — if true, output is upsampled back to `eeg_times`.
+/// * `so_spect`: row-major (F, T) spectrogram. Non-finite entries are
+///   skipped in the sum over frequency (nansum).
+/// * `n_freqs`, `n_times`: F and T, the dimensions of `so_spect`.
+/// * `stimes`: window-center times (length T), *relative to start of input*.
+///   Absolute times are computed as `stimes + eeg_times[0]`.
+/// * `sfreqs`: frequency bin centers (length F). Only `df = sfreqs[1]-sfreqs[0]`
+///   is used here (the band-integration multiplier).
+/// * `eeg_times`: the EEG sample time axis (length N). Used for time_range
+///   defaults and (if `retain_fs`) upsampling.
+/// * `isexcluded`: per-EEG-sample artifact mask (length N). Upsampled output
+///   has NaN wherever `isexcluded[i]`.
+/// * `stage_times`, `stage_vals`: sleep staging to interpolate onto the
+///   output time grid (previous-neighbor step). Pass empty slices to
+///   default stages to all-1.
+/// * `time_range`: `(t_start, t_end)` used for percentile normalization scope.
+/// * `outlier_threshold`: |z| >= threshold → NaN (3.0 in pydynamo).
+/// * `norm_method`: how the dB series is normalized (see [`NormMethod`]).
+/// * `retain_fs`: if true, output is upsampled back to `eeg_times`.
 #[allow(clippy::too_many_arguments)]
 pub fn so_power_from_spectrogram(
     so_spect: &[f64],
@@ -144,24 +156,28 @@ pub fn so_power_from_spectrogram(
         return Err("eeg_times must be non-empty".into());
     }
 
-    // Step: absolute window-center times. pydynamo:89, MATLAB is symmetrical.
+    // Step: absolute window-center times (pydynamo:89, same in MATLAB).
     let t0 = eeg_times[0];
     let mut so_power_times: Vec<f64> = stimes.iter().map(|&s| s + t0).collect();
 
     // Step: nan-sum along freq axis * df. pydynamo:93-94.
     let df = if n_freqs >= 2 { sfreqs[1] - sfreqs[0] } else { 1.0 };
     let mut so_power: Vec<f64> = Vec::with_capacity(n_times);
-    for ct in 0..n_times {
-        let mut acc = 0.0_f64;
-        let mut any = false;
-        for cf in 0..n_freqs {
-            let v = so_spect[cf * n_times + ct];
+    for t in 0..n_times {
+        let mut power_sum = 0.0_f64;
+        let mut has_finite = false;
+        for f in 0..n_freqs {
+            let v = so_spect[f * n_times + t];
             if v.is_finite() {
-                acc += v;
-                any = true;
+                power_sum += v;
+                has_finite = true;
             }
         }
-        so_power.push(if any { acc * df } else { f64::NAN });
+        if has_finite {
+            so_power.push(power_sum * df);
+        } else {
+            so_power.push(f64::NAN);
+        }
     }
 
     // Step: 10*log10(x>0, else NaN).  pydynamo:_nan_pow2db.
@@ -172,9 +188,16 @@ pub fn so_power_from_spectrogram(
 
     // Step: stage assignment (previous-neighbor).  pydynamo:98-108.
     let mut so_power_stages: Vec<f64> = if !stage_times.is_empty() && !stage_vals.is_empty() {
-        let interp = interp_previous(stage_times, stage_vals, &so_power_times, f64::NAN);
-        interp.into_iter().map(|v| if v.is_nan() { 0.0 } else { v }).collect()
+        let mut stages = interp_previous(stage_times, stage_vals, &so_power_times, f64::NAN);
+        // Samples outside the staging range come back NaN. Report them as stage 0.
+        for stage in stages.iter_mut() {
+            if stage.is_nan() {
+                *stage = 0.0;
+            }
+        }
+        stages
     } else {
+        // No staging supplied: treat every sample as stage 1.
         vec![1.0; so_power_times.len()]
     };
 
@@ -210,39 +233,38 @@ pub fn so_power_from_spectrogram(
         .collect();
     let (mut so_power_norm, ptile_used) = match norm_method {
         NormMethod::Shift { ptile, stages } => {
-            let sel: Vec<f64> = so_power_db
-                .iter()
-                .zip(so_power_stages.iter())
-                .zip(in_range.iter())
-                .filter_map(|((&v, &s), &r)| {
-                    if r && v.is_finite() && stages.contains(&(s as i32)) {
-                        Some(v)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if sel.is_empty() {
+            // Finite values inside time_range whose stage is one of `stages`.
+            let mut selected: Vec<f64> = Vec::new();
+            for i in 0..so_power_db.len() {
+                let value = so_power_db[i];
+                let stage = so_power_stages[i] as i32;
+                if in_range[i] && value.is_finite() && stages.contains(&stage) {
+                    selected.push(value);
+                }
+            }
+            if selected.is_empty() {
                 return Err(format!(
                     "No valid stages {:?} found for shift normalization.",
                     stages
                 ));
             }
-            let p = nanpercentile_hazen(&sel, *ptile);
-            let out: Vec<f64> = so_power_db.iter().map(|&v| v - p).collect();
-            (out, Some(PtileUsed::Single(p)))
+            let shift_value = nanpercentile_hazen(&selected, *ptile);
+            let out: Vec<f64> = so_power_db.iter().map(|&v| v - shift_value).collect();
+            (out, Some(PtileUsed::Single(shift_value)))
         }
         NormMethod::Percent => {
-            let sel: Vec<f64> = so_power_db
-                .iter()
-                .zip(in_range.iter())
-                .filter_map(|(&v, &r)| if r && v.is_finite() { Some(v) } else { None })
-                .collect();
-            if sel.is_empty() {
+            // Finite values inside time_range.
+            let mut selected: Vec<f64> = Vec::new();
+            for i in 0..so_power_db.len() {
+                if in_range[i] && so_power_db[i].is_finite() {
+                    selected.push(so_power_db[i]);
+                }
+            }
+            if selected.is_empty() {
                 return Err("No valid samples for percent normalization.".into());
             }
-            let p1 = nanpercentile_hazen(&sel, 1.0);
-            let p99 = nanpercentile_hazen(&sel, 99.0);
+            let p1 = nanpercentile_hazen(&selected, 1.0);
+            let p99 = nanpercentile_hazen(&selected, 99.0);
             let denom = p99 - p1;
             let out: Vec<f64> = so_power_db
                 .iter()
@@ -255,16 +277,15 @@ pub fn so_power_from_spectrogram(
 
     // Step: upsample to EEG rate if requested. pydynamo:148-164.
     if retain_fs {
-        let valid_vals: Vec<f64> = so_power_norm
-            .iter()
-            .filter(|v| v.is_finite())
-            .copied()
-            .collect();
-        let valid_times: Vec<f64> = so_power_norm
-            .iter()
-            .zip(so_power_times.iter())
-            .filter_map(|(v, &t)| if v.is_finite() { Some(t) } else { None })
-            .collect();
+        // Coarse-grid samples with a finite value, and their times.
+        let mut valid_vals: Vec<f64> = Vec::new();
+        let mut valid_times: Vec<f64> = Vec::new();
+        for i in 0..so_power_norm.len() {
+            if so_power_norm[i].is_finite() {
+                valid_vals.push(so_power_norm[i]);
+                valid_times.push(so_power_times[i]);
+            }
+        }
 
         if valid_vals.is_empty() {
             // Nothing valid → stay at the downsampled grid.
@@ -277,35 +298,39 @@ pub fn so_power_from_spectrogram(
         }
         // Pad endpoints with eeg_times[0]/eeg_times[-1] so interp holds flat
         // outside the valid range (matches pydynamo's xp/fp pad trick).
-        let tn = *eeg_times.last().unwrap();
-        let mut xp = Vec::with_capacity(valid_times.len() + 2);
-        let mut fp = Vec::with_capacity(valid_vals.len() + 2);
-        xp.push(t0);
-        fp.push(valid_vals[0]);
-        xp.extend_from_slice(&valid_times);
-        fp.extend_from_slice(&valid_vals);
-        xp.push(tn);
-        fp.push(*valid_vals.last().unwrap());
+        let last_eeg_time = *eeg_times.last().unwrap();
+        let mut padded_times = Vec::with_capacity(valid_times.len() + 2);
+        let mut padded_vals = Vec::with_capacity(valid_vals.len() + 2);
+        padded_times.push(t0);
+        padded_vals.push(valid_vals[0]);
+        padded_times.extend_from_slice(&valid_times);
+        padded_vals.extend_from_slice(&valid_vals);
+        padded_times.push(last_eeg_time);
+        padded_vals.push(*valid_vals.last().unwrap());
 
-        let mut up = interp_linear_padded(&xp, &fp, eeg_times);
+        let mut upsampled = interp_linear_padded(&padded_times, &padded_vals, eeg_times);
         // Match MATLAB/Python: interpolate through finite coarse-grid values,
         // then restore NaNs only at the original excluded EEG samples.
-        for (v, &ex) in up.iter_mut().zip(isexcluded.iter()) {
+        for (v, &ex) in upsampled.iter_mut().zip(isexcluded.iter()) {
             if ex {
                 *v = f64::NAN;
             }
         }
-        so_power_norm = up;
+        so_power_norm = upsampled;
         so_power_times = eeg_times.to_vec();
 
         // Re-assign stages onto the EEG grid. pydynamo:160-164.
         if !stage_times.is_empty() && !stage_vals.is_empty() {
-            let stages_up = interp_previous(stage_times, stage_vals, &so_power_times, f64::NAN);
-            so_power_stages = stages_up
-                .into_iter()
-                .map(|v| if v.is_nan() { 0.0 } else { v })
-                .collect();
+            let mut stages_up = interp_previous(stage_times, stage_vals, &so_power_times, f64::NAN);
+            // Samples outside the staging range come back NaN. Report them as stage 0.
+            for stage in stages_up.iter_mut() {
+                if stage.is_nan() {
+                    *stage = 0.0;
+                }
+            }
+            so_power_stages = stages_up;
         } else {
+            // No staging supplied: treat every sample as stage 1.
             so_power_stages = vec![1.0; so_power_times.len()];
         }
     }
@@ -319,32 +344,32 @@ pub fn so_power_from_spectrogram(
 }
 
 /// NaN-aware mean + sample std (ddof=1). Mirrors numpy `np.nanmean` and
-/// `np.nanstd(ddof=1)` — same definitions pydynamo uses.
+/// `np.nanstd(ddof=1)`, the same definitions pydynamo uses.
 fn nan_mean_std(xs: &[f64]) -> (f64, f64) {
     let mut n = 0usize;
-    let mut s = 0.0_f64;
+    let mut sum = 0.0_f64;
     for &v in xs {
         if v.is_finite() {
-            s += v;
+            sum += v;
             n += 1;
         }
     }
     if n == 0 {
         return (f64::NAN, f64::NAN);
     }
-    let mean_ = s / n as f64;
+    let mean = sum / n as f64;
     if n < 2 {
-        return (mean_, f64::NAN);
+        return (mean, f64::NAN);
     }
-    let mut sq = 0.0_f64;
+    let mut sum_sq_dev = 0.0_f64;
     for &v in xs {
         if v.is_finite() {
-            let d = v - mean_;
-            sq += d * d;
+            let deviation = v - mean;
+            sum_sq_dev += deviation * deviation;
         }
     }
-    let var_ = sq / (n - 1) as f64;
-    (mean_, var_.sqrt())
+    let variance = sum_sq_dev / (n - 1) as f64;
+    (mean, variance.sqrt())
 }
 
 #[cfg(test)]

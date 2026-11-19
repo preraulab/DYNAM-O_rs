@@ -46,16 +46,16 @@ fn hazen_from_sorted(sorted: &[f64], q_pct: f64) -> f64 {
     if n == 1 {
         return sorted[0];
     }
-    // 1-based hazen index
-    let h = q_pct / 100.0 * n as f64 + 0.5;
-    let h = h.clamp(1.0, n as f64);
-    let lo = h.floor() as usize; // 1-based
-    let hi = h.ceil() as usize; // 1-based
-    let frac = h - h.floor();
+    // 1-based hazen rank, clamped to the available values.
+    let rank_unclamped = q_pct / 100.0 * n as f64 + 0.5;
+    let rank = rank_unclamped.clamp(1.0, n as f64);
+    let lo = rank.floor() as usize; // 1-based
+    let hi = rank.ceil() as usize; // 1-based
+    let frac = rank - rank.floor();
     // Convert to 0-based
-    let a = sorted[lo - 1];
-    let b = sorted[hi - 1];
-    a + (b - a) * frac
+    let lower_value = sorted[lo - 1];
+    let upper_value = sorted[hi - 1];
+    lower_value + (upper_value - lower_value) * frac
 }
 
 /// Map each `stimes[t]` to the nearest index into `t_data`, assuming
@@ -86,7 +86,14 @@ pub fn nearest_indices(stimes: ArrayView1<f64>, t_data: ArrayView1<f64>) -> Vec<
     out
 }
 
-/// Compute per-frequency baseline.
+/// Compute the per-frequency baseline: the `baseline_ptile`-th percentile
+/// of each spectrogram row over the valid time columns (see module doc).
+///
+/// * `spect` is (F, T), `stimes` its T column times.
+/// * `t_data` is the EEG sample time grid that `baseline_exclude` lives on.
+/// * `baseline_range` is the inclusive `(start, end)` time window.
+///
+/// Returns an (F, 1) column. A row with no usable value is NaN.
 pub fn compute_baseline(
     spect: ArrayView2<f64>,
     stimes: ArrayView1<f64>,
@@ -95,7 +102,8 @@ pub fn compute_baseline(
     baseline_range: (f64, f64),
     baseline_ptile: f64,
 ) -> Result<Array2<f64>, String> {
-    let (n_freq, n_time) = (spect.nrows(), spect.ncols());
+    let n_freq = spect.nrows();
+    let n_time = spect.ncols();
     if stimes.len() != n_time {
         return Err(format!(
             "stimes len {} != spect.ncols {}",
@@ -135,8 +143,8 @@ pub fn compute_baseline(
     }
 
     // Per-frequency hazen percentile over valid columns, treating 0 as NaN.
-    // Parallel across frequency rows (rayon); O(N) quickselect per row
-    // (no full sort) — matches numpy's introspect-based partition strategy.
+    // Parallel across frequency rows (rayon), with an O(N) quickselect per
+    // row (no full sort), like numpy's introselect-based percentile.
     let spect_slice = spect
         .as_slice()
         .ok_or_else(|| "spect must be C-contiguous".to_string())?;
@@ -173,7 +181,7 @@ pub fn compute_baseline(
 
 /// Hazen percentile using O(N) quickselect (via
 /// `select_nth_unstable_by`). Equivalent to `hazen_from_sorted` but avoids
-/// a full N log N sort — MATLAB `prctile` on ~100k values is ~5ms via
+/// a full N log N sort. MATLAB `prctile` on ~100k values is ~5ms via
 /// this path vs ~30ms for a full sort.
 ///
 /// Takes the scratch buffer by value (will be rearranged in-place).
@@ -185,38 +193,39 @@ fn hazen_via_quickselect(mut vals: Vec<f64>, q_pct: f64) -> f64 {
     if n == 1 {
         return vals[0];
     }
-    // 1-based hazen index
-    let h = q_pct / 100.0 * n as f64 + 0.5;
-    let h = h.clamp(1.0, n as f64);
-    let lo_1based = h.floor() as usize;
-    let frac = h - h.floor();
+    // 1-based hazen rank, clamped to the available values.
+    let rank_unclamped = q_pct / 100.0 * n as f64 + 0.5;
+    let rank = rank_unclamped.clamp(1.0, n as f64);
+    let lo_1based = rank.floor() as usize;
+    let frac = rank - rank.floor();
     let lo_idx = lo_1based - 1; // 0-based
     // Partition so that vals[lo_idx] has the correct rank and everything
     // smaller is on its left. Scope the mutable borrow.
-    let a = {
+    let lower_value = {
         let (_left, pivot_at_lo, _right) = vals.select_nth_unstable_by(
             lo_idx,
-            |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+            |x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
         );
         *pivot_at_lo
     };
     if frac == 0.0 {
-        return a;
+        return lower_value;
     }
     // ceil element: smallest value among the right-of-lo partition.
     // After select_nth_unstable_by, everything at positions > lo_idx
     // is ≥ pivot (but not sorted). Find min of that slice.
     let right_slice_start = lo_idx + 1;
     if right_slice_start >= n {
-        return a; // at top rank — no ceil element
+        // At the top rank there is no ceil element.
+        return lower_value;
     }
-    let mut b = f64::INFINITY;
+    let mut upper_value = f64::INFINITY;
     for &v in &vals[right_slice_start..] {
-        if v < b {
-            b = v;
+        if v < upper_value {
+            upper_value = v;
         }
     }
-    a + (b - a) * frac
+    lower_value + (upper_value - lower_value) * frac
 }
 
 /// Build the per-EEG-sample baseline-exclude mask from stages + artifacts +
@@ -229,7 +238,7 @@ fn hazen_via_quickselect(mut vals: Vec<f64>, q_pct: f64) -> f64 {
 ///   baseline_exclude = user_exclude | stage_exclude | artifacts
 ///
 /// `user_exclude` may be empty (treated as all-false).
-/// `baseline_stages` typically = `[1, 2, 3, 4, 5]` (NREM + REM + Wake; only
+/// `baseline_stages` typically = `[1, 2, 3, 4, 5]` (NREM + REM + Wake, so only
 /// stage 0 / unknown + 6 / artifact are excluded by default).
 pub fn build_baseline_exclude(
     t_data: &[f64],
@@ -260,16 +269,24 @@ pub fn build_baseline_exclude(
 
     let mut out = vec![false; n];
     for i in 0..n {
-        let in_baseline_stages = baseline_stages
-            .iter()
-            .any(|&bs| (bs - stage_at_data[i]).abs() < f64::EPSILON);
-        let explicit = user_exclude.map_or(false, |ue| ue[i]);
+        let mut in_baseline_stages = false;
+        for &baseline_stage in baseline_stages {
+            if (baseline_stage - stage_at_data[i]).abs() < f64::EPSILON {
+                in_baseline_stages = true;
+                break;
+            }
+        }
+        let explicit = match user_exclude {
+            Some(user_mask) => user_mask[i],
+            None => false,
+        };
         out[i] = explicit || !in_baseline_stages || artifacts[i];
     }
     Ok(out)
 }
 
-/// Divide spectrogram by baseline (column broadcast).
+/// Remove the baseline from a linear-power spectrogram by dividing each
+/// frequency row by its baseline value.
 pub fn subtract_baseline(
     spect: ArrayView2<f64>,
     baseline: ArrayView2<f64>,
@@ -318,7 +335,7 @@ mod tests {
         let t_data = array![0.0, 1.0, 2.0, 3.0];
         let idx = nearest_indices(stimes.view(), t_data.view());
         // Ties broken toward the RIGHT neighbor (matches pydynamo
-        // `use_left = np.abs(left) < np.abs(right)` — strict <, so equal
+        // `use_left = np.abs(left) < np.abs(right)`. Strict <, so equal
         // distances fall through to the right-neighbor).
         // 0.5 → d_left=d_right=0.5 → right (1)
         // 1.5 → d_left=d_right=0.5 → right (2)
@@ -352,7 +369,7 @@ mod tests {
     #[test]
     fn baseline_exclude_combines_stages_and_artifacts() {
         // t_data = 0..10, stages = [0, 5] → vals [2, 6] (N2 then Artifact/excluded)
-        // baseline_stages = [1,2,3,4,5]; so stage 6 samples are excluded.
+        // baseline_stages = [1,2,3,4,5], so stage 6 samples are excluded.
         let t_data: Vec<f64> = (0..10).map(|i| i as f64).collect();
         let stage_times = vec![0.0, 5.0];
         let stage_vals = vec![2.0, 6.0];

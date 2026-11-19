@@ -9,16 +9,19 @@
 //!
 //! Conventions follow the MATLAB functions exactly:
 //!
-//! * `assign_peak_stage` — previous-neighbor interp (step function) with
-//!   fill=0 for peaks outside the staging range; artifact override sets the
+//! * `assign_peak_stage`: previous-neighbor interp (step function) with
+//!   fill=0 for peaks outside the staging range. The artifact override sets the
 //!   stage to 6 when the nearest `artifacts` sample is true
 //!   (`interp1(..., 'nearest')`, an exact midpoint goes to the later sample).
-//! * `assign_peak_sopower` — MATLAB's padded `interp1`: the series is
+//! * `assign_peak_sopower`: MATLAB's padded `interp1`: the series is
 //!   extended by one grid step at each end with the endpoint value, so a
 //!   query within one step of either end gets the endpoint value and a
 //!   query farther out is NaN.
-//! * `assign_peak_sophase` — the same padded interp on the *unwrapped*
+//! * `assign_peak_sophase`: the same padded interp on the *unwrapped*
 //!   phase, then `wrapToPi` to the closed interval `[-π, π]`.
+
+/// Stage code given to a peak that falls on an artifact sample.
+const ARTIFACT_STAGE: f64 = 6.0;
 
 /// Previous-neighbor (step) interpolation: each query `q` maps to the value
 /// `fp[i]` where `i` is the largest index with `xp[i] <= q`. Queries outside
@@ -64,18 +67,23 @@ pub fn interp_nearest_bool(xp: &[f64], flags: &[bool], queries: &[f64]) -> Vec<b
         } else if j == xp.len() {
             xp.len() - 1
         } else {
-            // Compare distance to xp[j-1] vs xp[j]; tie → j (higher index).
+            // Compare distance to xp[j-1] vs xp[j]. A tie goes to j (higher index).
             let left = q - xp[j - 1];
             let right = xp[j] - q;
-            if right <= left { j } else { j - 1 }
+            if right <= left {
+                j
+            } else {
+                j - 1
+            }
         };
         out.push(flags[idx]);
     }
     out
 }
 
-/// Linear interpolation with flat extrapolation at both ends (one-sample pad
-/// to one second outside the grid, matching pydynamo `pipeline.py:231`).
+/// Linear interpolation that holds the end values flat: any query at or
+/// beyond either end of `xp` gets the first / last value of `fp`, however
+/// far out it is. Returns all zeros when `xp` is empty.
 pub fn interp_linear_padded(xp: &[f64], fp: &[f64], queries: &[f64]) -> Vec<f64> {
     debug_assert_eq!(xp.len(), fp.len());
     if xp.is_empty() {
@@ -95,8 +103,8 @@ pub fn interp_linear_padded(xp: &[f64], fp: &[f64], queries: &[f64]) -> Vec<f64>
             let t1 = xp[j];
             let y0 = fp[j - 1];
             let y1 = fp[j];
-            let a = (q - t0) / (t1 - t0);
-            out.push(y0 + a * (y1 - y0));
+            let frac = (q - t0) / (t1 - t0);
+            out.push(y0 + frac * (y1 - y0));
         }
     }
     out
@@ -112,11 +120,11 @@ pub fn interp_linear_padded(xp: &[f64], fp: &[f64], queries: &[f64]) -> Vec<f64>
 /// where `step = t(2) - t(1)`. The behavior at each kind of query point:
 ///
 /// * exactly on a grid point: that sample's value, even when a neighboring
-///   sample is NaN;
+///   sample is NaN.
 /// * strictly between two samples: the linear blend, or NaN when either
-///   sample is NaN;
+///   sample is NaN.
 /// * outside the grid but within one `step` of an end (the padded endpoint
-///   included): the end sample's value;
+///   included): the end sample's value.
 /// * farther out, or a non-finite query: NaN.
 ///
 /// `xp` must be sorted ascending. A series with fewer than two samples has
@@ -200,7 +208,7 @@ pub fn wrap_to_pi(x: f64) -> f64 {
 /// Assign sleep stage to each peak by previous-neighbor interp of staging,
 /// then override with stage=6 where the nearest EEG sample is flagged as an
 /// artifact. `artifact_times` is the EEG time grid on which `artifacts`
-/// lives; typically `t_tr` in the pydynamo pipeline.
+/// lives. Typically `t_tr` in the pydynamo pipeline.
 pub fn assign_peak_stage(
     peak_times: &[f64],
     stage_times: &[f64],
@@ -210,9 +218,9 @@ pub fn assign_peak_stage(
 ) -> Vec<f64> {
     let mut stages = interp_previous(stage_times, stage_vals, peak_times, 0.0);
     let art_at_peak = interp_nearest_bool(artifact_times, artifacts, peak_times);
-    for (s, &a) in stages.iter_mut().zip(art_at_peak.iter()) {
-        if a {
-            *s = 6.0;
+    for (stage, &is_artifact) in stages.iter_mut().zip(art_at_peak.iter()) {
+        if is_artifact {
+            *stage = ARTIFACT_STAGE;
         }
     }
     stages
@@ -254,7 +262,7 @@ mod tests {
     #[test]
     fn previous_step_basic() {
         let xp = [0.0, 10.0, 20.0, 30.0];
-        let fp = [1.0, 2.0, 3.0, 4.0]; // N1 N2 N3 REM ~
+        let fp = [1.0, 2.0, 3.0, 4.0]; // N3 N2 N1 REM
         // Fill for q < xp[0] AND q > xp[-1] (scipy/MATLAB no-extrap semantics).
         let q = [-5.0, 0.0, 5.0, 10.0, 29.9, 30.0, 100.0];
         let out = interp_previous(&xp, &fp, &q, 0.0);
@@ -366,7 +374,7 @@ mod tests {
         let eeg_times = [5.0, 15.0];
         let artifacts = [false, true];
         let out = assign_peak_stage(&peak_times, &stage_times, &stage_vals, &eeg_times, &artifacts);
-        assert_eq!(out, vec![2.0, 6.0]); // first N2; second overridden to artifact=6
+        assert_eq!(out, vec![2.0, 6.0]); // First is N2, second is overridden to artifact=6.
     }
 
     #[test]

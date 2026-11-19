@@ -1,8 +1,19 @@
 //! Iterative max-weight merge loop (MATLAB `mergeWshedSegment.m`).
 //!
-//! Symmetric edge-weight rule matching current MATLAB edgeWeightEqual.m.
-//! Stops when the max remaining weight ≤ merge_thresh, or `max_merges`
-//! iterations reached.
+//! The input is a watershed-labeled image and the spectrogram values. The
+//! region adjacency graph (region pixels, the watershed 0-line borders, and
+//! the neighbors across them) comes from `adjacency`. The loop merges the
+//! edge with the largest weight until no weight exceeds `merge_thresh`, or
+//! until `max_merges` merges have run.
+//!
+//! Edge weight for neighbors i and j (symmetric, MATLAB `edgeWeightEqual.m`):
+//!   A_ij_max = max(data on the border shared by i and j)
+//!   w_ij = −min(border of i) − max(interior and border of j)
+//!   w_ji = −min(border of j) − max(interior and border of i)
+//!   weight = 2·A_ij_max + max(w_ij, w_ji)
+//!
+//! The output is an (F, T) int32 label image. Every surviving region's
+//! pixels carry its label, and watershed 0-line pixels stay 0.
 //!
 //! Each merge also absorbs encircled regions, as MATLAB `mergeRegions.m`
 //! does: after region `b` joins region `a`, any former neighbor of `b`
@@ -35,16 +46,18 @@ impl PartialEq for HeapEntry {
 }
 impl Eq for HeapEntry {}
 impl PartialOrd for HeapEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 impl Ord for HeapEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         // Primary key: higher weight first (BinaryHeap is max-heap → Greater).
         // NaN-safe: partial_cmp of f64 returns None for NaN; treat as Equal
         // and fall back to tie-break. Real weights are always finite here.
-        let w = self.weight.partial_cmp(&other.weight).unwrap_or(Ordering::Equal);
-        if w != Ordering::Equal {
-            return w;
+        let weight_order = self.weight.partial_cmp(&other.weight).unwrap_or(Ordering::Equal);
+        if weight_order != Ordering::Equal {
+            return weight_order;
         }
         // Tie-break: earlier insertion_order wins. Invert so BinaryHeap pops it first.
         other.insertion_order.cmp(&self.insertion_order)
@@ -157,9 +170,12 @@ fn sorted_max_over_two(a: &[u32], b: &[u32], values: &[f64]) -> f64 {
     }
 }
 
-/// Symmetric merge weight (matches pyDYNAM-O's edge_weight after bug fix).
-/// Returns None when the two regions' border intersection is empty (= not
-/// actually adjacent, the "diagonal neighbor" case).
+/// Symmetric merge weight between two regions (MATLAB `edgeWeightEqual.m`):
+///   2 * max(shared border) + max(-min(border_a) - max(region_b),
+///                                -min(border_b) - max(region_a))
+/// where a region's max is taken over its interior and its border.
+/// Returns None when the two borders share no pixel (the regions are
+/// diagonal neighbors, not actually adjacent).
 fn edge_weight(
     ra: &Region,
     rb: &Region,
@@ -241,8 +257,8 @@ fn sorted_symdiff(a: &[u32], b: &[u32]) -> Vec<u32> {
 /// and the interior+border label image (for dur/bw filter bbox computation).
 /// Matches MATLAB's dual semantics: extractTFPeaks.m paints interior+border
 /// for bbox (`Ldata(ii_pixels)=ii` with ii_pixels=interior∪border), but the
-/// maskSpectrogram inlining in export_bisect_intermediates.m zeros borders
-/// back out (`spect2_masked(border_inds)=0`).
+/// spectrogram masking step zeros the borders back out
+/// (`spect2_masked(border_inds)=0`).
 pub fn run_with_borders(
     labels: ArrayView2<i64>,
     values: ArrayView2<f64>,
@@ -260,15 +276,7 @@ pub fn run_with_borders(
     let mut with_borders = Array2::<i32>::zeros((h, w));
     {
         let wb = with_borders.as_slice_mut().unwrap();
-        // Every live region as (label, slot), to be painted in label order.
-        let mut ordered: Vec<(i32, usize)> = Vec::new();
-        for slot in 0..graph.regions.len() {
-            if let Some(region) = &graph.regions[slot] {
-                ordered.push((region.label, slot));
-            }
-        }
-        ordered.sort_by_key(|&(lbl, _)| lbl);
-        for (_, slot) in ordered {
+        for slot in live_slots_in_label_order(&graph) {
             let r = graph.regions[slot].as_ref().unwrap();
             for &p in &r.interior {
                 wb[p as usize] = r.label;
@@ -281,6 +289,26 @@ pub fn run_with_borders(
     Ok((interior_only, with_borders))
 }
 
+/// Slots of the regions still in the graph, in ascending label order.
+fn live_slots_in_label_order(graph: &Graph) -> Vec<usize> {
+    // Every live region as (label, slot).
+    let mut labeled_slots: Vec<(i32, usize)> = Vec::new();
+    for slot in 0..graph.regions.len() {
+        if let Some(region) = &graph.regions[slot] {
+            labeled_slots.push((region.label, slot));
+        }
+    }
+    labeled_slots.sort_by_key(|&(label, _)| label);
+    let mut slots: Vec<usize> = Vec::with_capacity(labeled_slots.len());
+    for (_, slot) in labeled_slots {
+        slots.push(slot);
+    }
+    slots
+}
+
+/// Run the MATLAB-reference merge (TF-peak extraction) and return the
+/// interior-only label image: each surviving region's interior pixels carry
+/// its label, and borders and watershed lines are 0.
 pub fn run(
     labels: ArrayView2<i64>,
     values: ArrayView2<f64>,
@@ -313,15 +341,7 @@ pub fn run_all_px(
     let mut out = Array2::<i32>::zeros((h, w));
     {
         let flat = out.as_slice_mut().unwrap();
-        // Every live region as (label, slot), to be painted in label order.
-        let mut ordered: Vec<(i32, usize)> = Vec::new();
-        for slot in 0..graph.regions.len() {
-            if let Some(region) = &graph.regions[slot] {
-                ordered.push((region.label, slot));
-            }
-        }
-        ordered.sort_by_key(|&(lbl, _)| lbl);
-        for (_, slot) in ordered {
+        for slot in live_slots_in_label_order(&graph) {
             let r = graph.regions[slot].as_ref().unwrap();
             for &p in &r.all_px {
                 flat[p as usize] = r.label;
@@ -422,6 +442,9 @@ fn matlab_prctile(values: impl Iterator<Item = f64>, p: f64) -> f64 {
     xs[i] + t * (xs[i + 1] - xs[i])
 }
 
+/// The merge loop behind every `run*` entry point. Returns the
+/// interior-only label image and the merged graph (each surviving region
+/// with its interior, border and all-pixel lists).
 fn run_inner(
     labels: ArrayView2<i64>,
     values: ArrayView2<f64>,
@@ -437,58 +460,60 @@ fn run_inner(
 
     let mut graph = Graph::from_labels(labels);
 
-    // Heap-based max-weight merge loop (2026-04-24 refactor from O(|E|)
-    // linear scan + O(|E|) retain per iteration). Structure:
+    // Heap-based max-weight merge loop. Structure:
     //   edge_weights : live weight per edge (source of truth)
-    //   edge_meta    : insertion_order + generation per edge (for heap tie-break
-    //                  and lazy-deletion staleness check)
-    //   heap         : max-heap of HeapEntry, may contain stale entries;
-    //                  we pop-and-discard any whose generation mismatches meta
-    // When an edge is removed or reweighted we bump its generation and push
-    // a new heap entry (old entries become stale and are skipped on pop).
+    //   edge_meta    : table position, generation and orientation per edge
+    //                  (heap tie-break and staleness check)
+    //   heap         : max-heap of HeapEntry. It may hold stale entries,
+    //                  which are discarded on pop when their generation
+    //                  does not match edge_meta.
+    // When an edge is removed or reweighted its generation goes up and a
+    // new heap entry is pushed. Older entries for that edge are then stale.
     let mut edge_weights: HashMap<(i32, i32), f64> = HashMap::new();
     let mut edge_meta:    HashMap<(i32, i32), EdgeMeta> = HashMap::new();
     let mut heap:         BinaryHeap<HeapEntry> = BinaryHeap::new();
     let mut next_order: u64 = 0;
 
-    // Helper closures would need to borrow mutably. Use local macros-via-fn instead.
-    // We inline the insert/update logic at the three places it's needed.
-
     // --- Seed: for each edge (ra_label, n) with n > ra_label, compute weight. ---
     // Iterate slots in ascending label order so the initial insertion_order
     // reflects label order (matches MATLAB's edge enumeration, giving stable
     // first-index tie-break on identical weights).
-    let mut ordered_slots: Vec<usize> = (0..graph.regions.len())
-        .filter(|&s| graph.regions[s].is_some())
-        .collect();
-    ordered_slots.sort_by_key(|&s| graph.regions[s].as_ref().unwrap().label);
+    let ordered_slots: Vec<usize> = live_slots_in_label_order(&graph);
     let mut n_pairs = 0u64;
     for slot in &ordered_slots {
         let ra_label = graph.regions[*slot].as_ref().unwrap().label;
-        let mut nbrs: Vec<i32> = graph.regions[*slot].as_ref().unwrap()
-            .neighbors.iter().copied().collect();
-        nbrs.sort();
-        for n in nbrs {
-            if n <= ra_label { continue; }
-            let sb = match graph.label_to_slot.get(&n).copied() {
-                Some(s) => s, None => continue,
+        // The neighbor set is a BTreeSet, so this list is in ascending
+        // label order.
+        let mut neighbor_labels: Vec<i32> = Vec::new();
+        for &label in &graph.regions[*slot].as_ref().unwrap().neighbors {
+            neighbor_labels.push(label);
+        }
+        for neighbor_label in neighbor_labels {
+            if neighbor_label <= ra_label {
+                continue;
+            }
+            let neighbor_slot = match graph.label_to_slot.get(&neighbor_label).copied() {
+                Some(s) => s,
+                None => continue,
             };
             n_pairs += 1;
-            let ra = graph.regions[*slot].as_ref().unwrap();
-            let rb = graph.regions[sb].as_ref().unwrap();
-            if let Some(w) = edge_weight(ra, rb, values_slice) {
-                let key = (ra_label, n);
+            let region_a = graph.regions[*slot].as_ref().unwrap();
+            let region_b = graph.regions[neighbor_slot].as_ref().unwrap();
+            if let Some(weight) = edge_weight(region_a, region_b, values_slice) {
+                let key = (ra_label, neighbor_label);
                 let meta = EdgeMeta {
                     insertion_order: next_order,
                     generation: 0,
-                    oriented: (ra_label, n),
+                    oriented: (ra_label, neighbor_label),
                 };
                 next_order += 1;
-                edge_weights.insert(key, w);
+                edge_weights.insert(key, weight);
                 edge_meta.insert(key, meta);
                 heap.push(HeapEntry {
-                    weight: w, insertion_order: meta.insertion_order,
-                    generation: meta.generation, edge: key,
+                    weight,
+                    insertion_order: meta.insertion_order,
+                    generation: meta.generation,
+                    edge: key,
                 });
             }
         }
@@ -515,10 +540,17 @@ fn run_inner(
     }
 
     let mut n_merges = 0u64;
-    let max_merges_u = if max_merges.is_finite() { max_merges as u64 } else { u64::MAX };
+    // An infinite (or NaN) max_merges means no cap.
+    let max_merges_u = if max_merges.is_finite() {
+        max_merges as u64
+    } else {
+        u64::MAX
+    };
 
     loop {
-        if n_merges >= max_merges_u { break; }
+        if n_merges >= max_merges_u {
+            break;
+        }
 
         // Pop the heap until we find a live entry.
         let popped = loop {
@@ -544,7 +576,9 @@ fn run_inner(
                 // MATLAB `mergeWshedSegment.m` loops `while max_wt >
                 // merge_thresh`, so an edge exactly at the threshold does
                 // not merge.
-                if e.weight <= merge_thresh { break; }
+                if e.weight <= merge_thresh {
+                    break;
+                }
                 // MATLAB sets `mrg_to = ematr(row,1)` and `mrg_from = ematr(row,2)`.
                 let oriented = edge_meta[&e.edge].oriented;
                 dst_label = oriented.0;
@@ -553,7 +587,9 @@ fn run_inner(
             MergeRules::PairwiseOnly => {
                 // An edge exactly at the threshold still merges, and the
                 // lower label is the destination.
-                if e.weight < merge_thresh { break; }
+                if e.weight < merge_thresh {
+                    break;
+                }
                 dst_label = e.edge.0.min(e.edge.1);
                 src_label = e.edge.0.max(e.edge.1);
             }
@@ -591,8 +627,8 @@ fn run_inner(
         }
         graph.label_to_slot.remove(&src_label);
 
-        // Remove every edge touching src_label. Iterate src_label's neighbors
-        // (known from absorbed_neighbors). This replaces the old O(|E|) retain.
+        // Remove every edge touching src_label, found through src_label's
+        // neighbors (absorbed_neighbors).
         for nb in &absorbed_neighbors {
             let key = (src_label.min(*nb), src_label.max(*nb));
             if edge_weights.remove(&key).is_some() {
@@ -663,15 +699,18 @@ fn run_inner(
         let dst_nbrs_now: Vec<i32> = graph.regions[dst_slot].as_ref().unwrap()
             .neighbors.iter().copied().collect();
         for nb in dst_nbrs_now {
-            if nb == dst_label || nb == src_label { continue; }
+            if nb == dst_label || nb == src_label {
+                continue;
+            }
             let key = (dst_label.min(nb), dst_label.max(nb));
             let nb_slot = match graph.label_to_slot.get(&nb).copied() {
-                Some(s) => s, None => continue,
+                Some(s) => s,
+                None => continue,
             };
             let ra = graph.regions[dst_slot].as_ref().unwrap();
             let rb = graph.regions[nb_slot].as_ref().unwrap();
             match edge_weight(ra, rb, values_slice) {
-                Some(w) => {
+                Some(weight) => {
                     // Which row survives MATLAB's de-duplication of
                     // `[dst nb]` / `[nb dst]`: the one earlier in the table,
                     // between dst's own row and src's relabeled row. It
@@ -728,10 +767,12 @@ fn run_inner(
                     meta.insertion_order = new_position;
                     meta.oriented = oriented;
                     meta.generation = previous_generation + 1;
-                    edge_weights.insert(key, w);
+                    edge_weights.insert(key, weight);
                     heap.push(HeapEntry {
-                        weight: w, insertion_order: meta.insertion_order,
-                        generation: meta.generation, edge: key,
+                        weight,
+                        insertion_order: meta.insertion_order,
+                        generation: meta.generation,
+                        edge: key,
                     });
                     // Maintain neighbor sets (in case this was a new adjacency
                     // exposed by the merge of borders).
@@ -755,13 +796,9 @@ fn run_inner(
         eprintln!("[merge] n_merges={}", n_merges);
     }
 
-    // Rebuild output label image: interior pixels only.
-    // Note: MATLAB paints interior+border for dur/bw filter bbox computation
-    // (via `Ldata(ii_pixels)=ii` where ii_pixels = rgn{ii} = interior∪border),
-    // but zeros borders back out for masking
-    // (`spect2_masked(border_inds)=0`). Pydynamo returns interior-only here
-    // and uses `merge_segment_with_borders` to get the with-borders variant
-    // for the filter path.
+    // Output label image: interior pixels only, so watershed 0-lines and
+    // region borders stay 0. `run_with_borders` and `run_all_px` paint the
+    // border-inclusive variants from the returned graph.
     let mut out = Array2::<i32>::zeros((h, w));
     {
         let out_flat = out.as_slice_mut().unwrap();

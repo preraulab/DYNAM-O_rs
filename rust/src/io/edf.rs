@@ -18,7 +18,7 @@ use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
-/// One of the two readers the EDF parsers consume — a raw file handle
+/// One of the two readers the EDF parsers consume. A raw file handle
 /// for plain `.edf`, or an in-memory cursor over decompressed bytes for
 /// `.edf.gz`. `EdfReader: Read + Seek` so the rest of the parser code
 /// is identical in either branch.
@@ -45,26 +45,23 @@ impl Seek for EdfReader {
     }
 }
 
-/// Open an EDF file, transparently decompressing if the path ends in
-/// `.gz` (case-insensitive). Mirrors the lab convention from
-/// `preraulab_utilities/EDF_toolbox/read_EDF.m`: `.edf` files are read
-/// straight from disk, `.edf.gz` files are decompressed (in memory,
-/// matching the MEX path's semantics — the pure-MATLAB path uses
-/// `gunzip → tempname` to a temp file). `.edf.zst` is supported by the
-/// MATLAB toolbox but not by this reader yet; pre-decompress with
-/// `zstd -d` if you need it.
+/// True when the path's final extension is `gz` (case-insensitive).
 fn path_is_gz(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("gz"))
-        .unwrap_or(false)
+    let extension = match path.extension() {
+        Some(ext) => ext,
+        None => return false,
+    };
+    match extension.to_str() {
+        Some(ext_str) => ext_str.eq_ignore_ascii_case("gz"),
+        None => false,
+    }
 }
 
 /// Read the main header + per-signal headers, applying the
 /// data_record_duration → sampling_frequency derivation. Works on any
 /// `R: Read`, so it serves both the seekable `EdfReader` path and the
 /// streaming `BufReader<GzDecoder<File>>` path. Does NOT do the
-/// num_data_records-from-file-size fallback — that needs Seek, so the
+/// num_data_records-from-file-size fallback. That needs Seek, so the
 /// caller handles it on the seekable readers.
 fn read_header_pair<R: Read>(r: &mut R) -> Result<(EdfHeader, Vec<SignalHeader>), EdfError> {
     let header = read_main_header(r)?;
@@ -83,6 +80,13 @@ fn read_header_pair<R: Read>(r: &mut R) -> Result<(EdfHeader, Vec<SignalHeader>)
     Ok((header, sh))
 }
 
+/// Open an EDF file, transparently decompressing if the path ends in
+/// `.gz` (case-insensitive). Mirrors the lab convention from
+/// `preraulab_utilities/EDF_toolbox/read_EDF.m`: `.edf` files are read
+/// straight from disk, `.edf.gz` files are decompressed in memory, as the
+/// MEX path does (the pure-MATLAB path uses `gunzip → tempname` to a temp
+/// file). `.edf.zst` is supported by the MATLAB toolbox but not by this
+/// reader. Pre-decompress with `zstd -d` if you need it.
 fn open_edf_reader(path: &Path) -> Result<EdfReader, EdfError> {
     let is_gz = path_is_gz(path);
     let f = File::open(path)?;
@@ -134,6 +138,8 @@ pub struct EdfData {
     pub data: Vec<Vec<f64>>,
 }
 
+/// Failure reading an EDF: an underlying I/O error, or a header / data
+/// layout the reader cannot decode (message says which).
 #[derive(Debug)]
 pub enum EdfError {
     Io(std::io::Error),
@@ -170,8 +176,9 @@ fn trim_edf(s: &[u8]) -> String {
     String::from_utf8_lossy(&s[start..end]).into_owned()
 }
 
+/// C `atoi`-style parse: leading integer, trailing junk ignored, 0 when
+/// there is no number.
 fn parse_int(s: &str) -> i32 {
-    // MATLAB `atoi` equivalent: parse leading int, silently accept trailing.
     let t = s.trim();
     // Try full, fall back to leading-digit parse.
     if let Ok(v) = t.parse::<i32>() {
@@ -196,6 +203,8 @@ fn parse_int(s: &str) -> i32 {
     acc.parse::<i32>().unwrap_or(0)
 }
 
+/// Float parse that falls back to the leading run of numeric characters
+/// (digits, sign, `.`, `e`), and to 0.0 when that run does not parse.
 fn parse_float(s: &str) -> f64 {
     let t = s.trim();
     t.parse::<f64>().unwrap_or_else(|_| {
@@ -212,7 +221,7 @@ fn parse_float(s: &str) -> f64 {
     })
 }
 
-/// Read the main 256-byte EDF header. Sequential `read_exact` only —
+/// Read the main 256-byte EDF header. Sequential `read_exact` only, with
 /// no `Seek` required, so this can run against a streaming
 /// `GzDecoder<File>` wrapped in `BufReader` and only pull the header
 /// bytes off the gzipped stream (no full decompress needed for a
@@ -224,13 +233,9 @@ pub fn read_main_header<R: Read>(f: &mut R) -> Result<EdfHeader, EdfError> {
     h.edf_ver = trim_edf(&buf[0..8]);
     h.patient_id = trim_edf(&buf[8..88]);
     h.local_rec_id = trim_edf(&buf[88..168]);
-    // Date/time: do NOT trim — keep 8-char fixed field (mex keeps raw).
-    // Use `trim_edf` (not raw `from_utf8_lossy`) so trailing NULL / space
-    // padding gets stripped — some lab EDF writers leave the date/time
-    // fields half-filled like `"22:07:2\0"`, which the EDF spec permits
-    // (NULL is a conventional pad character) but downstream parsers
-    // choke on. trim_edf is already used for patient_id / local_rec_id
-    // via decode_str-style stripping; these two were the holdouts.
+    // Date/time: strip trailing NUL / space padding. Some EDF writers leave
+    // these 8-char fields partly filled (e.g. `"22:07:2\0"`), which the EDF
+    // spec permits but downstream parsers reject.
     h.recording_startdate = trim_edf(&buf[168..176]);
     h.recording_starttime = trim_edf(&buf[176..184]);
     h.num_header_bytes = parse_int(&String::from_utf8_lossy(&buf[184..192]));
@@ -243,14 +248,9 @@ pub fn read_main_header<R: Read>(f: &mut R) -> Result<EdfHeader, EdfError> {
 /// Read per-signal headers (laid out field-major: all labels, then all
 /// transducer_types, etc.). File position must be at byte 256.
 ///
-/// **Bulk-read implementation.** The signal-header block is exactly
-/// `256 * nsig` bytes, laid out in 11 field-major sub-arrays. The
-/// previous implementation issued ~11N sequential `read_exact` calls
-/// against a raw `File`. On NFS each call is a network round-trip, so
-/// for a 30-signal EDF this was ~330 round-trips per file — easily 10×
-/// slower than MATLAB's `read_EDF` MEX, which reads through a buffered
-/// libc `FILE*`. Reading the whole block in one syscall and parsing in
-/// memory matches the MEX's effective behavior.
+/// The whole `256 * nsig`-byte block is read in one call and parsed in
+/// memory. On a network file system every read is a round-trip, so one
+/// bulk read keeps header parsing fast.
 pub fn read_signal_headers<R: Read>(f: &mut R, nsig: usize) -> Result<Vec<SignalHeader>, EdfError> {
     let block_size = 256 * nsig;
     let mut block = vec![0u8; block_size];
@@ -259,7 +259,7 @@ pub fn read_signal_headers<R: Read>(f: &mut R, nsig: usize) -> Result<Vec<Signal
     let mut sh = vec![SignalHeader::default(); nsig];
     let mut off = 0;
 
-    // 16-char labels. Some exports leave every label blank — give those
+    // 16-char labels. Some exports leave every label blank. Give those
     // signals deterministic positional names (`ch1`, `ch2`, …) so the
     // rest of the stack (label pickers, channel expressions, run-time
     // selection) can address them: the same synthesis runs on every
@@ -311,7 +311,7 @@ pub fn read_signal_headers<R: Read>(f: &mut R, nsig: usize) -> Result<Vec<Signal
         s.samples_in_record = parse_int(&String::from_utf8_lossy(&block[off..off + 8]));
         off += 8;
     }
-    // 32-char reserved per signal — skipped.
+    // 32-char reserved field per signal, skipped.
     off += 32 * nsig;
     debug_assert_eq!(off, block_size);
 
@@ -319,7 +319,7 @@ pub fn read_signal_headers<R: Read>(f: &mut R, nsig: usize) -> Result<Vec<Signal
 }
 
 /// Read just the EDF headers (main + per-signal) and apply the same
-/// post-processing `read_edf_all` performs — without reading sample
+/// post-processing `read_edf_all` performs, without reading sample
 /// data. Specifically:
 ///   1. Compute `sampling_frequency = samples_in_record /
 ///      data_record_duration` for each signal.
@@ -327,7 +327,7 @@ pub fn read_signal_headers<R: Read>(f: &mut R, nsig: usize) -> Result<Vec<Signal
 ///      derive it from `file_size − num_header_bytes` divided by the
 ///      bytes-per-record (`2 · Σ samples_in_record`).
 ///
-/// This is what `read_EDF.m` does in its header-only branch — UI
+/// This is what `read_EDF.m` does in its header-only branch. UI
 /// previews need both quantities to display duration + fs.
 pub fn read_edf_header<P: AsRef<Path>>(path: P) -> Result<(EdfHeader, Vec<SignalHeader>), EdfError> {
     let path = path.as_ref();
@@ -368,7 +368,7 @@ pub fn read_edf_header<P: AsRef<Path>>(path: P) -> Result<(EdfHeader, Vec<Signal
     Ok((header, sh))
 }
 
-/// Read the whole EDF, decoding every signal. Returns (header, signals, data).
+/// Read the whole EDF, decoding every signal into an [`EdfData`].
 pub fn read_edf_all<P: AsRef<Path>>(path: P) -> Result<EdfData, EdfError> {
     let mut f = open_edf_reader(path.as_ref())?;
     let mut header = read_main_header(&mut f)?;
@@ -425,30 +425,30 @@ pub fn read_edf_all<P: AsRef<Path>>(path: P) -> Result<EdfData, EdfError> {
         acc += s.samples_in_record as u64;
     }
 
-    let ndr = header.num_data_records as u64;
+    let num_records = header.num_data_records as u64;
     let mut data: Vec<Vec<f64>> = Vec::with_capacity(nsig);
     for s in 0..nsig {
-        let spr = sh[s].samples_in_record as u64;
-        let len = (spr * ndr) as usize;
+        let samples_per_record = sh[s].samples_in_record as u64;
+        let len = (samples_per_record * num_records) as usize;
         let mut out = Vec::with_capacity(len);
 
-        let d_range = sh[s].digital_max - sh[s].digital_min;
-        let p_range = sh[s].physical_max - sh[s].physical_min;
-        if d_range == 0.0 {
+        let digital_range = sh[s].digital_max - sh[s].digital_min;
+        let physical_range = sh[s].physical_max - sh[s].physical_min;
+        if digital_range == 0.0 {
             return Err(EdfError::Format(format!(
                 "digital_max == digital_min for signal '{}'",
                 sh[s].signal_labels
             )));
         }
-        let scale = p_range / d_range;
-        let offs = sh[s].physical_min - sh[s].digital_min * scale;
+        let scale = physical_range / digital_range;
+        let physical_offset = sh[s].physical_min - sh[s].digital_min * scale;
 
-        for r in 0..ndr {
+        for r in 0..num_records {
             let base = r * total_samp_per_rec + sig_offset[s];
-            for k in 0..spr {
-                let bidx = 2 * ((base + k) as usize);
-                let v = i16::from_le_bytes([raw[bidx], raw[bidx + 1]]);
-                out.push(v as f64 * scale + offs);
+            for k in 0..samples_per_record {
+                let byte_idx = 2 * ((base + k) as usize);
+                let v = i16::from_le_bytes([raw[byte_idx], raw[byte_idx + 1]]);
+                out.push(v as f64 * scale + physical_offset);
             }
         }
         data.push(out);
@@ -459,7 +459,7 @@ pub fn read_edf_all<P: AsRef<Path>>(path: P) -> Result<EdfData, EdfError> {
 
 /// Partial-load: read only the signals whose labels (case-insensitive,
 /// trimmed) appear in `wanted_labels`. Labels not present in the EDF
-/// header are silently absent from the result — the caller decides how
+/// header are silently absent from the result. The caller decides how
 /// to report misses (the CLI's downstream `select_channel` call surfaces
 /// them as `channel not found, skipping`, matching the per-channel-miss
 /// behavior of MATLAB `read_EDF`'s `'Channels'` arg).
@@ -468,7 +468,7 @@ pub fn read_edf_all<P: AsRef<Path>>(path: P) -> Result<EdfData, EdfError> {
 /// (`bytes_per_rec`) regardless of `wanted_labels.len()`, but `data` is
 /// only allocated for wanted signals. So loading 4 of 8 channels halves
 /// the decoded f64 storage. Disk bandwidth is unchanged (EDF interleaves
-/// signals within each record; a record-by-record sequential read is
+/// signals within each record. A record-by-record sequential read is
 /// faster than per-signal seeks on any modern storage).
 ///
 /// Otherwise identical to [`read_edf_all`]: same num-records fixup, same
@@ -489,16 +489,16 @@ pub fn read_edf_with_signals<P: AsRef<Path>>(
     // held for the duration of the read, the working set is the
     // ~10 KB per-record scratch buffer. That matters when the
     // wizard's 4-loader parallel header scan + Phase-1 workers run
-    // concurrently — RAM pressure drops by orders of magnitude.
+    // concurrently. RAM pressure drops by orders of magnitude.
     //
     // Falls through to the full-decompress + Seek path below when the
-    // header's `num_data_records` isn't trustworthy — that branch
+    // header's `num_data_records` isn't trustworthy. That branch
     // re-derives the count from `file_size / bytes_per_rec`, which
     // needs Seek.
     if is_gz {
         let f = File::open(path)?;
         let mut r = std::io::BufReader::new(flate2::read::GzDecoder::new(f));
-        let (mut header, mut sh) = read_header_pair(&mut r)?;
+        let (header, sh) = read_header_pair(&mut r)?;
         let bytes_per_rec = compute_bytes_per_rec(&sh)?;
         validate_record_duration(&header)?;
         // Sampling-frequency derivation already done by read_header_pair.
@@ -515,11 +515,10 @@ pub fn read_edf_with_signals<P: AsRef<Path>>(
             )?;
             let signals: Vec<SignalHeader> =
                 wanted_idx.iter().map(|&i| sh[i].clone()).collect();
-            let _ = (&mut header, &mut sh); // silence unused-mut on the streaming branch
             return Ok(EdfData { header, signals, data });
         }
         // Fall through to full-decompress so we can Seek-to-end for the
-        // num_data_records fixup. Rare path — valid EDFs declare a
+        // num_data_records fixup. This path is rare: valid EDFs declare a
         // positive count in the header.
     }
 
@@ -570,8 +569,8 @@ pub fn read_edf_with_signals<P: AsRef<Path>>(
 }
 
 /// Reject signal headers that can't be safely decoded. A negative
-/// `samples_in_record` — from a truncated or bit-flipped header (common on
-/// interrupted NFS transfers) — sign-extends to a huge value when cast to
+/// `samples_in_record`, from a truncated or bit-flipped header (common on
+/// interrupted NFS transfers), sign-extends to a huge value when cast to
 /// `u64`/`usize`, producing oversized record sizes and byte offsets that index
 /// out of bounds and panic mid-decode, taking down the whole batch. Catch it
 /// here and fail this one file cleanly instead. Valid EDFs always declare a
@@ -589,7 +588,7 @@ fn validate_decodable_headers(sh: &[SignalHeader]) -> Result<(), EdfError> {
 }
 
 /// Total bytes per data record (sum of samples_in_record * 2 across
-/// signals). Errors when zero — the EDF has no usable data.
+/// signals). Errors when zero, since the EDF then has no usable data.
 fn compute_bytes_per_rec(sh: &[SignalHeader]) -> Result<u64, EdfError> {
     validate_decodable_headers(sh)?;
     let total: u64 = sh.iter().map(|s| s.samples_in_record as u64).sum();
@@ -610,9 +609,9 @@ fn validate_record_duration(header: &EdfHeader) -> Result<(), EdfError> {
 }
 
 /// Map a `wanted_labels` list to indices into `sh`, case-insensitive +
-/// trimmed. Order of `wanted_labels` preserved; duplicates dedup'd;
-/// labels not present in the EDF silently absent (caller decides how
-/// to report misses).
+/// trimmed. The order of `wanted_labels` is preserved, duplicates are
+/// dropped, and labels not present in the EDF are silently absent (the
+/// caller decides how to report misses).
 fn map_wanted_indices(sh: &[SignalHeader], wanted_labels: &[&str]) -> Vec<usize> {
     let header_keys: Vec<String> = sh
         .iter()
@@ -641,15 +640,15 @@ fn signal_byte_offsets(sh: &[SignalHeader]) -> Vec<u64> {
     off
 }
 
-/// Decode `ndr` records from `r` sequentially, materialising only the
+/// Decode `num_records` records from `r` sequentially, materializing only the
 /// signals in `wanted_idx`. `<R: Read>` so both the seekable path
 /// (`File` / `Cursor`) and the streaming gz path
 /// (`BufReader<GzDecoder<File>>`) share the same loop. The per-record
-/// scratch buffer is the only large allocation; output vectors are
-/// pre-sized to `samples_in_record * ndr` for each wanted signal.
+/// scratch buffer is the only large allocation. Output vectors are
+/// pre-sized to `samples_in_record * num_records` for each wanted signal.
 fn decode_records<R: Read>(
     r: &mut R,
-    ndr: u64,
+    num_records: u64,
     bytes_per_rec: usize,
     wanted_idx: &[usize],
     sh: &[SignalHeader],
@@ -657,28 +656,28 @@ fn decode_records<R: Read>(
 ) -> Result<Vec<Vec<f64>>, EdfError> {
     let mut data: Vec<Vec<f64>> = wanted_idx
         .iter()
-        .map(|&i| Vec::with_capacity((sh[i].samples_in_record as usize) * (ndr as usize)))
+        .map(|&i| Vec::with_capacity((sh[i].samples_in_record as usize) * (num_records as usize)))
         .collect();
     let mut rec_buf = vec![0u8; bytes_per_rec];
-    for _r in 0..ndr {
+    for _record in 0..num_records {
         r.read_exact(&mut rec_buf)?;
         for (out_idx, &sig_idx) in wanted_idx.iter().enumerate() {
             let off = sig_byte_offset[sig_idx] as usize;
-            let spr = sh[sig_idx].samples_in_record as usize;
-            let d_range = sh[sig_idx].digital_max - sh[sig_idx].digital_min;
-            let p_range = sh[sig_idx].physical_max - sh[sig_idx].physical_min;
-            if d_range == 0.0 {
+            let samples_per_record = sh[sig_idx].samples_in_record as usize;
+            let digital_range = sh[sig_idx].digital_max - sh[sig_idx].digital_min;
+            let physical_range = sh[sig_idx].physical_max - sh[sig_idx].physical_min;
+            if digital_range == 0.0 {
                 return Err(EdfError::Format(format!(
                     "digital_max == digital_min for signal '{}'",
                     sh[sig_idx].signal_labels
                 )));
             }
-            let scale = p_range / d_range;
-            let offs = sh[sig_idx].physical_min - sh[sig_idx].digital_min * scale;
-            for k in 0..spr {
-                let bidx = off + 2 * k;
-                let v = i16::from_le_bytes([rec_buf[bidx], rec_buf[bidx + 1]]);
-                data[out_idx].push(v as f64 * scale + offs);
+            let scale = physical_range / digital_range;
+            let physical_offset = sh[sig_idx].physical_min - sh[sig_idx].digital_min * scale;
+            for k in 0..samples_per_record {
+                let byte_idx = off + 2 * k;
+                let v = i16::from_le_bytes([rec_buf[byte_idx], rec_buf[byte_idx + 1]]);
+                data[out_idx].push(v as f64 * scale + physical_offset);
             }
         }
     }
@@ -688,7 +687,7 @@ fn decode_records<R: Read>(
 /// Select a channel by label.
 ///
 ///   - Exact label match (case-insensitive, trimmed) → plain channel.
-///   - Otherwise try each '-' as leftmost A-B split; both halves must match
+///   - Otherwise try each '-' as leftmost A-B split. Both halves must match
 ///     a file label → returns A − B (element-wise).
 ///
 /// Returns (selected_signal_header, signal_values).
@@ -760,35 +759,43 @@ fn find_label(sigs: &[SignalHeader], name: &str) -> Option<usize> {
 /// 3. Parse `channel`, resolve its `SignalRef::Leaf` names against the
 ///    table, and return the resulting linear combination.
 ///
-/// The returned `SignalHeader` is synthesised from the first leaf
+/// The returned `SignalHeader` is synthesized from the first leaf
 /// channel's header (with `signal_labels` set to `channel`). All leaves
-/// must share the same sample count — read_EDF's uniform-fs rule.
+/// must share the same sample count (read_EDF's uniform-fs rule).
 pub fn select_channel_with_refs(
     edf: &EdfData,
     channel: &str,
     references: &[String],
 ) -> Result<(SignalHeader, Vec<f64>), EdfError> {
-    use super::expr::{evaluate, parse, parse_named, resolve_references, ExprAst, SignalRef, Term};
+    use super::expr::{
+        evaluate, parse, parse_named, resolve_references, ExprAst, NamedRef, SignalRef, Term,
+    };
 
-    // Channel fast-path: bare literal label match, even with refs
-    // present. EDF labels can contain '-', '[' / ']', spaces — under
-    // the new bracket-as-grouping parser semantics, those would mis-
-    // parse if we always routed through the expression parser.
+    // Channel fast-path: a bare literal label match, even with refs present.
+    // EDF labels can contain '-', '[' / ']' and spaces, which the expression
+    // parser would read as operators and grouping.
     if find_label(&edf.signals, channel.trim()).is_some() {
         return select_channel(edf, channel);
     }
 
-    // Parse references; topo-sort. Each ref's body gets a literal-
+    // Parse references, then topo-sort. Each ref's body gets a literal-
     // label fast-path: if the textual body matches an EDF channel
     // name exactly, replace the parsed AST with a single-leaf AST so
     // the evaluator looks up the literal label directly.
-    let mut parsed_refs: Vec<(String, ExprAst)> = Vec::new();
+    let mut parsed_refs: Vec<NamedRef> = Vec::new();
     for r in references {
         let (name, ast) = parse_named(r)
             .map_err(|e| EdfError::Format(format!("reference '{}': {}", r, e)))?;
-        let body = match r.find('=') { Some(i) => r[i + 1..].trim(), None => r.trim() };
+        let body = match r.find('=') {
+            Some(eq_pos) => r[eq_pos + 1..].trim(),
+            None => r.trim(),
+        };
         let ast = if find_label(&edf.signals, body).is_some() {
-            ExprAst { terms: vec![Term { coeff: 1.0, signal: Some(SignalRef::Leaf(body.to_string())) }] }
+            let literal_leaf = Term {
+                coeff: 1.0,
+                signal: Some(SignalRef::Leaf(body.to_string())),
+            };
+            ExprAst { terms: vec![literal_leaf] }
         } else {
             ast
         };
@@ -798,6 +805,8 @@ pub fn select_channel_with_refs(
         .map_err(|e| EdfError::Format(format!("reference resolution: {}", e)))?;
 
     // Seed signals table with file channels.
+    // find_label returns the first case-insensitive match, so files with
+    // duplicate labels map every duplicate to the first one's data.
     let mut signals: std::collections::HashMap<String, Vec<f64>> = std::collections::HashMap::new();
     for sh in &edf.signals {
         let key = sh.signal_labels.trim().to_string();
@@ -806,55 +815,59 @@ pub fn select_channel_with_refs(
     }
 
     // Evaluate refs in dependency order. A reference that cannot be
-    // evaluated against THIS file (its channels are absent — common in
-    // cohorts that mix montage naming schemes) is recorded rather than
+    // evaluated against THIS file (its channels are absent, which is common
+    // in cohorts that mix montage naming schemes) is recorded rather than
     // fatal: only the channels that actually use it fail, with the
     // recorded cause attached, and a mean(...) over it just skips it.
     let mut ref_errors: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for (name, ast) in &ordered {
-        let rewritten = rewrite_refs(ast, &signals_keys_only(&signals), &ordered);
+        let rewritten = rewrite_refs(ast, &ordered);
         match evaluate(&rewritten, &signals) {
-            Ok(v) => { signals.insert(name.clone(), v); }
-            Err(e) => { ref_errors.insert(name.clone(), e.to_string()); }
+            Ok(v) => {
+                signals.insert(name.clone(), v);
+            }
+            Err(e) => {
+                ref_errors.insert(name.clone(), e.to_string());
+            }
         }
     }
+    // Append the recorded cause of every failed reference that `msg` names.
     let attach_ref_causes = |msg: String| -> String {
-        let used: Vec<String> = ref_errors
-            .iter()
-            .filter(|(n, _)| msg.contains(n.as_str()))
-            .map(|(n, e)| format!("{}: {}", n, e))
-            .collect();
-        if used.is_empty() { msg } else { format!("{} (reference not available — {})", msg, used.join("; ")) }
+        let mut causes: Vec<String> = Vec::new();
+        for (ref_name, ref_error) in ref_errors.iter() {
+            if msg.contains(ref_name.as_str()) {
+                causes.push(format!("{}: {}", ref_name, ref_error));
+            }
+        }
+        if causes.is_empty() {
+            msg
+        } else {
+            format!("{} (reference not available — {})", msg, causes.join("; "))
+        }
     };
 
     // Parse the channel expression.
     let channel = channel.trim();
-    // Bare label fast-path again — covers `select_channel_with_refs(edf, "M", &[…M…])`.
+    // Bare label fast-path again. Covers `select_channel_with_refs(edf, "M", &[…M…])`.
     if let Some(v) = signals.get(channel) {
-        // Synthesise header from any leaf. Use file channel if it's
-        // a file label; otherwise fall back to the first file channel.
-        let sh = match find_label(&edf.signals, channel) {
-            Some(idx) => {
-                let mut sh = edf.signals[idx].clone();
-                sh.signal_labels = channel.to_string();
-                sh
-            }
-            None => {
-                let mut sh = edf.signals[0].clone();
-                sh.signal_labels = channel.to_string();
-                sh
-            }
+        // Synthesize the header from the file channel when `channel` is a
+        // file label. Otherwise fall back to the first file channel.
+        let source_idx = match find_label(&edf.signals, channel) {
+            Some(idx) => idx,
+            None => 0,
         };
+        let mut sh = edf.signals[source_idx].clone();
+        sh.signal_labels = channel.to_string();
         return Ok((sh, v.clone()));
     }
 
     let ast = parse(channel).map_err(|e| EdfError::Format(format!("channel '{}': {}", channel, e)))?;
-    let rewritten = rewrite_refs(&ast, &signals_keys_only(&signals), &ordered);
+    let rewritten = rewrite_refs(&ast, &ordered);
     let v = evaluate(&rewritten, &signals)
         .map_err(|e| EdfError::Format(attach_ref_causes(format!("evaluating channel '{}': {}", channel, e))))?;
 
-    // Synthesise the header from the first leaf encountered (signals()
+    // Synthesize the header from the first leaf encountered (signals()
     // recurses into mean arguments, so a channel led by a mean still
     // finds a real file channel).
     let header_leaf = ast.signals().into_iter().next();
@@ -866,42 +879,45 @@ pub fn select_channel_with_refs(
     Ok((sh, v))
 }
 
-fn signals_keys_only(map: &std::collections::HashMap<String, Vec<f64>>) -> std::collections::HashSet<String> {
-    map.keys().cloned().collect()
-}
-
 /// SignalRef::Leaf names that are also known refs become SignalRef::Named.
-/// Kept simple — the evaluator looks up by name regardless of kind, but
-/// preserving the distinction helps error messages.
+/// The evaluator looks up by name regardless of kind, but preserving the
+/// distinction helps error messages.
 fn rewrite_refs(
     ast: &super::expr::ExprAst,
-    known_signals: &std::collections::HashSet<String>,
-    ordered_refs: &[(String, super::expr::ExprAst)],
+    ordered_refs: &[super::expr::NamedRef],
 ) -> super::expr::ExprAst {
     use super::expr::{ExprAst, SignalRef, Term};
     let ref_names: std::collections::HashSet<&str> =
         ordered_refs.iter().map(|(n, _)| n.as_str()).collect();
-    let _ = known_signals; // currently unused; future: error early on missing
     fn rewrite_terms(
         terms: &[Term],
         ref_names: &std::collections::HashSet<&str>,
     ) -> Vec<Term> {
-        terms.iter().map(|t| {
-            let new_sig = t.signal.as_ref().map(|s| match s {
+        let mut rewritten: Vec<Term> = Vec::with_capacity(terms.len());
+        for term in terms {
+            let new_signal = match &term.signal {
+                None => None,
                 // Recurse into mean arguments so a ref used inside a
                 // mean resolves through the signals table like any other.
-                SignalRef::Mean(args) => SignalRef::Mean(
-                    args.iter()
-                        .map(|a| ExprAst { terms: rewrite_terms(&a.terms, ref_names) })
-                        .collect(),
-                ),
-                _ => {
-                    let n = s.name();
-                    if ref_names.contains(n) { SignalRef::Named(n.to_string()) } else { SignalRef::Leaf(n.to_string()) }
+                Some(SignalRef::Mean(args)) => {
+                    let mut new_args: Vec<ExprAst> = Vec::with_capacity(args.len());
+                    for arg in args {
+                        new_args.push(ExprAst { terms: rewrite_terms(&arg.terms, ref_names) });
+                    }
+                    Some(SignalRef::Mean(new_args))
                 }
-            });
-            Term { coeff: t.coeff, signal: new_sig }
-        }).collect()
+                Some(other) => {
+                    let name = other.name();
+                    if ref_names.contains(name) {
+                        Some(SignalRef::Named(name.to_string()))
+                    } else {
+                        Some(SignalRef::Leaf(name.to_string()))
+                    }
+                }
+            };
+            rewritten.push(Term { coeff: term.coeff, signal: new_signal });
+        }
+        rewritten
     }
     ExprAst { terms: rewrite_terms(&ast.terms, &ref_names) }
 }
@@ -909,7 +925,7 @@ fn rewrite_refs(
 #[cfg(test)]
 mod gz_tests {
     //! Verify `read_edf_*` reads a gzipped EDF as if it were plain.
-    //! Round-trip a synthesised minimal-valid EDF (1 signal, 1 record,
+    //! Round-trip a synthesized minimal-valid EDF (1 signal, 1 record,
     //! 10 samples) under both `.edf` and `.edf.gz` suffixes and assert
     //! the parsed headers match.
     use super::*;
@@ -991,19 +1007,18 @@ mod gz_tests {
         let _ = std::fs::remove_file(&gzipped);
     }
 
-    /// Header reads on .gz must NOT inflate the entire payload — they
+    /// Header reads on .gz must NOT inflate the entire payload. They
     /// should stream just the header bytes off the GzDecoder and stop.
     /// Test it by gzipping a valid 512-byte header followed by ~2 MB
-    /// of zero bytes (compresses fine; would take measurable time to
+    /// of zero bytes (compresses fine, but would take measurable time to
     /// fully inflate). The header read should succeed quickly without
     /// the heavy buffer ever being allocated.
     ///
-    /// Also pins that the parsed header values match the in-memory
-    /// truth, so we don't regress correctness while chasing speed.
+    /// Also checks that the parsed header values are correct.
     #[test]
     fn read_edf_header_streams_gz_without_full_inflate() {
         let mut bytes = synth_minimal_edf();
-        // Pad with 2 MiB of zeros — would be visible in inflate time
+        // Pad with 2 MiB of zeros, which would be visible in inflate time
         // if we fully decompressed. Streaming stops at byte 532.
         bytes.extend(std::iter::repeat(0u8).take(2 * 1024 * 1024));
 
@@ -1028,9 +1043,9 @@ mod gz_tests {
         assert_eq!(h.num_signals, 1);
         assert_eq!(sh[0].signal_labels, "EEG");
         // Header-only on a 2 MiB-padded gz should be near-instant if
-        // streaming; the assertion is generous (250 ms) so a loaded CI
+        // streaming. The assertion is generous (250 ms) so a loaded CI
         // box doesn't false-flag, but a full inflate of 2 MiB of zeros
-        // would normally be sub-ms anyway — the real win is on the
+        // would normally be sub-ms anyway. The real win is on the
         // 100-500 MB overnight EDF case where the difference is many
         // seconds vs near-instant.
         assert!(
@@ -1073,30 +1088,58 @@ mod gz_tests {
         bytes.extend_from_slice(b"B               ");
         bytes.extend_from_slice(b"C               ");
         // transducer (80 × 3)
-        for _ in 0..3 { bytes.extend(std::iter::repeat(b' ').take(80)); }
+        for _ in 0..3 {
+            bytes.extend(std::iter::repeat(b' ').take(80));
+        }
         // phys_dim (8 × 3)
-        for _ in 0..3 { bytes.extend_from_slice(b"uV      "); }
-        // phys_min, phys_max, dig_min, dig_max — all the same per
-        // signal for simplicity; gives scale=1, offs=0.
-        for _ in 0..3 { bytes.extend_from_slice(b"-32768  "); } // phys_min
-        for _ in 0..3 { bytes.extend_from_slice(b"32767   "); } // phys_max
-        for _ in 0..3 { bytes.extend_from_slice(b"-32768  "); } // dig_min
-        for _ in 0..3 { bytes.extend_from_slice(b"32767   "); } // dig_max
+        for _ in 0..3 {
+            bytes.extend_from_slice(b"uV      ");
+        }
+        // phys_min, phys_max, dig_min, dig_max: all the same per
+        // signal for simplicity, which gives scale=1, offset=0.
+        // phys_min
+        for _ in 0..3 {
+            bytes.extend_from_slice(b"-32768  ");
+        }
+        // phys_max
+        for _ in 0..3 {
+            bytes.extend_from_slice(b"32767   ");
+        }
+        // dig_min
+        for _ in 0..3 {
+            bytes.extend_from_slice(b"-32768  ");
+        }
+        // dig_max
+        for _ in 0..3 {
+            bytes.extend_from_slice(b"32767   ");
+        }
         // prefilter (80 × 3)
-        for _ in 0..3 { bytes.extend(std::iter::repeat(b' ').take(80)); }
+        for _ in 0..3 {
+            bytes.extend(std::iter::repeat(b' ').take(80));
+        }
         // samples_in_record = 4 (8 × 3)
-        for _ in 0..3 { bytes.extend_from_slice(b"4       "); }
+        for _ in 0..3 {
+            bytes.extend_from_slice(b"4       ");
+        }
         // reserved (32 × 3)
-        for _ in 0..3 { bytes.extend(std::iter::repeat(b' ').take(32)); }
+        for _ in 0..3 {
+            bytes.extend(std::iter::repeat(b' ').take(32));
+        }
         assert_eq!(bytes.len(), 1024);
         // ---- data: 5 records, each [A(4 i16) | B(4 i16) | C(4 i16)] ----
         for r in 0..5i16 {
             // A: 100 + r * 10 + k
-            for k in 0..4i16 { bytes.extend_from_slice(&(100 + r * 10 + k).to_le_bytes()); }
+            for k in 0..4i16 {
+                bytes.extend_from_slice(&(100 + r * 10 + k).to_le_bytes());
+            }
             // B: 200 + r * 10 + k
-            for k in 0..4i16 { bytes.extend_from_slice(&(200 + r * 10 + k).to_le_bytes()); }
+            for k in 0..4i16 {
+                bytes.extend_from_slice(&(200 + r * 10 + k).to_le_bytes());
+            }
             // C: 300 + r * 10 + k
-            for k in 0..4i16 { bytes.extend_from_slice(&(300 + r * 10 + k).to_le_bytes()); }
+            for k in 0..4i16 {
+                bytes.extend_from_slice(&(300 + r * 10 + k).to_le_bytes());
+            }
         }
         assert_eq!(bytes.len(), 1024 + 5 * 3 * 4 * 2);
 
@@ -1109,7 +1152,7 @@ mod gz_tests {
             enc.finish().expect("gz finish");
         }
 
-        // Request only signal "B" — exercises wanted_labels filtering on both paths.
+        // Request only signal "B". Exercises wanted_labels filtering on both paths.
         let wanted = ["B"];
         let plain_out = read_edf_with_signals(&plain, &wanted).expect("plain read");
         let gz_out = read_edf_with_signals(&gzipped, &wanted).expect("gz streaming read");
@@ -1157,7 +1200,7 @@ mod gz_tests {
 
 #[cfg(test)]
 mod select_refs_tests {
-    //! `select_channel_with_refs` over a synthetic in-memory EDF —
+    //! `select_channel_with_refs` over a synthetic in-memory EDF. It
     //! exercises the heterogeneous-cohort case: a reference mean that
     //! lists every montage spelling, evaluated in a file that has only
     //! some of them.
@@ -1181,20 +1224,20 @@ mod select_refs_tests {
 
     #[test]
     fn ref_mean_uses_only_the_spellings_this_file_has() {
-        // M1 lists two spellings of the same montage; this file carries
+        // M1 lists two spellings of the same montage. This file carries
         // only the literal "C3-A2". M1 must evaluate as the mean of the
         // one available channel, and the rereferenced output must work.
         let edf = edf_with(&[("C3-A2", vec![10.0, 20.0]), ("O1-A2", vec![4.0, 6.0])]);
         let refs = vec!["M1 = mean($C3-A2$, $[C3-A2 - B]$, $O1-A2$, $[O1-A2 - B]$)".to_string()];
         let (_, v) = select_channel_with_refs(&edf, "$C3-A2$ - M1", &refs).unwrap();
-        // M1 = (C3-A2 + O1-A2)/2 = [7, 13]; C3-A2 - M1 = [3, 7].
+        // M1 = (C3-A2 + O1-A2)/2 = [7, 13], and C3-A2 - M1 = [3, 7].
         assert_eq!(v, vec![3.0, 7.0]);
     }
 
     #[test]
     fn unavailable_ref_fails_only_channels_that_use_it() {
         // M2's channels are absent from this file entirely. A channel
-        // using M1 still works; one using M2 fails with the cause named.
+        // using M1 still works. One using M2 fails with the cause named.
         let edf = edf_with(&[("C3-A2", vec![1.0, 2.0])]);
         let refs = vec![
             "M1 = mean($C3-A2$)".to_string(),

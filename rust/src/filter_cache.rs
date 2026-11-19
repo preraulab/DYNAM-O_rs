@@ -25,6 +25,7 @@
 //! Filename format: `sophase_sos_Fs{fs}_{lo}_{hi}.npy` with `{:g}` formatting
 //! (e.g. `Fs100_0.3_1.5`, `Fs128_0.5_1`, no trailing zeros).
 
+use crate::filter_design;
 use ndarray::Array2;
 use ndarray_npy::{read_npy, ReadNpyExt};
 use std::collections::HashMap;
@@ -60,17 +61,29 @@ impl std::fmt::Display for FilterError {
 
 impl std::error::Error for FilterError {}
 
+/// Order of the fallback Chebyshev Type-I bandpass.
+const FALLBACK_CHEBY1_ORDER: usize = 4;
+/// Passband ripple of the fallback design, in dB.
+const FALLBACK_CHEBY1_RIPPLE_DB: f64 = 0.2;
+
 /// Build the ordered list of candidate cache directories.
 fn candidate_filter_dirs() -> Vec<PathBuf> {
-    candidate_filter_dirs_from(
-        std::env::var_os("DYNAMO_FILTER_CACHE")
-            .filter(|path| !path.is_empty())
-            .map(PathBuf::from),
-        runtime_module_path().as_deref(),
-        std::env::current_dir().ok().as_deref(),
-    )
+    // A set but empty DYNAMO_FILTER_CACHE counts as not set.
+    let mut override_dir: Option<PathBuf> = None;
+    if let Some(value) = std::env::var_os("DYNAMO_FILTER_CACHE") {
+        if !value.is_empty() {
+            override_dir = Some(PathBuf::from(value));
+        }
+    }
+    let module_path = runtime_module_path();
+    let current_dir = std::env::current_dir().ok();
+    candidate_filter_dirs_from(override_dir, module_path.as_deref(), current_dir.as_deref())
 }
 
+/// The candidate directories in search order, without duplicates: the
+/// override, `data_matlab_filters` beside the loaded module, then
+/// `data_matlab_filters` in the current directory and in its parent.
+/// Separate from `candidate_filter_dirs` so tests can pass fixed paths.
 fn candidate_filter_dirs_from(
     override_dir: Option<PathBuf>,
     module_path: Option<&Path>,
@@ -92,12 +105,16 @@ fn candidate_filter_dirs_from(
     dirs
 }
 
+/// Append `path` unless it is already in the list.
 fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if !paths.contains(&path) {
         paths.push(path);
     }
 }
 
+/// Path of the shared library or executable this code was loaded from
+/// (`dladdr` on Unix, `GetModuleFileNameW` on Windows), or `None` if the
+/// system cannot say.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn runtime_module_path() -> Option<PathBuf> {
     use std::ffi::{c_char, c_int, c_void, CStr};
@@ -136,6 +153,9 @@ fn runtime_module_path() -> Option<PathBuf> {
     Some(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
 }
 
+/// Path of the shared library or executable this code was loaded from
+/// (`dladdr` on Unix, `GetModuleFileNameW` on Windows), or `None` if the
+/// system cannot say.
 #[cfg(target_os = "windows")]
 fn runtime_module_path() -> Option<PathBuf> {
     use std::ffi::c_void;
@@ -164,6 +184,9 @@ fn runtime_module_path() -> Option<PathBuf> {
         return None;
     }
 
+    // Start at MAX_PATH (260) UTF-16 units. A result that fills the buffer
+    // means the path was cut off, so the buffer is doubled and the call
+    // repeated.
     let mut buffer = vec![0_u16; 260];
     loop {
         let length =
@@ -178,19 +201,16 @@ fn runtime_module_path() -> Option<PathBuf> {
     }
 }
 
+/// Path of the running executable, or `None` if the system cannot say.
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn runtime_module_path() -> Option<PathBuf> {
     std::env::current_exe().ok()
 }
 
-/// `{:g}` mimics Python's `f"{v:g}"` and Rust's default `{}` for `f64` with
-/// trimmed trailing zeros. Rust's `{}` for f64 already avoids trailing zeros
-/// (e.g. `0.3` → `"0.3"`, `1.5` → `"1.5"`, `1.0` → `"1"`), matching the
-/// existing filenames on disk.
+/// Format a number for a cache filename the way Python's `{:g}` does for
+/// these values: a whole number without a decimal point (`100`, `1`),
+/// anything else in its shortest decimal form (`0.3`, `1.5`).
 fn fmt_g(v: f64) -> String {
-    // f64's Display already strips trailing zeros and doesn't print ".0"
-    // for integer values. A quick spot-check against the committed filenames
-    // confirms this matches the expected format.
     if v == v.trunc() && v.is_finite() {
         format!("{}", v as i64)
     } else {
@@ -243,52 +263,56 @@ fn sophase_cache_key(fs: f64, band: (f64, f64)) -> SophaseKey {
     (to_micro_hz(fs), to_micro_hz(band.0), to_micro_hz(band.1))
 }
 
-/// Load a SOphase SOS filter from the cache, or fall back to cheby1 bandpass
-/// design if the cache file is not found.
+/// The SO-phase SOS filter for a sampling rate and band. Looked up, in
+/// order, in the process-wide table, the cache directories, and the set
+/// embedded in the binary. A band found in none of them gets the Chebyshev
+/// fallback design.
 ///
 /// Returns an `(n_sections, 6)` SOS array in scipy layout [b0 b1 b2 a0 a1 a2].
 pub fn get_sophase_sos(fs: f64, band: (f64, f64)) -> Result<Array2<f64>, FilterError> {
     let key = sophase_cache_key(fs, band);
     let cache = SOPHASE_SOS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(g) = cache.lock() {
-        if let Some(prev) = g.get(&key) {
-            return match prev {
-                Ok(arr) => Ok(arr.clone()),
+    if let Ok(table) = cache.lock() {
+        if let Some(cached) = table.get(&key) {
+            // A cached failure is stored as its message only, so it comes
+            // back as `DesignFailed` whichever kind it was the first time.
+            return match cached {
+                Ok(sos) => Ok(sos.clone()),
                 Err(msg) => Err(FilterError::DesignFailed(msg.clone())),
             };
         }
     }
 
     let computed = resolve_sophase_sos(fs, band);
-    if let Ok(mut g) = cache.lock() {
+    if let Ok(mut table) = cache.lock() {
         let stored = match &computed {
-            Ok(arr) => Ok(arr.clone()),
+            Ok(sos) => Ok(sos.clone()),
             Err(e) => Err(format!("{}", e)),
         };
-        g.insert(key, stored);
+        table.insert(key, stored);
     }
     computed
 }
 
 /// The cache-miss path: filesystem cache → embedded set → cheby1 fallback.
-/// Factored out of `get_sophase_sos` so the cache-hit path stays a one-line
-/// HashMap lookup.
+/// Kept separate from `get_sophase_sos` so the cache-hit path there stays a
+/// single table lookup.
 fn resolve_sophase_sos(fs: f64, band: (f64, f64)) -> Result<Array2<f64>, FilterError> {
     let fname = sophase_cache_filename(fs, band);
     let mut tried: Vec<String> = Vec::new();
     for dir in candidate_filter_dirs() {
-        let p = dir.join(&fname);
-        if p.exists() {
-            return read_npy::<_, Array2<f64>>(&p)
-                .map_err(|e| FilterError::LoadFailed(format!("{}: {}", p.display(), e)));
+        let candidate_path = dir.join(&fname);
+        if candidate_path.exists() {
+            return read_npy::<_, Array2<f64>>(&candidate_path)
+                .map_err(|e| FilterError::LoadFailed(format!("{}: {}", candidate_path.display(), e)));
         }
-        tried.push(p.display().to_string());
+        tried.push(candidate_path.display().to_string());
     }
 
     // Last cache tier: filters embedded in the binary at build time. A relocated
     // binary (no source tree, no DYNAMO_FILTER_CACHE) still gets the exact MATLAB
     // elliptic design here instead of degrading to cheby1.
-    if let Some((_, bytes)) = EMBEDDED_FILTERS.iter().find(|(n, _)| *n == fname) {
+    if let Some((_, bytes)) = EMBEDDED_FILTERS.iter().find(|(name, _)| *name == fname) {
         return Array2::<f64>::read_npy(std::io::Cursor::new(*bytes))
             .map_err(|e| FilterError::LoadFailed(format!("embedded {}: {}", fname, e)));
     }
@@ -307,9 +331,9 @@ fn resolve_sophase_sos(fs: f64, band: (f64, f64)) -> Result<Array2<f64>, FilterE
         fs, band.0, band.1, tried,
     );
 
-    // cheby1 default order 4, 0.2 dB ripple. Same design used elsewhere in
-    // DYNAM-O's highpass/bandpass chain for consistency.
-    design_cheby1_bandpass_sos(4, 0.2, band, fs)
+    // Same order and ripple as the Chebyshev designs elsewhere in DYNAM-O's
+    // highpass/bandpass chain.
+    design_cheby1_bandpass_sos(FALLBACK_CHEBY1_ORDER, FALLBACK_CHEBY1_RIPPLE_DB, band, fs)
 }
 
 /// Design a Chebyshev Type-I bandpass SOS filter.
@@ -322,8 +346,8 @@ pub fn design_cheby1_bandpass_sos(
     band: (f64, f64),
     fs: f64,
 ) -> Result<Array2<f64>, FilterError> {
-    // Reuse the existing in-tree implementation via #[path] shim (declared
-    // below). Keeps us from pulling in an extra filter-design crate.
+    // The design comes from the crate's own `filter_design::cheby1_sos`, so
+    // no outside filter-design crate is needed.
     let wn = [band.0, band.1];
     let sections = filter_design::cheby1_sos(order, rp_db, &wn, "bandpass", fs);
     if sections.is_empty() {
@@ -331,16 +355,14 @@ pub fn design_cheby1_bandpass_sos(
             "cheby1_sos returned zero sections".into(),
         ));
     }
-    let n = sections.len();
-    let mut flat = Vec::with_capacity(n * 6);
-    for s in &sections {
-        flat.extend_from_slice(s);
+    let n_sections = sections.len();
+    let mut flat = Vec::with_capacity(n_sections * 6);
+    for section in &sections {
+        flat.extend_from_slice(section);
     }
-    Array2::from_shape_vec((n, 6), flat)
+    Array2::from_shape_vec((n_sections, 6), flat)
         .map_err(|e| FilterError::DesignFailed(format!("{}", e)))
 }
-
-use crate::filter_design;
 
 #[cfg(test)]
 mod tests {
@@ -366,7 +388,7 @@ mod tests {
 
     #[test]
     fn filename_format_matches_cache() {
-        // Spot-check every committed combination's naming convention.
+        // Spot-check three committed names.
         assert_eq!(
             sophase_cache_filename(100.0, (0.3, 1.5)),
             "sophase_sos_Fs100_0.3_1.5.npy"

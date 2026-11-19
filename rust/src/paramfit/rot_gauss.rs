@@ -19,10 +19,8 @@
 //! ```
 //!
 //! The `-0.5` is what makes `ys` (`fstd`) and `xs` (`pstd`) genuine
-//! standard deviations. The historical form omitted it, so the fitted
-//! widths were `sqrt(2)` times the standard deviation they were named
-//! after. Squaring the denominator alone is not sufficient — the factor
-//! of one half is the part that fixes the units.
+//! standard deviations. Without it the widths would be `sqrt(2)` times the
+//! standard deviation they are named after.
 //!
 //! Parameter layout (flat vector, length `6N + 3`):
 //!
@@ -40,7 +38,7 @@
 //! `reshape(B0, 1, numel(B0))` where `B0` is the canonical Nx6 matrix
 //! `[amp fmean fstd pmean pstd theta]`. The CFTool alphabetizes the
 //! coefficient names so the order is `amp, fmean, fstd, pmean, pstd,
-//! theta, xxx, yyy, zzz` — same order.
+//! theta, xxx, yyy, zzz`, which is the same order.
 
 use ndarray::{Array2, ArrayView2};
 use nalgebra::DMatrix;
@@ -50,8 +48,9 @@ use super::{Gof, ParamFitError, ParamFitOut};
 
 /// Evaluate the rotated-Gaussian-mixture model on a grid.
 ///
-/// `x_grid`, `y_grid` are the bin centers; output `(n_y, n_x)` row-major
-/// matches the MATLAB SOPH orientation `(n_freqs, n_features)`.
+/// `x_grid`, `y_grid` are the bin centers. The output has shape
+/// `(n_y, n_x)`, which matches the MATLAB SOPH orientation
+/// `(n_freqs, n_features)`.
 pub fn eval_model(
     params: &[f64],
     n_modes: usize,
@@ -69,6 +68,8 @@ pub fn eval_model(
         for ix in 0..nx {
             let x = x_grid[ix];
             let mut v = xxx * x + yyy * y + zzz;
+            // Per-mode parameters: a = amp, fm / fs = frequency mean / std,
+            // pm / ps = power mean / std, th = rotation angle.
             for n in 0..n_modes {
                 let a  = params[n];
                 let fm = params[n_modes + n];
@@ -89,6 +90,8 @@ pub fn eval_model(
     z
 }
 
+/// The rotated-Gaussian fit as a least-squares problem: residuals are
+/// model minus data on the grid, and non-finite data bins contribute zero.
 struct RotGaussProblem<'a> {
     n_modes: usize,
     x_grid: &'a [f64],
@@ -100,23 +103,22 @@ struct RotGaussProblem<'a> {
 impl<'a> ResidualsAndJacobian for RotGaussProblem<'a> {
     fn residuals(&self, params: &[f64], out: &mut [f64]) {
         let model = eval_model(params, self.n_modes, self.x_grid, self.y_grid);
-        for (k, ((zm, zd), m)) in model.iter()
-            .zip(self.z_data.iter())
-            .zip(self.finite_mask.iter())
-            .enumerate()
-        {
-            out[k] = if *m { *zm - *zd } else { 0.0 };
+        for (k, model_value) in model.iter().enumerate() {
+            if self.finite_mask[k] {
+                out[k] = *model_value - self.z_data[k];
+            } else {
+                out[k] = 0.0;
+            }
         }
     }
 
     fn jacobian(&self, params: &[f64], out: &mut DMatrix<f64>) {
         // Analytic Jacobian. nalgebra DMatrix is column-major, so each
         // column j occupies `out.as_mut_slice()[j*n_r..(j+1)*n_r]`. We
-        // index that slice directly to avoid per-element bounds-check
-        // overhead and stride computation in Index/IndexMut. To get
-        // contiguous writes within each column, we iterate columns in
-        // the outer loop and pixels in the inner loop.
-        let n = self.n_modes;
+        // index that slice directly to avoid the stride computation in
+        // Index/IndexMut. To get contiguous writes within each column, we
+        // iterate columns in the outer loop and pixels in the inner loop.
+        let n_modes = self.n_modes;
         let nx = self.x_grid.len();
         let ny = self.y_grid.len();
         let n_r = nx * ny;
@@ -125,14 +127,18 @@ impl<'a> ResidualsAndJacobian for RotGaussProblem<'a> {
         debug_assert_eq!(out.ncols(), n_p);
 
         let buf: &mut [f64] = out.as_mut_slice();
-        // Zero entire Jacobian first (one big memset → fast).
-        for v in buf.iter_mut() { *v = 0.0; }
+        // Zero the whole Jacobian first. Masked rows stay zero.
+        buf.fill(0.0);
 
         // Background plane columns (xxx, yyy, zzz). Each is contiguous.
-        let xxx_idx = 6 * n;
-        let yyy_idx = 6 * n + 1;
-        let zzz_idx = 6 * n + 2;
+        let xxx_idx = 6 * n_modes;
+        let yyy_idx = 6 * n_modes + 1;
+        let zzz_idx = 6 * n_modes + 2;
         {
+            // SAFETY: xxx_idx, yyy_idx and zzz_idx are three distinct column
+            // indices below n_p, and buf has n_r * n_p elements (asserted
+            // above in debug builds). The three slices are therefore in
+            // bounds and do not overlap.
             let (col_x, col_y, col_z) = unsafe {
                 let p = buf.as_mut_ptr();
                 (
@@ -156,27 +162,33 @@ impl<'a> ResidualsAndJacobian for RotGaussProblem<'a> {
         // Per-mode kernel-derivative columns. Get 6 separate &mut slices
         // (one per derivative column) so each write is a direct offset
         // into a contiguous f64 buffer.
-        for m in 0..n {
+        for m in 0..n_modes {
             let a  = params[m];
-            let fm = params[n + m];
-            let fs = params[2 * n + m];
-            let pm = params[3 * n + m];
-            let ps = params[4 * n + m];
-            let th = params[5 * n + m];
+            let fm = params[n_modes + m];
+            let fs = params[2 * n_modes + m];
+            let pm = params[3 * n_modes + m];
+            let ps = params[4 * n_modes + m];
+            let th = params[5 * n_modes + m];
             let (sin_t, cos_t) = th.sin_cos();
             let inv_fs = 1.0 / fs;
             let inv_ps = 1.0 / ps;
+            // fs/ps - ps/fs, the width factor in the theta derivative.
             let fs_over_ps_minus = fs * inv_ps - ps * inv_fs;
 
+            // SAFETY: the six column indices m, n_modes + m, ...,
+            // 5 * n_modes + m are distinct and below 6 * n_modes < n_p, and
+            // buf has n_r * n_p elements. The six slices are in bounds and
+            // do not overlap each other. The background slices above are out
+            // of scope.
             let (col_a, col_fm, col_fs, col_pm, col_ps, col_t) = unsafe {
                 let p = buf.as_mut_ptr();
                 (
-                    std::slice::from_raw_parts_mut(p.add( m            * n_r), n_r),
-                    std::slice::from_raw_parts_mut(p.add((n + m)        * n_r), n_r),
-                    std::slice::from_raw_parts_mut(p.add((2 * n + m)    * n_r), n_r),
-                    std::slice::from_raw_parts_mut(p.add((3 * n + m)    * n_r), n_r),
-                    std::slice::from_raw_parts_mut(p.add((4 * n + m)    * n_r), n_r),
-                    std::slice::from_raw_parts_mut(p.add((5 * n + m)    * n_r), n_r),
+                    std::slice::from_raw_parts_mut(p.add(m * n_r), n_r),
+                    std::slice::from_raw_parts_mut(p.add((n_modes + m) * n_r), n_r),
+                    std::slice::from_raw_parts_mut(p.add((2 * n_modes + m) * n_r), n_r),
+                    std::slice::from_raw_parts_mut(p.add((3 * n_modes + m) * n_r), n_r),
+                    std::slice::from_raw_parts_mut(p.add((4 * n_modes + m) * n_r), n_r),
+                    std::slice::from_raw_parts_mut(p.add((5 * n_modes + m) * n_r), n_r),
                 )
             };
 
@@ -192,15 +204,18 @@ impl<'a> ResidualsAndJacobian for RotGaussProblem<'a> {
                     let dx = self.x_grid[ix] - pm;
                     let u = (dy_c + dx * sin_t) * inv_fs;
                     let w = (-dy_s + dx * cos_t) * inv_ps;
-                    // Kernel is exp(-1/2 (u^2 + w^2)), so each derivative
-                    // that used to carry the 2 from d/dx exp(-x^2) now
-                    // carries 1. `col_a` is d/d(amp) = kern and keeps its
-                    // form (only its value moves with the exponent), and
-                    // `fs_over_ps_minus` is a ratio in which the width
-                    // rescale cancels, so it is unchanged too.
+                    // With kern = exp(-1/2 (u^2 + w^2)) and g = amp * kern:
+                    //   d/d(amp)   = kern
+                    //   d/d(fmean) = g * (u*cos(t)/fs - w*sin(t)/ps)
+                    //   d/d(fstd)  = g * u^2 / fs
+                    //   d/d(pmean) = g * (u*sin(t)/fs + w*cos(t)/ps)
+                    //   d/d(pstd)  = g * w^2 / ps
+                    //   d/d(theta) = g * u * w * (fs/ps - ps/fs)
                     let exp_arg = -0.5 * (u * u + w * w);
                     let kern = exp_arg.exp();
                     let g = a * kern;
+                    // g / a rather than kern, so the stored value is the
+                    // rounded quotient whenever amp is nonzero.
                     col_a[row]  = if a != 0.0 { g / a } else { kern };
                     col_fm[row] = g * (inv_fs * u * cos_t - inv_ps * w * sin_t);
                     col_fs[row] = g * inv_fs * u * u;
@@ -218,14 +233,14 @@ impl<'a> ResidualsAndJacobian for RotGaussProblem<'a> {
 
 /// Fit a rotated-Gaussian mixture + linear plane to a SOPH histogram.
 ///
-/// * `soph` — shape `(n_y, n_x)` = `(n_freqs, n_features)`, row-major.
-/// * `x_grid` — feature/power bin centers, length `n_x`.
-/// * `y_grid` — frequency bin centers,    length `n_y`.
-/// * `initial` — Nx6 matrix of seed params `[amp, fmean, fstd, pmean, pstd, theta]`.
-/// * `lower`, `upper` — bound matrices, same shape as `initial`.
-/// * `bg_lower`, `bg_upper` — bounds on `[xxx, yyy, zzz]`.
-/// * `bg_initial` — seed for `[xxx, yyy, zzz]`.
-/// * `max_iters` — LM evaluation cap.
+/// * `soph`: shape `(n_y, n_x)` = `(n_freqs, n_features)`, row-major.
+/// * `x_grid`: feature/power bin centers, length `n_x`.
+/// * `y_grid`: frequency bin centers,    length `n_y`.
+/// * `initial`: Nx6 matrix of seed params `[amp, fmean, fstd, pmean, pstd, theta]`.
+/// * `lower`, `upper`: bound matrices, same shape as `initial`.
+/// * `bg_lower`, `bg_upper`: bounds on `[xxx, yyy, zzz]`.
+/// * `bg_initial`: seed for `[xxx, yyy, zzz]`.
+/// * `max_iters`: LM evaluation cap.
 pub fn fit_rotgauss(
     soph: ArrayView2<f64>,
     x_grid: &[f64],
@@ -308,8 +323,11 @@ pub fn fit_rotgauss(
     let model_soph = eval_model(&report.params, n_modes, x_grid, y_grid);
     let mut z_keep_data:  Vec<f64> = Vec::with_capacity(z_data.len());
     let mut z_keep_model: Vec<f64> = Vec::with_capacity(z_data.len());
-    for ((zd, zm), m) in z_data.iter().zip(model_soph.iter()).zip(finite_mask.iter()) {
-        if *m { z_keep_data.push(*zd); z_keep_model.push(*zm); }
+    for (k, model_value) in model_soph.iter().enumerate() {
+        if finite_mask[k] {
+            z_keep_data.push(z_data[k]);
+            z_keep_model.push(*model_value);
+        }
     }
     let gof = Gof::from_data(&z_keep_data, &z_keep_model, n_params);
 
@@ -360,12 +378,9 @@ mod tests {
 
     #[test]
     fn analytic_jacobian_matches_central_differences() {
-        // The hand-written derivative columns have to move with the kernel:
-        // exp(-1/2 (u² + w²)) turns every factor of 2 that came from
-        // d/dx exp(-x²) into a 1, except in `col_a` (= kern, whose form is
-        // unchanged) and in `fs_over_ps_minus` (a ratio in which the width
-        // rescale cancels). Central differences know only `eval_model`, so
-        // they disagree the moment a column is scaled wrong.
+        // The hand-written derivative columns must match the kernel
+        // exp(-1/2 (u² + w²)). Central differences know only `eval_model`,
+        // so they disagree the moment a column is scaled wrong.
         let (xg, yg) = make_grid(9, 7);
         let p = vec![
             3.0, 1.5,          // amp
@@ -394,8 +409,10 @@ mod tests {
         let mut pert = p.clone();
         for c in 0..n_p {
             let h = 1e-6 * p[c].abs().max(1.0);
-            pert[c] = p[c] + h; problem.residuals(&pert, &mut r_plus);
-            pert[c] = p[c] - h; problem.residuals(&pert, &mut r_minus);
+            pert[c] = p[c] + h;
+            problem.residuals(&pert, &mut r_plus);
+            pert[c] = p[c] - h;
+            problem.residuals(&pert, &mut r_minus);
             pert[c] = p[c];
             for r in 0..n_r {
                 let fd = (r_plus[r] - r_minus[r]) / (2.0 * h);
@@ -440,7 +457,7 @@ mod tests {
 
         assert!(out.gof.rsquare > 0.99,
             "Recovery R² too low: {} (sse={}, dfe={})", out.gof.rsquare, out.gof.sse, out.gof.dfe);
-        // Loose parameter check — LM minima drift on noisy data.
+        // Loose parameter check, because the fitted minimum drifts on noisy data.
         assert!((out.params[[0, 0]] - 3.0).abs() < 0.5, "amp drift: {}", out.params[[0, 0]]);
         assert!((out.params[[0, 1]] - 12.0).abs() < 0.5, "fmean drift: {}", out.params[[0, 1]]);
     }

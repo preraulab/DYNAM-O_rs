@@ -24,7 +24,14 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let ch_idx: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    // Optional channel index. A missing or unparseable argument selects
+    // channel 0.
+    let mut ch_idx: usize = 0;
+    if let Some(text) = args.next() {
+        if let Ok(parsed) = text.parse() {
+            ch_idx = parsed;
+        }
+    }
 
     eprintln!("loading {} …", edf);
     let t = Instant::now();
@@ -52,7 +59,8 @@ fn main() {
 
     let opts = ArtifactOpts::default();
 
-    // Warm-up run (toggles allocator caches, JIT-like effects).
+    // Warm-up run, so the timed runs start with warm CPU caches and an
+    // already-grown allocator.
     let _ = detect_artifacts(data, fs, &opts);
 
     // Timed runs.

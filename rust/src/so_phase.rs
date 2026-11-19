@@ -1,7 +1,7 @@
 //! SO-phase time series.
 //!
 //! Port of `computeSOphase.m` (MATLAB) and `pydynamo.soph.sophase.compute_so_phase`.
-//! SO-phase is returned **unwrapped** to match MATLAB convention — downstream
+//! SO-phase is returned **unwrapped** to match MATLAB convention. Downstream
 //! binning / per-peak assignment applies `wrapToPi` when needed.
 //!
 //! Pipeline:
@@ -16,22 +16,24 @@
 use crate::peak_assign::interp_previous;
 use crate::signal::{hilbert, sosfiltfilt, unwrap};
 
+/// Output of [`so_phase_from_eeg`].
 pub struct SoPhaseOut {
     /// Unwrapped phase (radians), length = eeg.len(). NaN at excluded samples.
     pub so_phase_unwrapped: Vec<f64>,
     /// EEG time grid (echo of input).
     pub so_phase_times: Vec<f64>,
-    /// Stage per sample (0 outside staging range). Length = eeg.len().
+    /// Stage per sample (0 outside staging range, all 1 when no staging is
+    /// given). Length = eeg.len().
     pub so_phase_stages: Vec<f64>,
-    /// Filtered EEG — useful for downstream visualisation / QA. NaN at excluded samples.
+    /// Filtered EEG, useful for downstream visualization / QA. NaN at excluded samples.
     pub filtdata: Vec<f64>,
 }
 
-/// Compute SO-phase from raw EEG. Caller supplies the SOS filter (2D array
-/// flattened row-major: shape (n_sections, 6) per scipy layout [b0 b1 b2 a0 a1 a2]).
+/// Compute SO-phase from raw EEG. Caller supplies the SOS filter as one
+/// `[b0 b1 b2 a0 a1 a2]` array per section (scipy layout).
 ///
 /// To load MATLAB's canonical elliptic SOS for a given (fs, band), use
-/// `filter_cache::get_sophase_sos` — same cache pydynamo uses.
+/// `filter_cache::get_sophase_sos`, the same cache pydynamo uses.
 pub fn so_phase_from_eeg(
     eeg: &[f64],
     eeg_times: &[f64],
@@ -56,10 +58,13 @@ pub fn so_phase_from_eeg(
     }
 
     let filt = sosfiltfilt(sos, eeg);
-    let (re, im) = hilbert(&filt);
-    // atan2(imag, real) of the analytic signal — scipy hilbert returns
-    // analytic = filt + i*H{filt}; numpy angle(analytic) = atan2(imag, real).
-    let phase_wrapped: Vec<f64> = re.iter().zip(im.iter()).map(|(r, i)| i.atan2(*r)).collect();
+    let (real_part, imag_part) = hilbert(&filt);
+    // Phase of the analytic signal filt + i*H{filt}: atan2(imag, real), in
+    // [-π, π]. This is numpy's angle(analytic).
+    let mut phase_wrapped: Vec<f64> = Vec::with_capacity(real_part.len());
+    for (real, imag) in real_part.iter().zip(imag_part.iter()) {
+        phase_wrapped.push(imag.atan2(*real));
+    }
     let phase_unwrapped = unwrap(&phase_wrapped, std::f64::consts::PI);
 
     // NaN mask at excluded samples (applied to both filtdata_out and phase).
@@ -73,11 +78,16 @@ pub fn so_phase_from_eeg(
     }
 
     let so_phase_stages: Vec<f64> = if !stage_times.is_empty() && !stage_vals.is_empty() {
-        interp_previous(stage_times, stage_vals, eeg_times, f64::NAN)
-            .into_iter()
-            .map(|v| if v.is_nan() { 0.0 } else { v })
-            .collect()
+        let mut stages = interp_previous(stage_times, stage_vals, eeg_times, f64::NAN);
+        // Samples outside the staging range come back NaN. Report them as stage 0.
+        for stage in stages.iter_mut() {
+            if stage.is_nan() {
+                *stage = 0.0;
+            }
+        }
+        stages
     } else {
+        // No staging supplied: treat every sample as stage 1.
         vec![1.0; eeg.len()]
     };
 
@@ -94,7 +104,7 @@ mod tests {
     use super::*;
     use std::f64::consts::PI;
 
-    /// Tiny synthetic test — drive a single sine oscillation at a frequency
+    /// Tiny synthetic test. Drive a single sine oscillation at a frequency
     /// inside the band, confirm unwrapped phase increases roughly linearly.
     #[test]
     fn pure_sine_gives_linear_phase() {
@@ -108,7 +118,7 @@ mod tests {
         let isexcluded = vec![false; n];
 
         // Use the filter cache (this will fall back to cheby1 if the SO band
-        // elliptic isn't on disk in this test env — OK, we're testing the
+        // elliptic isn't on disk in this test env. OK, we're testing the
         // pipeline shape, not the filter coefficients).
         let sos = crate::filter_cache::get_sophase_sos(fs, (0.3, 1.5))
             .expect("cache or cheby1 fallback should succeed");
@@ -125,14 +135,14 @@ mod tests {
         assert_eq!(out.so_phase_unwrapped.len(), n);
         assert_eq!(out.filtdata.len(), n);
         // Sine at 1 Hz → phase increases by 2π/s → unwrapped phase slope ~2π
-        // (sign depends on hilbert convention; check absolute slope).
+        // (sign depends on hilbert convention. Check absolute slope).
         // Skip the edges where sosfiltfilt is ramping up.
         let mid = n / 2;
         let dphi = out.so_phase_unwrapped[mid + 100] - out.so_phase_unwrapped[mid];
         let dt = eeg_times[mid + 100] - eeg_times[mid];
         let rad_per_s = dphi / dt;
         // 1 Hz ⇒ 2π rad/s. With the cheby1 fallback SOS the slope is
-        // within ~0.2 rad/s of the ideal; the MATLAB elliptic SOS is
+        // within ~0.2 rad/s of the ideal. The MATLAB elliptic SOS is
         // closer to ideal. Tolerance excludes any adjacent integer Hz.
         assert!(
             (rad_per_s.abs() - 2.0 * PI).abs() < 0.3,

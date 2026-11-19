@@ -12,7 +12,7 @@
  * new `#define`s may appear, but existing signatures, struct layouts,
  * and enum values never change under the same value. Bump this on any
  * breaking change. Numeric-semantics changes that keep the ABI stable
- * (e.g. the 0.2.0 width reparameterization) do NOT bump this — they
+ * (e.g. a width reparameterization) do NOT bump this. They
  * bump the crate semver, which callers observe via [`dynamo_version`].
  */
 #define DYNAMO_C_ABI_VERSION 1
@@ -20,8 +20,8 @@
 /**
  * Stats-CSV schema version written by this crate (OUTPUT_FORMAT.md §8.2):
  * format 3 = the 14-column layout below plus the `#` provenance preamble.
- * Format 2 was the same columns bare; format 1 was the 16-column layout
- * with the redundant `bbox_width_s`/`bbox_height_Hz`.
+ * Format 2 is the same columns with no preamble. Format 1 is the
+ * 16-column layout that also carries `bbox_width_s`/`bbox_height_Hz`.
  */
 #define STATS_CSV_FORMAT 3
 
@@ -41,7 +41,8 @@
  *      (MATLAB `segmentData.m` semantics: floor + ceil).
  *   2. For each segment in parallel: stride-downsample by
  *      (`downsample_f`, `downsample_t`), watershed(-spect), merge,
- *      expand_labels(distance=5), resize labels up, trim, regionprops.
+ *      border fill (see `expand_labels_distance`), resize labels up, trim,
+ *      regionprops.
  *   3. Concatenate per-segment peaks.
  *   4. Apply filterStatsTable: keep peaks where
  *        dur_min < Duration < dur_max,
@@ -49,13 +50,13 @@
  *        freq_min < PeakFrequency < freq_max,
  *        pow2db(Height) > ht_db_min.
  *
- * Parameter defaults when 0.0 is passed:
- *   * `seg_time` → 30.0
- *   * `downsample_f` / `downsample_t` → 1
- *   * `max_merges` → +∞ if 0
- *   * `freq_max` → +∞ if 0
- *   * `dur_max`, `bw_max`, `ht_db_min` → no-op if you want everything
- *     through, pass +∞ / +∞ / -∞ respectively.
+ * Sentinel values that select a default:
+ *   * `seg_time` <= 0 → 30.0 s
+ *   * `downsample_f` / `downsample_t` = 0 → 1 (no downsampling)
+ *   * `max_merges` = 0 → +∞
+ *   * `freq_max` = 0 → +∞
+ * `dur_max`, `bw_max` and `ht_db_min` have no sentinel. Pass +∞, +∞ and
+ * -∞ respectively to disable those cuts.
  */
 typedef struct ExtractTfpeaksIn {
   const double *spect_ptr;
@@ -79,9 +80,10 @@ typedef struct ExtractTfpeaksIn {
   double freq_max;
   double ht_db_min;
   /**
-   * Distance for expand_labels(). 0 = skip (MATLAB-native; labels
-   * keep 0 on watershed lines). 5 = pydynamo default (skimage-style
-   * fill so regions touch directly).
+   * Border-fill mode applied after the merge. 0 = MATLAB paint in label
+   * order (8-connected 1-pixel dilation, higher labels overwrite lower),
+   * matching extractTFPeaks.m. N > 0 = skimage-style expand_labels
+   * (breadth-first fill out to N pixels, lower label wins ties).
    */
   uint32_t expand_labels_distance;
   /**
@@ -97,7 +99,7 @@ typedef struct ExtractTfpeaksIn {
 /**
  * Output descriptor for [`dynamo_extract_tfpeaks`].
  *
- * All `*mut` pointers are callee-allocated; caller must free each with the
+ * All `*mut` pointers are callee-allocated. The caller must free each with the
  * matching `dynamo_free_buffer_*` call. `bounding_box` is `n_peaks × 4`
  * row-major `[t_tl, f_tl, width_s, height_Hz]` per peak (pydynamo format).
  *
@@ -115,7 +117,7 @@ typedef struct ExtractTfpeaksIn {
  *     are the spectrogram values inside peak i (one per pixel).
  *   * `boundaries_xy[2*boundary_offsets[i] .. 2*boundary_offsets[i+1]]`
  *     are interleaved (time, freq) pairs along peak i's perimeter.
- * Both offset arrays have length `n_peaks + 1` (always; even when n_peaks
+ * Both offset arrays have length `n_peaks + 1` (always, even when n_peaks
  * is 0 the array is `[0]`).
  */
 typedef struct ExtractTfpeaksOut {
@@ -141,7 +143,7 @@ typedef struct ExtractTfpeaksOut {
    */
   double *peakiness;
   /**
-   * Flattened per-peak pixel values; length `n_height_data_elems`.
+   * Flattened per-peak pixel values, length `n_height_data_elems`.
    */
   double *height_data;
   uintptr_t n_height_data_elems;
@@ -166,10 +168,10 @@ typedef struct ExtractTfpeaksOut {
  * Input descriptor for [`dynamo_multitaper_spectrogram`].
  *
  * `data_ptr` is a length-`n_data` f64 vector. `tapers_ptr` is the
- * pre-computed DPSS taper bank (caller supplies; we don't reimplement
- * `dpss` in Rust), row-major (n_tapers × winsize) so element (k, i) is
+ * pre-computed DPSS taper bank (caller supplies it, for example from
+ * [`dynamo_dpss`]), row-major (n_tapers × winsize) so element (k, i) is
  * at `tapers_ptr[k * winsize + i]`. Caller MUST guarantee
- * `winsize == round(window_size_s * fs)` — the underlying compute
+ * `winsize == round(window_size_s * fs)`. The underlying compute
  * validates and returns ShapeMismatch otherwise.
  *
  * `eigen_ptr` is required iff `weighting == 1` (Eigen). Pass null
@@ -197,7 +199,7 @@ typedef struct MtsIn {
  * Output descriptor for [`dynamo_multitaper_spectrogram`].
  *
  * `spect_ptr` points to a row-major (n_freqs_out × n_windows) f64 buffer.
- * All three pointers come from `Box::leak` and must be released with
+ * All three pointers are callee-allocated and must be released with
  * `dynamo_free_buffer_f64(ptr, len)` where `len` is the matching
  * `n_freqs_out`, `n_windows`, or `n_freqs_out * n_windows` count.
  */
@@ -226,6 +228,10 @@ typedef struct ArtifactOptsFFI {
   uint32_t zscore_method;
 } ArtifactOptsFFI;
 
+/**
+ * Input descriptor for [`dynamo_so_power`]. `spect_ptr` is a row-major
+ * (n_freqs, n_times) SO-band spectrogram.
+ */
 typedef struct SoPowerIn {
   const double *spect_ptr;
   uintptr_t n_freqs;
@@ -243,13 +249,19 @@ typedef struct SoPowerIn {
   double outlier_threshold;
   uint8_t retain_fs;
   /**
-   * Null-terminated ASCII norm method spec: e.g. "p2shift1234",
-   * "percent", "none". Same parser as `NormMethod::parse`.
+   * ASCII norm method spec, e.g. "p2shift1234", "percent", "none".
+   * Exactly `norm_method_len` bytes are read, so no NUL terminator is
+   * needed and none should be counted in the length. Parsed by
+   * `NormMethod::parse`.
    */
   const uint8_t *norm_method_ptr;
   uintptr_t norm_method_len;
 } SoPowerIn;
 
+/**
+ * Output descriptor for [`dynamo_so_power`]. The three arrays are
+ * callee-allocated with length `n_out`.
+ */
 typedef struct SoPowerOut {
   double *so_power_norm_ptr;
   double *so_power_times_ptr;
@@ -266,6 +278,9 @@ typedef struct SoPowerOut {
   double ptile_value[2];
 } SoPowerOut;
 
+/**
+ * Input descriptor for [`dynamo_so_phase`].
+ */
 typedef struct SoPhaseIn {
   const double *eeg_ptr;
   const double *eeg_times_ptr;
@@ -282,6 +297,10 @@ typedef struct SoPhaseIn {
   uintptr_t n_stages;
 } SoPhaseIn;
 
+/**
+ * Output descriptor for [`dynamo_so_phase`]. All four arrays are
+ * callee-allocated with length `n_out`.
+ */
 typedef struct SoPhaseOut {
   double *so_phase_ptr;
   double *so_phase_times_ptr;
@@ -314,6 +333,9 @@ typedef struct SplineBasisIn {
   uint32_t boundary_multiplicity;
 } SplineBasisIn;
 
+/**
+ * Output descriptor for [`dynamo_spline_basis_fit`].
+ */
 typedef struct SplineBasisOut {
   /**
    * `(m_y, m_x)` row-major. Matches MATLAB `squeeze(spline_obj.coefs)'`.
@@ -340,8 +362,8 @@ typedef struct SplineBasisOut {
  *
  * SOPH is `(n_y, n_x)` row-major where `n_y = freq_bins.len()` and
  * `n_x = feat_bins.len()`. This matches the canonical MATLAB SOPH
- * `(n_freqs, n_features)` column-major byte-for-byte — pass `mxGetPr`
- * directly without copying.
+ * `(n_freqs, n_features)` column-major byte-for-byte, so `mxGetPr` can be
+ * passed directly without copying.
  *
  * Initial/lower/upper are `(n_modes, 6)` row-major:
  *   * power: `[amp, fmean, fstd, pmean,    pstd,      theta]`
@@ -350,34 +372,29 @@ typedef struct SplineBasisOut {
  *
  * `bg_initial`, `bg_lower`, `bg_upper` are 3-vectors `[xxx, yyy, zzz]`.
  *
- * # Width convention changed in 0.2.0 — the ABI did not
+ * # Width convention
  *
- * The Gaussian widths are now genuine standard deviations. Both kernels
- * carry an explicit factor of one half in the exponent:
+ * The Gaussian widths are standard deviations. Both kernels carry an
+ * explicit factor of one half in the exponent:
  *
  * ```text
  *   power: amp * exp(-0.5*(u/fstd)^2 - 0.5*(v/pstd)^2)
  *   phase: amp * exp(-0.5*(dy/fstd)^2) * exp(k*(cos(dx) - 1)), k = 1/recikappa^2
  * ```
  *
- * Before 0.2.0 the half was absent, so `fstd` and `pstd` were `sqrt(2)`
- * times the standard deviation they were named after (and before that,
- * the phase `fstd` divided unsquared, which made it variance-like). The
- * struct layout, the field types and the function signatures are all
- * unchanged, so a stale caller still links and still runs — it just
- * describes a window `sqrt(2)` too wide and reads back numbers on the
- * old scale. Rebuild every MEX/loadlibrary caller, and do not pool
- * widths emitted across the change.
+ * Widths written by kernel versions below 0.2.0 are `sqrt(2)` times
+ * larger than these standard deviations, although the struct layout, the
+ * field types and the function signatures are identical. Values cross
+ * this ABI unchanged, so divide stored widths from those versions by
+ * `sqrt(2)` before reusing them as a modeled surface or bound window, and
+ * do not pool widths across the two conventions. Seeds and priors already
+ * expressed as standard deviations keep their numeric values.
  *
- * Values cross this ABI unchanged. Divide stored pre-0.2.0 Gaussian widths
- * by `sqrt(2)` only when preserving an old modeled surface or bound window;
- * fresh seeds and priors already expressed as standard deviations keep their
- * numeric values.
- *
- * Column 4 is polymorphic and must NOT be migrated by index: a stored
- * pre-0.2.0 `pstd` for `dynamo_rotgauss_fit` rescales by `1/sqrt(2)`, while
- * `recikappa` for `dynamo_vmgauss_fit` is unchanged — the von Mises factor
- * is its own small-angle Gaussian and already carries the half.
+ * Column 4 must NOT be converted by index. A stored `pstd` from a version
+ * below 0.2.0 for `dynamo_rotgauss_fit` rescales by `1/sqrt(2)`, while
+ * `recikappa` for `dynamo_vmgauss_fit` needs no conversion, because the
+ * von Mises factor is its own small-angle Gaussian and already carries
+ * the half.
  */
 typedef struct ParamFitIn {
   const double *soph_ptr;
@@ -400,6 +417,9 @@ typedef struct ParamFitIn {
   uint32_t unit_row;
 } ParamFitIn;
 
+/**
+ * Output descriptor for [`dynamo_rotgauss_fit`] and [`dynamo_vmgauss_fit`].
+ */
 typedef struct ParamFitOutFFI {
   /**
    * Final parameters, `(n_modes, 6)` row-major. Allocated, length `n_modes * 6`.
@@ -442,12 +462,13 @@ uint32_t dynamo_c_abi_version(void);
  * DYNAM-O provenance grammar `<semver>+<sha12>[.dirty]` (or
  * `<semver>+unknown`). This is the `kernel_version` every consumer
  * (MEX bridge, PyO3, app/CLI) should record next to its outputs. The
- * pointer is `'static` — callers must NOT free it.
+ * pointer is `'static`. Callers must NOT free it.
  */
 const char *dynamo_version(void);
 
 /**
- * Run the full tf-peak extraction pipeline on a single segment spectrogram.
+ * Run the full TF-peak extraction pipeline on a whole spectrogram, which is
+ * split internally into `seg_time`-second segments.
  *
  * # Safety
  * `in_` must point to a valid `ExtractTfpeaksIn`. `out` must point to a
@@ -461,12 +482,16 @@ int dynamo_extract_tfpeaks(const struct ExtractTfpeaksIn *in_, struct ExtractTfp
  *
  * Inputs:
  *   * `peak_time`, `peak_freq`, `bbox` (n × 4, [f_lo, f_hi, t_lo, t_hi]), `n`.
- *   * `data`, `n_data`, `fs` — raw 1-D signal + sampling rate.
+ *   * `data`, `n_data`, `fs`: raw 1-D signal and sampling rate.
  *   * `freq_lo`, `freq_hi`, `window_size` (s), `dsfreqs` (Hz).
  *
  * Caller provides preallocated output buffers:
- *   * `out_peak_freq[i]` — refined frequency (NaN if removed).
- *   * `out_keep[i]` — 1 if peak passed edge filter, 0 otherwise.
+ *   * `out_peak_freq[i]`: refined frequency. Peaks within `window_size/2`
+ *     of either end of `data` keep their input `peak_freq[i]`. NaN when
+ *     the refined maximum sits on the edge of the peak's frequency band.
+ *   * `out_keep[i]`: 1 for a peak near either end of `data` (it keeps its
+ *     input frequency). For every other peak, 1 when the refined frequency
+ *     is finite and 0 when it is NaN.
  *
  * # Safety
  * All pointers must be valid for at least `n` elements (`n_data` for `data`),
@@ -493,11 +518,13 @@ int dynamo_refine_peaks(const double *peak_time,
  * row-major: `[0 * nbins + i]` is the low edge of bin i, `[1 * nbins + i]`
  * is the high edge.
  *
- * Caller-provided output buffers (must all be non-null):
- *   * `out_c_mat`          — `num_cbins * num_fbins` row-major.
- *   * `out_time_in_bin`    — `num_cbins * 5` row-major (minutes).
- *   * `out_prop_in_bin`    — `num_cbins * 5` row-major.
- *   * `out_peak_at_freq`   — `num_fbins`.
+ * Caller-provided output buffers (must all be non-null). The 2-D outputs
+ * are written column-major (MATLAB layout):
+ *   * `out_c_mat`: `(num_cbins, num_fbins)`, element (c, f) at
+ *     `f * num_cbins + c`.
+ *   * `out_time_in_bin`: `(num_cbins, 5)` column-major (minutes).
+ *   * `out_prop_in_bin`: `(num_cbins, 5)` column-major.
+ *   * `out_peak_at_freq`: `num_fbins`.
  *
  * # Safety
  * All pointers must be valid for the lengths derived from `n_times`,
@@ -533,12 +560,16 @@ int dynamo_tfpeak_histogram(const double *c_metric,
  * Thin FFI wrapper over [`crate::mask::mask_spectrogram`].
  *
  * All 2-D arrays are row-major: `spect_2s[f * n_times_2 + t]`, etc.
- * `labels_1s` is (n_freqs, n_times_1) int64; `spect_2s` and `out_masked`
+ * `labels_1s` is (n_freqs, n_times_1) int64. `spect_2s` and `out_masked`
  * are both (n_freqs, n_times_2) float64.
  *
  * Caller allocates `out_masked` of size `n_freqs * n_times_2`.
  *
  * Returns 0 on success, negative on error.
+ *
+ * # Safety
+ * All pointers must be valid for the lengths derived from `n_freqs`,
+ * `n_times_1`, `n_times_2`. `out_masked` must be writable.
  */
 int dynamo_mask_spectrogram(const double *spect_2s,
                             const double *stimes_2s,
@@ -553,7 +584,7 @@ int dynamo_mask_spectrogram(const double *spect_2s,
  * Compute a multitaper spectrogram via the `multitaper_rs` crate.
  *
  * Wraps `multitaper_rs::compute_spectrogram` with a C ABI matching the
- * shape of the other dynamo_rs ABI entries. f64 throughout — the MATLAB
+ * shape of the other dynamo_rs ABI entries. f64 throughout. The MATLAB
  * Coder MEX uses f32, so callers swapping over should expect f32-roundoff
  * (~1e-7 relative) drift in output.
  *
@@ -568,9 +599,9 @@ int dynamo_multitaper_spectrogram(const struct MtsIn *in_, struct MtsOut *out);
  * Generate K DPSS tapers of length N with time-half-bandwidth NW.
  *
  * Caller-allocated outputs:
- *   `tapers_out`  — row-major (K, N) double, total K*N elements.
+ *   `tapers_out`: row-major (K, N) double, total K*N elements.
  *                   Row k is the k-th Slepian sequence, unit L²-norm.
- *   `ratios_out`  — length-K double, concentration ratios in (0, 1].
+ *   `ratios_out`: length-K double, concentration ratios in (0, 1].
  *
  * Matches MATLAB R2025a `dpss(N, NW, K)` and
  * `scipy.signal.windows.dpss(N, NW, K, return_ratios=True)` after the
@@ -586,18 +617,17 @@ int dynamo_dpss(uintptr_t n, double nw, uintptr_t k, double *tapers_out, double 
 
 /**
  * Band-detection artifact mask. **Does NOT include the slope-test
- * branch** — that needs the multitaper spectrogram and is left to the
+ * branch**. That needs the multitaper spectrogram and is left to the
  * caller (the MATLAB `detect_artifacts.m` ORs the slope mask in
  * separately). The Rust path here matches `detect_artifacts.m` with
  * `'slope_test', false` to within ≤30 samples on the synthetic-EEG
- * fixture battery; validated end-to-end in the upstream
- * `preraulab/artifact_detection` PR #1 and now MEX-bridged here.
+ * fixture battery.
  *
  * Caller-allocated output `mask_out` is length `n`; 1 = artifact.
  *
  * # Safety
- * `data` must point to `n` readable f64s; `opts` must point to a valid
- * `ArtifactOptsFFI`; `mask_out` must point to `n` writable u8s.
+ * `data` must point to `n` readable f64s, `opts` must point to a valid
+ * `ArtifactOptsFFI`, and `mask_out` must point to `n` writable u8s.
  */
 int dynamo_detect_artifacts(const double *data,
                             uintptr_t n,
@@ -609,17 +639,17 @@ int dynamo_detect_artifacts(const double *data,
  * Compute the per-frequency baseline used in TFpeak extraction.
  *
  * Inputs (all row-major):
- *   `spect`           — shape (n_freqs, n_times) double; baseline is the
+ *   `spect`: shape (n_freqs, n_times) double. The baseline is the
  *                       `baseline_ptile`-th percentile over the valid
  *                       columns of each row (zeros treated as NaN).
- *   `stimes`          — length n_times; window-center times.
- *   `t_data`          — length n_data; the EEG time grid that the
+ *   `stimes`: length n_times, window-center times.
+ *   `t_data`: length n_data, the EEG time grid that the
  *                       `baseline_exclude` mask is defined on.
- *   `baseline_exclude` — length n_data u8 (1 = exclude); nearest-neighbor
+ *   `baseline_exclude`: length n_data u8 (1 = exclude), nearest-neighbor
  *                       interpolated onto `stimes` columns.
- *   `baseline_range_lo` / `baseline_range_hi` — time-range trimming
+ *   `baseline_range_lo` / `baseline_range_hi`: time-range trimming
  *                       applied to `stimes`.
- *   `baseline_ptile`  — percentile in [0, 100] (Hyndman-Fan #5, matching
+ *   `baseline_ptile`: percentile in [0, 100] (Hyndman-Fan #5, matching
  *                       MATLAB `prctile(..., baseline_ptile, 2)`).
  *
  * Caller-allocated output `baseline_out` is length `n_freqs`.
@@ -643,9 +673,9 @@ int dynamo_compute_baseline(const double *spect,
 /**
  * Compute the SO-power time series and stage / outlier-masked
  * normalization. Mirrors `crate::so_power::so_power_from_spectrogram`
- * (and pydynamo `compute_so_power`); MATLAB analog is `computeSOpower.m`.
+ * (and pydynamo `compute_so_power`). The MATLAB analog is `computeSOpower.m`.
  *
- * Output pointers are `Box::leak`-allocated; caller frees with
+ * Output pointers are callee-allocated. Caller frees with
  * `dynamo_free_buffer_f64(ptr, n_out)` for each of the three arrays.
  *
  * # Safety
@@ -657,9 +687,9 @@ int dynamo_so_power(const struct SoPowerIn *in_, struct SoPowerOut *out);
 /**
  * Compute unwrapped SO-phase from raw EEG via SOS bandpass + Hilbert +
  * atan2 + unwrap + NaN-at-excluded + stage interp. Mirrors pydynamo
- * `compute_so_phase`; MATLAB analog is `computeSOphase.m`.
+ * `compute_so_phase`. The MATLAB analog is `computeSOphase.m`.
  *
- * All four output arrays are length `n_data` and `Box::leak`-allocated.
+ * All four output arrays are length `n_data` and callee-allocated.
  * Caller frees with `dynamo_free_buffer_f64(ptr, n_data)` each.
  *
  * `sos_ptr` must point to `n_sections * 6` f64s in scipy layout
@@ -671,11 +701,12 @@ int dynamo_so_power(const struct SoPowerIn *in_, struct SoPowerOut *out);
 int dynamo_so_phase(const struct SoPhaseIn *in_, struct SoPhaseOut *out);
 
 /**
- * Free a buffer previously returned via one of the callee-allocated output
- * pointers of `ExtractTfpeaksOut`.
+ * Free an f64 buffer returned through any callee-allocated output
+ * pointer in this module (`ExtractTfpeaksOut`, `MtsOut`, `SoPowerOut`,
+ * `SoPhaseOut`, `SplineBasisOut`, `ParamFitOutFFI`).
  *
- * `len` MUST match the original allocation length (the matching `n_peaks`
- * or `n_label_elems` field for array-of-peaks or array-of-labels buffers).
+ * `len` MUST equal the element count of the original allocation, as
+ * documented on the struct field that returned the pointer.
  *
  * # Safety
  * See [`drop_leaked_f64`].
@@ -704,7 +735,7 @@ void dynamo_free_buffer_u64(uint64_t *ptr, uintptr_t len);
  * Parity-tested against MATLAB `spap2` to f64 round-off (see
  * `tests/spline_basis_parity.rs`).
  *
- * All four output arrays are `Box::leak`-allocated. Caller frees with
+ * All four output arrays are callee-allocated. Caller frees with
  * `dynamo_free_buffer_f64`:
  *   * `coefs_ptr`       length `m_y * m_x`
  *   * `splinefit_ptr`   length `n_x * n_y`
@@ -719,7 +750,7 @@ int dynamo_spline_basis_fit(const struct SplineBasisIn *in_, struct SplineBasisO
 /**
  * Fit a rotated-Gaussian-mixture model + linear background plane to a SOPH
  * histogram. Mirrors MATLAB `fit_rotGauss` (without `prepareSurfaceData`'s
- * NaN drop — caller must hand us a finite-valued grid).
+ * NaN drop. The caller must pass a finite-valued grid).
  *
  * # Safety
  * All pointers must back the declared lengths.

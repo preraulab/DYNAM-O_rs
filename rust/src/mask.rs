@@ -4,7 +4,7 @@
 //!
 //! 1. For each pass-2 time column, find the nearest pass-1 column and
 //!    look up its label vector.
-//! 2. Keep spect2[f,t] wherever the pass-1 label is > 0; zero elsewhere.
+//! 2. Keep spect2[f,t] wherever the pass-1 label is > 0, and zero elsewhere.
 //! 3. Zero each region's contour, MATLAB's `spect_masked(border_inds) = 0`.
 //!    `border_inds` are the `trimmed_borders` of `trimWshedRegions.m`:
 //!    the 8-connected outer boundary that `bwtraceboundary` walks from the
@@ -14,33 +14,8 @@
 use ndarray::{Array2, ArrayView1, ArrayView2};
 use std::collections::HashMap;
 
+use crate::baseline::nearest_indices;
 use crate::extract_pipeline::moore_trace;
-
-/// Nearest-neighbor mapping: for each stimes_2s value, the index into
-/// stimes_1s of the closest entry. Ties broken toward the right (matches
-/// pydynamo `use_left = abs(left) < abs(right)` strict-less).
-fn nearest_indices(stimes_2s: ArrayView1<f64>, stimes_1s: ArrayView1<f64>) -> Vec<usize> {
-    let n = stimes_1s.len();
-    let mut out = Vec::with_capacity(stimes_2s.len());
-    for &s in stimes_2s.iter() {
-        let mut lo = 0usize;
-        let mut hi = n;
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if stimes_1s[mid] < s {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        let right = lo.min(n - 1);
-        let left = if lo == 0 { 0 } else { lo - 1 };
-        let d_right = (stimes_1s[right] - s).abs();
-        let d_left = (stimes_1s[left] - s).abs();
-        out.push(if d_left < d_right { left } else { right });
-    }
-    out
-}
 
 /// Contour pixels of every labeled region, on the label image's own grid.
 ///
@@ -73,7 +48,12 @@ fn region_contour_mask(labels: ArrayView2<i64>) -> Array2<bool> {
     on_contour
 }
 
-/// Build the pass-2 masked spectrogram.
+/// Build the pass-2 masked spectrogram (see module doc).
+///
+/// `spect_2s` (F, T2) with column times `stimes_2s` is the pass-2
+/// spectrogram. `labels_1s` (F, T1) with column times `stimes_1s` is the
+/// pass-1 region label image (0 = no region). Returns an (F, T2) array
+/// that is zero outside regions and on region contours.
 pub fn mask_spectrogram(
     spect_2s: ArrayView2<f64>,
     stimes_2s: ArrayView1<f64>,
@@ -103,7 +83,8 @@ pub fn mask_spectrogram(
         ));
     }
 
-    // Map each pass-2 column to the nearest pass-1 column.
+    // Map each pass-2 column to the nearest pass-1 column. A pass-2 time
+    // exactly halfway between two pass-1 times takes the later column.
     let nearest = nearest_indices(stimes_2s, stimes_1s);
 
     // Region contours are traced on the pass-1 grid, where the regions
@@ -115,10 +96,10 @@ pub fn mask_spectrogram(
     // not on that region's contour.
     let mut masked = Array2::<f64>::zeros((f_count, t_count_2));
     for t in 0..t_count_2 {
-        let src = nearest[t];
+        let pass1_col = nearest[t];
         for f in 0..f_count {
-            let in_region = labels_1s[[f, src]] > 0;
-            if in_region && !on_contour_1s[[f, src]] {
+            let in_region = labels_1s[[f, pass1_col]] > 0;
+            if in_region && !on_contour_1s[[f, pass1_col]] {
                 masked[[f, t]] = spect_2s[[f, t]];
             }
         }
@@ -135,7 +116,7 @@ mod tests {
     #[test]
     fn mask_interior_keeps_strict_interior() {
         // 3x3 region of label 1 surrounded by 0.
-        // Inner perimeter = the 8 outer pixels of the 3x3; only center
+        // Inner perimeter = the 8 outer pixels of the 3x3. Only the center
         // survives.
         let labels = array![
             [0i64, 0, 0, 0, 0],
@@ -155,11 +136,15 @@ mod tests {
         let masked = mask_spectrogram(spect.view(), stimes.view(), labels.view(), stimes.view())
             .unwrap();
         // Only the center pixel (2,2) should be non-zero.
-        let nz: Vec<(usize, usize)> = (0..masked.nrows())
-            .flat_map(|r| (0..masked.ncols()).map(move |c| (r, c)))
-            .filter(|&(r, c)| masked[[r, c]] != 0.0)
-            .collect();
-        assert_eq!(nz, vec![(2, 2)]);
+        let mut kept: Vec<(usize, usize)> = Vec::new();
+        for r in 0..masked.nrows() {
+            for c in 0..masked.ncols() {
+                if masked[[r, c]] != 0.0 {
+                    kept.push((r, c));
+                }
+            }
+        }
+        assert_eq!(kept, vec![(2, 2)]);
         assert_eq!(masked[[2, 2]], 13.0);
     }
 
@@ -219,7 +204,7 @@ mod tests {
 
     #[test]
     fn nearest_mapping_different_stimes() {
-        // 2×2 label at time 1; pass-2 stimes land at 0.5 and 1.5 (tie → right)
+        // 2×2 label at time 1. Pass-2 stimes land at 0.5 and 1.5 (tie → right).
         let labels = array![[1i64, 2], [1, 2]];
         let stimes_1s = array![1.0, 2.0];
         let spect_2s = array![[10.0f64, 20.0, 30.0], [40.0, 50.0, 60.0]];

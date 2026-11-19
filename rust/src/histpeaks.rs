@@ -21,7 +21,7 @@
 //! SOPH is a single small array). We therefore reuse the same building
 //! blocks:
 //!   * `matlab_watershed::matlab_watershed_2d`: step 1
-//!   * `merge::run`: step 3 (via the adjacency graph it builds internally)
+//!   * `merge::run_all_px`: step 3 (via the adjacency graph it builds internally)
 //!   * `trim::trim_all_regions`: step 5
 //!
 //! Axis convention. MATLAB calls `extracthistpeaks(SOPH, x, y)` with
@@ -102,51 +102,60 @@ pub struct HistPeak {
 /// Separable 2-D Gaussian blur (`sigma` in bins, non-finite → 0). Filter
 /// radius `ceil(2σ)` matches MATLAB `imgaussfilt`'s default FilterSize.
 pub fn gaussian_blur(hist: ArrayView2<f64>, sigma_row: f64, sigma_col: f64) -> Array2<f64> {
+    /// Normalized 1-D Gaussian weights out to `ceil(2σ)` bins on each
+    /// side. `sigma <= 0` gives the identity kernel `[1]`.
     fn kernel(sigma: f64) -> Vec<f64> {
         if sigma <= 0.0 {
             return vec![1.0];
         }
-        let r = (2.0 * sigma).ceil() as isize;
-        let mut k: Vec<f64> = (-r..=r)
-            .map(|i| (-(i as f64).powi(2) / (2.0 * sigma * sigma)).exp())
-            .collect();
-        let s: f64 = k.iter().sum();
-        for v in &mut k {
-            *v /= s;
+        let radius = (2.0 * sigma).ceil() as isize;
+        let mut weights: Vec<f64> = Vec::new();
+        for offset in -radius..=radius {
+            weights.push((-(offset as f64).powi(2) / (2.0 * sigma * sigma)).exp());
         }
-        k
+        let weight_sum: f64 = weights.iter().sum();
+        for weight in &mut weights {
+            *weight /= weight_sum;
+        }
+        weights
     }
     let (h, w) = hist.dim();
-    let kr = kernel(sigma_row);
-    let kc = kernel(sigma_col);
-    let rr = (kr.len() / 2) as isize;
-    let rc = (kc.len() / 2) as isize;
+    let row_kernel = kernel(sigma_row);
+    let col_kernel = kernel(sigma_col);
+    let row_radius = (row_kernel.len() / 2) as isize;
+    let col_radius = (col_kernel.len() / 2) as isize;
 
     let mut src = Array2::<f64>::zeros((h, w));
     for r in 0..h {
         for c in 0..w {
             let v = hist[[r, c]];
-            src[[r, c]] = if v.is_finite() { v } else { 0.0 };
+            if v.is_finite() {
+                src[[r, c]] = v;
+            } else {
+                src[[r, c]] = 0.0;
+            }
         }
     }
-    let mut mid = Array2::<f64>::zeros((h, w));
+    // Blur along rows first, then along columns.
+    let mut row_blurred = Array2::<f64>::zeros((h, w));
     for r in 0..h {
         for c in 0..w {
             let mut acc = 0.0;
-            for (ki, &kv) in kr.iter().enumerate() {
-                let r2 = (r as isize + ki as isize - rr).clamp(0, h as isize - 1) as usize;
+            for (ki, &kv) in row_kernel.iter().enumerate() {
+                // Clamping the index repeats the edge value (replicate padding).
+                let r2 = (r as isize + ki as isize - row_radius).clamp(0, h as isize - 1) as usize;
                 acc += kv * src[[r2, c]];
             }
-            mid[[r, c]] = acc;
+            row_blurred[[r, c]] = acc;
         }
     }
     let mut out = Array2::<f64>::zeros((h, w));
     for r in 0..h {
         for c in 0..w {
             let mut acc = 0.0;
-            for (ki, &kv) in kc.iter().enumerate() {
-                let c2 = (c as isize + ki as isize - rc).clamp(0, w as isize - 1) as usize;
-                acc += kv * mid[[r, c2]];
+            for (ki, &kv) in col_kernel.iter().enumerate() {
+                let c2 = (c as isize + ki as isize - col_radius).clamp(0, w as isize - 1) as usize;
+                acc += kv * row_blurred[[r, c2]];
             }
             out[[r, c]] = acc;
         }
@@ -156,13 +165,15 @@ pub fn gaussian_blur(hist: ArrayView2<f64>, sigma_row: f64, sigma_col: f64) -> A
 
 /// Per-region bounding box / intensity accumulator over a label image.
 struct RegionAccum {
+    /// Inclusive bounding box, in pixel indices.
     r_min: usize,
     r_max: usize,
     c_min: usize,
     c_max: usize,
+    /// Smallest non-NaN value.
     min_v: f64,
+    /// Largest non-NaN value.
     max_v: f64,
-    count: usize,
 }
 
 /// Collect, for every non-zero label in `labels`, its inclusive bounding
@@ -188,7 +199,6 @@ fn accumulate_regions(
                 c_max: c,
                 min_v: f64::INFINITY,
                 max_v: f64::NEG_INFINITY,
-                count: 0,
             });
             if r < e.r_min {
                 e.r_min = r;
@@ -210,7 +220,6 @@ fn accumulate_regions(
                     e.max_v = v;
                 }
             }
-            e.count += 1;
         }
     }
     map
@@ -235,32 +244,33 @@ pub fn extract_hist_peaks(
 fn bwlabel_8(mask: &Array2<bool>) -> Array2<i64> {
     let (h, w) = mask.dim();
     let mut labels = Array2::<i64>::zeros((h, w));
-    let mut next: i64 = 1;
+    let mut next_label: i64 = 1;
     let mut stack: Vec<(usize, usize)> = Vec::new();
     for c in 0..w {
         for r in 0..h {
             if !mask[[r, c]] || labels[[r, c]] != 0 {
                 continue;
             }
-            let lab = next;
-            next += 1;
-            labels[[r, c]] = lab;
+            let component_label = next_label;
+            next_label += 1;
+            labels[[r, c]] = component_label;
             stack.clear();
             stack.push((r, c));
-            while let Some((kr, kc)) = stack.pop() {
+            while let Some((row, col)) = stack.pop() {
                 for dr in -1i32..=1 {
                     for dc in -1i32..=1 {
                         if dr == 0 && dc == 0 {
                             continue;
                         }
-                        let nr = kr as i32 + dr;
-                        let nc = kc as i32 + dc;
+                        let nr = row as i32 + dr;
+                        let nc = col as i32 + dc;
                         if nr < 0 || nc < 0 || nr >= h as i32 || nc >= w as i32 {
                             continue;
                         }
-                        let (nr, nc) = (nr as usize, nc as usize);
+                        let nr = nr as usize;
+                        let nc = nc as usize;
                         if mask[[nr, nc]] && labels[[nr, nc]] == 0 {
-                            labels[[nr, nc]] = lab;
+                            labels[[nr, nc]] = component_label;
                             stack.push((nr, nc));
                         }
                     }
@@ -285,6 +295,9 @@ fn bwlabel_8(mask: &Array2<bool>) -> Array2<i64> {
 ///
 /// Pipeline = watershed(`-hist`) → merge → pre-trim dur/bw cut → trim →
 /// final dur/bw/height filter, mirroring `extracthistpeaks.m`.
+///
+/// If the merge or trim step reports an error, the result is empty
+/// (all-zero labels, no peaks).
 pub fn extract_hist_peaks_with_stats(
     hist: ArrayView2<f64>,
     so_bins: &[f64],
@@ -326,10 +339,8 @@ pub fn extract_hist_peaks_with_stats(
 
     // ---- 1) Watershed on the inverted histogram. -------------------------
     // MATLAB `runWatershed` runs `watershed(-data, 8)`: inverting turns
-    // histogram peaks into catchment basins. NaN handling: MATLAB zeroes
-    // NaNs before watershed and zeroes their labels after. We substitute
-    // 0.0 for NaN in the watershed input (label cleanup happens implicitly
-    // because trim/stats skip NaN pixels).
+    // histogram peaks into catchment basins. NaN pixels are set to 0.0 in
+    // the watershed input, as MATLAB zeroes them before the watershed.
     let neg: Array2<f64> = img.mapv(|v| if v.is_nan() { 0.0 } else { -v });
     let ws_u16 = crate::matlab_watershed::matlab_watershed_2d(neg.view());
     // `runWatershed.m`: after `watershed(-data)`, zero the NaN pixels'
@@ -350,7 +361,7 @@ pub fn extract_hist_peaks_with_stats(
     }
 
     // ---- 2 & 3) Build adjacency graph + iterative merge. -----------------
-    // `merge::run` builds the region-adjacency graph internally (the
+    // `merge::run_all_px` builds the region-adjacency graph internally (the
     // `Ldata2graph` step) and runs the max-weight merge loop
     // (`mergeWshedSegment`). We take the `all_px` label image: MATLAB's
     // `extracthistpeaks` carries each region as `regions{}` = `interior ∪
@@ -380,24 +391,24 @@ pub fn extract_hist_peaks_with_stats(
     // axis) fails `bw_min`, BEFORE trimming. Uses `(max-min)*Δ`.
     if params.dur_min > 0.0 || params.bw_min > 0.0 {
         let accum = accumulate_regions(labels.view(), img.view());
-        let mut drop: HashSet<i64> = HashSet::new();
-        let dbg = std::env::var("HISTPEAKS_DEBUG").is_ok();
-        for (lbl, a) in &accum {
-            let so_span = (a.r_max - a.r_min) as f64 * d_row;
-            let freq_span = (a.c_max - a.c_min) as f64 * d_col;
+        let mut labels_to_drop: HashSet<i64> = HashSet::new();
+        let debug_on = std::env::var("HISTPEAKS_DEBUG").is_ok();
+        for (lbl, region) in &accum {
+            let so_span = (region.r_max - region.r_min) as f64 * d_row;
+            let freq_span = (region.c_max - region.c_min) as f64 * d_col;
             let keep = so_span > params.dur_min && freq_span > params.bw_min;
             if !keep {
-                drop.insert(*lbl);
-            } else if dbg {
+                labels_to_drop.insert(*lbl);
+            } else if debug_on {
                 eprintln!(
                     "[cut] keep lbl={} so_span={:.3} freq_span={:.3}",
                     lbl, so_span, freq_span
                 );
             }
         }
-        if !drop.is_empty() {
+        if !labels_to_drop.is_empty() {
             for v in labels.iter_mut() {
-                if drop.contains(v) {
+                if labels_to_drop.contains(v) {
                     *v = 0;
                 }
             }
@@ -451,11 +462,11 @@ pub fn extract_hist_peaks_with_stats(
     // frequency axis = COLUMN span), each as `(max-min+1)*Δ`.
     let accum = accumulate_regions(trimmed.view(), img.view());
     let mut surviving: BTreeSet<i64> = BTreeSet::new();
-    for (lbl, a) in &accum {
-        let duration = (a.r_max - a.r_min + 1) as f64 * d_row;
-        let bandwidth = (a.c_max - a.c_min + 1) as f64 * d_col;
-        let height = if a.max_v.is_finite() && a.min_v.is_finite() {
-            a.max_v - a.min_v
+    for (lbl, region) in &accum {
+        let duration = (region.r_max - region.r_min + 1) as f64 * d_row;
+        let bandwidth = (region.c_max - region.c_min + 1) as f64 * d_col;
+        let height = if region.max_v.is_finite() && region.min_v.is_finite() {
+            region.max_v - region.min_v
         } else {
             0.0
         };
@@ -512,7 +523,7 @@ pub fn extract_hist_peaks_with_stats(
 fn compute_peak_stats(
     labels: ArrayView2<i64>,
     img: ArrayView2<f64>,
-    n: usize,
+    n_regions: usize,
     so_bins: &[f64],
     freq_bins: &[f64],
     d_row: f64,
@@ -534,9 +545,9 @@ fn compute_peak_stats(
         col_max: usize,
         has_pixels: bool,
     }
-    let mut acc: Vec<RegionTotals> = Vec::with_capacity(n);
-    for _ in 0..n {
-        acc.push(RegionTotals {
+    let mut totals: Vec<RegionTotals> = Vec::with_capacity(n_regions);
+    for _ in 0..n_regions {
+        totals.push(RegionTotals {
             sum_v: 0.0,
             sum_rv: 0.0,
             sum_cv: 0.0,
@@ -553,51 +564,52 @@ fn compute_peak_stats(
     for r in 0..h {
         for c in 0..w {
             let lbl = labels[[r, c]];
-            if lbl < 1 || (lbl as usize) > n {
+            if lbl < 1 || (lbl as usize) > n_regions {
                 continue;
             }
             let v = img[[r, c]];
+            // MATLAB `Ldata` excludes NaN pixels.
             if !v.is_finite() {
-                continue; // MATLAB `Ldata` excludes NaN pixels
+                continue;
             }
-            let a = &mut acc[(lbl - 1) as usize];
-            a.has_pixels = true;
-            a.sum_v += v;
-            a.sum_rv += r as f64 * v;
-            a.sum_cv += c as f64 * v;
-            a.min_v = a.min_v.min(v);
-            a.max_v = a.max_v.max(v);
-            a.row_min = a.row_min.min(r);
-            a.row_max = a.row_max.max(r);
-            a.col_min = a.col_min.min(c);
-            a.col_max = a.col_max.max(c);
+            let region = &mut totals[(lbl - 1) as usize];
+            region.has_pixels = true;
+            region.sum_v += v;
+            region.sum_rv += r as f64 * v;
+            region.sum_cv += c as f64 * v;
+            region.min_v = region.min_v.min(v);
+            region.max_v = region.max_v.max(v);
+            region.row_min = region.row_min.min(r);
+            region.row_max = region.row_max.max(r);
+            region.col_min = region.col_min.min(c);
+            region.col_max = region.col_max.max(c);
         }
     }
-    let so0 = so_bins.first().copied().unwrap_or(0.0);
-    let fq0 = freq_bins.first().copied().unwrap_or(0.0);
+    let first_so_bin = so_bins.first().copied().unwrap_or(0.0);
+    let first_freq_bin = freq_bins.first().copied().unwrap_or(0.0);
     let mut peaks: Vec<HistPeak> = Vec::new();
-    for (i, a) in acc.iter().enumerate() {
-        if !a.has_pixels {
+    for (i, region) in totals.iter().enumerate() {
+        if !region.has_pixels {
             continue;
         }
         // Value-weighted centroid. A region whose values sum to zero has no
         // weighted centroid, so it takes the middle of its extent.
         let centroid_row;
         let centroid_col;
-        if a.sum_v.abs() > 0.0 {
-            centroid_row = a.sum_rv / a.sum_v;
-            centroid_col = a.sum_cv / a.sum_v;
+        if region.sum_v.abs() > 0.0 {
+            centroid_row = region.sum_rv / region.sum_v;
+            centroid_col = region.sum_cv / region.sum_v;
         } else {
-            centroid_row = (a.row_min + a.row_max) as f64 / 2.0;
-            centroid_col = (a.col_min + a.col_max) as f64 / 2.0;
+            centroid_row = (region.row_min + region.row_max) as f64 / 2.0;
+            centroid_col = (region.col_min + region.col_max) as f64 / 2.0;
         }
         peaks.push(HistPeak {
             label: i as i64 + 1,
-            height: a.max_v - a.min_v,
-            so_feature: so0 + centroid_row * d_row,
-            peak_freq: fq0 + centroid_col * d_col,
-            duration: (a.row_max - a.row_min + 1) as f64 * d_row,
-            bandwidth: (a.col_max - a.col_min + 1) as f64 * d_col,
+            height: region.max_v - region.min_v,
+            so_feature: first_so_bin + centroid_row * d_row,
+            peak_freq: first_freq_bin + centroid_col * d_col,
+            duration: (region.row_max - region.row_min + 1) as f64 * d_row,
+            bandwidth: (region.col_max - region.col_min + 1) as f64 * d_col,
         });
     }
     peaks
@@ -626,22 +638,22 @@ pub fn extract_hist_peaks_phase(
     params: &HistPeakParams,
     gauss_filt_std: (f64, f64),
 ) -> (Array2<i64>, Vec<HistPeak>) {
-    let (n, cols) = hist.dim();
-    if n < 4 || cols < 2 || phase_bins.len() != n {
-        return (Array2::<i64>::zeros((n, cols)), Vec::new());
+    let (n_phase, cols) = hist.dim();
+    if n_phase < 4 || cols < 2 || phase_bins.len() != n_phase {
+        return (Array2::<i64>::zeros((n_phase, cols)), Vec::new());
     }
     // Triple along the phase (row) axis: [block1 | block2 minus ends | block3].
-    let trip = 3 * n - 2;
-    let mut tripled = Array2::<f64>::zeros((trip, cols));
+    let n_tripled_rows = 3 * n_phase - 2;
+    let mut tripled = Array2::<f64>::zeros((n_tripled_rows, cols));
     for c in 0..cols {
-        for r in 0..n {
+        for r in 0..n_phase {
             tripled[[r, c]] = hist[[r, c]];
         }
-        for r in 1..n - 1 {
-            tripled[[n + r - 1, c]] = hist[[r, c]];
+        for r in 1..n_phase - 1 {
+            tripled[[n_phase + r - 1, c]] = hist[[r, c]];
         }
-        for r in 0..n {
-            tripled[[2 * n - 2 + r, c]] = hist[[r, c]];
+        for r in 0..n_phase {
+            tripled[[2 * n_phase - 2 + r, c]] = hist[[r, c]];
         }
     }
     let tripled = if gauss_filt_std.0 > 0.0 || gauss_filt_std.1 > 0.0 {
@@ -652,19 +664,19 @@ pub fn extract_hist_peaks_phase(
 
     // Real tripled phase axis: [phase-2π, phase(2:end-1), phase+2π].
     let two_pi = std::f64::consts::TAU;
-    let mut trip_phase: Vec<f64> = Vec::with_capacity(trip);
+    let mut trip_phase: Vec<f64> = Vec::with_capacity(n_tripled_rows);
     trip_phase.extend(phase_bins.iter().map(|&p| p - two_pi));
-    trip_phase.extend(phase_bins[1..n - 1].iter().copied());
+    trip_phase.extend(phase_bins[1..n_phase - 1].iter().copied());
     trip_phase.extend(phase_bins.iter().map(|&p| p + two_pi));
 
     let (trip_labels, trip_stats) =
         extract_hist_peaks_with_stats(tripled.view(), &trip_phase, freq_bins, params);
 
     // Central period [-π, π] = tripled rows [n-1 .. 2n-2].
-    let mut central = Array2::<i64>::zeros((n, cols));
-    for r in 0..n {
+    let mut central = Array2::<i64>::zeros((n_phase, cols));
+    for r in 0..n_phase {
         for c in 0..cols {
-            central[[r, c]] = trip_labels[[n - 1 + r, c]];
+            central[[r, c]] = trip_labels[[n_phase - 1 + r, c]];
         }
     }
     let mut uniq: Vec<i64> = central.iter().copied().filter(|&v| v > 0).collect();
@@ -692,20 +704,18 @@ pub fn extract_hist_peaks_phase(
     (central, central_stats)
 }
 
-/// MATLAB's 256-entry `jet` colormap, sampled at `t ∈ [0, 1]`.
-///
-/// `jet` is piecewise-linear in each RGB channel. This evaluates the
-/// standard MATLAB jet ramp directly (the same breakpoints `jet.m` uses),
-/// returning 8-bit RGB. `t` is clamped to `[0, 1]`.
+/// MATLAB's `jet` colormap evaluated at `t ∈ [0, 1]` (clamped), as 8-bit
+/// RGB. `jet` is piecewise linear in each channel, and this evaluates
+/// the ramps directly (the same breakpoints `jet.m` uses) rather than
+/// looking up a 256-entry table.
 fn jet_color(t: f64) -> [u8; 3] {
     let t = t.clamp(0.0, 1.0);
-    // MATLAB jet: each channel is a clamped triangle/trapezoid.
-    //   red   peaks over t ∈ [3/8, 5/8] .. 1
-    //   green peaks over t ∈ [1/8, 3/8] .. [5/8, 7/8]
-    //   blue  peaks over t ∈ 0 .. [3/8, 5/8]
-    // Implemented via the canonical jet interpolant.
+    // Each channel is a trapezoid around its center: 1 within 1/8 of the
+    // center, falling linearly to 0 at 3/8 from it.
+    //   blue  is centered at t = 1/4
+    //   green is centered at t = 1/2
+    //   red   is centered at t = 3/4
     let chan = |t: f64, center: f64| -> f64 {
-        // Triangle of half-width 1/4 centered at `center`, clamped to [0,1].
         (1.5 - (4.0 * (t - center)).abs()).clamp(0.0, 1.0)
     };
     let r = chan(t, 0.75);
@@ -734,12 +744,13 @@ fn shuffled_index(label: i64, n: usize) -> usize {
     (h % (n as u64)) as usize
 }
 
-/// Render a label image to an RGB array, MATLAB-equivalent to
+/// Render a label image to an RGB array in the style of MATLAB
 /// `label2rgb(labels, 'jet', 'k', 'shuffle')`.
 ///
 /// * Background (label 0) → black `[0, 0, 0]` (MATLAB `'k'`).
-/// * Each non-zero label `1..=N` is mapped, via a deterministic shuffle, to
-///   a distinct sample of the `jet` colormap.
+/// * Each non-zero label takes a sample of the `jet` colormap chosen by
+///   `shuffled_index`. The scramble is not MATLAB's, so the colors
+///   differ from MATLAB's and two labels can share a color.
 ///
 /// Output shape is `(rows, cols, 3)`, `u8` per channel.
 ///

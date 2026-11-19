@@ -1,4 +1,4 @@
-//! Wilcoxon signed-rank test — port of MATLAB `signrank`.
+//! Wilcoxon signed-rank test. Port of MATLAB `signrank`.
 //!
 //! The paired counterpart to [`super::ranksum`], and the test `FDR_1D.m`
 //! uses when `paired = true`. Three MATLAB details drive the result and
@@ -12,7 +12,7 @@
 //!     count as tied when `sx[i] + eps[i] >= sx[i+1] - eps[i+1]`. That
 //!     chains transitively, so a run can merge even when its endpoints
 //!     differ by more than either tolerance. Using exact equality
-//!     instead changes both the ranks and the tie adjustment — on a
+//!     instead changes both the ranks and the tie adjustment. On a
 //!     29-pair sample with 6 near-ties it moves p from 0.0489 to 0.0528.
 //!   * **No continuity correction on the two-sided branch.** MATLAB
 //!     applies one in its one-sided branches but not in `tail='both'`.
@@ -28,7 +28,7 @@ const EXACT_MAX_N: usize = 15;
 
 /// Average ranks plus `sum(t^3 - t)` over tolerance-based tie groups.
 ///
-/// `eps_x` is MATLAB's `epsdiff`; pass zeros for exact-equality ties.
+/// `eps_x` is MATLAB's `epsdiff`. Pass zeros for exact-equality ties.
 fn tiedrank_tol(x: &[f64], eps_x: &[f64]) -> (Vec<f64>, f64) {
     let n = x.len();
     let mut order: Vec<usize> = (0..n).collect();
@@ -85,6 +85,9 @@ fn exact_p(w: f64, ranks: &[f64]) -> f64 {
         return f64::NAN;
     }
     let w2 = (w * 2.0).round() as usize;
+    // lower counts the sign assignments with doubled sum <= w2 and upper
+    // those with doubled sum >= w2. The `min` calls keep both slice bounds
+    // inside the table.
     let lower: f64 = counts[..=w2.min(max_sum)].iter().sum();
     let upper: f64 = counts[w2.min(max_sum + 1)..].iter().sum();
     (2.0 * (lower.min(upper) / total)).min(1.0)
@@ -92,26 +95,27 @@ fn exact_p(w: f64, ranks: &[f64]) -> f64 {
 
 /// Two-sided Wilcoxon signed-rank p-value.
 ///
-/// Returns `NaN` when no usable pairs remain — MATLAB errors there ("No
+/// Returns `NaN` when no usable pairs remain. MATLAB errors there ("No
 /// data remaining after removal of NaNs"), which is not a useful outcome
 /// inside a per-bin loop.
 pub fn signrank(x: &[f64], y: &[f64]) -> f64 {
     assert_eq!(x.len(), y.len(), "signrank requires paired samples");
     let mut diff = Vec::with_capacity(x.len());
-    let mut epsd = Vec::with_capacity(x.len());
+    let mut eps_diff = Vec::with_capacity(x.len());
     for (a, b) in x.iter().zip(y.iter()) {
         let d = a - b;
         if !d.is_finite() {
             continue;
         }
-        // MATLAB `epsdiff = eps(x) + eps(y)`; `f64::EPSILON * |v|` is the
-        // spacing at |v| for normal values, which is what eps() returns.
-        let e = ulp(*a) + ulp(*b);
-        if d.abs() <= e {
+        // MATLAB `epsdiff = eps(x) + eps(y)`. `ulp(v)` is the gap from |v|
+        // to the next larger double, which is what eps() returns for a
+        // nonzero finite value.
+        let pair_eps = ulp(*a) + ulp(*b);
+        if d.abs() <= pair_eps {
             continue; // zero difference
         }
         diff.push(d);
-        epsd.push(e);
+        eps_diff.push(pair_eps);
     }
     let n = diff.len();
     if n == 0 {
@@ -119,7 +123,10 @@ pub fn signrank(x: &[f64], y: &[f64]) -> f64 {
     }
 
     let abs_diff: Vec<f64> = diff.iter().map(|d| d.abs()).collect();
-    let (ranks, tie_sum) = tiedrank_tol(&abs_diff, &epsd);
+    let (ranks, tie_sum) = tiedrank_tol(&abs_diff, &eps_diff);
+    // W+: the rank sum of the positive differences. This stays an iterator
+    // sum because its value when no difference is positive (a signed zero)
+    // is part of the current behavior.
     let w: f64 = ranks
         .iter()
         .zip(diff.iter())
@@ -143,7 +150,9 @@ pub fn signrank(x: &[f64], y: &[f64]) -> f64 {
     two_sided_p(z)
 }
 
-/// Spacing at `v` — the MATLAB `eps(v)` of a scalar.
+/// Spacing at `v`: the gap from |v| to the next larger double, which is the
+/// MATLAB `eps(v)` of a nonzero finite scalar. Returns `f64::MIN_POSITIVE`
+/// for zero.
 fn ulp(v: f64) -> f64 {
     let a = v.abs();
     if a == 0.0 {
@@ -161,8 +170,8 @@ mod tests {
     fn drops_nan_and_zero_differences() {
         let x = [1.0, 2.0, 3.0, f64::NAN, 5.0];
         let y = [2.0, 2.0, 5.0, 1.0, 9.0];
-        // pair 1 is a zero difference, pair 3 has a NaN — both dropped,
-        // leaving three usable pairs.
+        // Pair 1 is a zero difference and pair 3 has a NaN. Both are
+        // dropped, leaving three usable pairs.
         let p = signrank(&x, &y);
         assert!(p.is_finite(), "got {}", p);
         let xs = [1.0, 3.0, 5.0];
@@ -181,9 +190,10 @@ mod tests {
     }
 
     #[test]
-    fn switches_to_approximate_above_fifteen_pairs() {
-        // 15 pairs -> exact; 16 -> approximate. The two differ, so a
-        // wrong threshold shows up as a changed p.
+    fn fifteen_pairs_use_the_exact_distribution() {
+        // 15 pairs is the largest sample that takes the exact branch. The
+        // exact and approximate p-values differ, so a lower threshold shows
+        // up as a changed p.
         let x15: Vec<f64> = (0..15).map(|i| i as f64).collect();
         let y15: Vec<f64> = (0..15).map(|i| i as f64 + 0.5).collect();
         let p15 = signrank(&x15, &y15);
@@ -200,14 +210,14 @@ mod tests {
         let x = [0.0, 0.0, 0.0, 0.0];
         let y = [-base, -nudged, -2.0, -3.0];
         let diff: Vec<f64> = x.iter().zip(y.iter()).map(|(a, b)| a - b).collect();
-        let epsd: Vec<f64> = x
+        let eps_diff: Vec<f64> = x
             .iter()
             .zip(y.iter())
             .map(|(a, b)| ulp(*a) + ulp(*b))
             .collect();
         let (ranks, tie_sum) = tiedrank_tol(
             &diff.iter().map(|d| d.abs()).collect::<Vec<_>>(),
-            &epsd,
+            &eps_diff,
         );
         assert_eq!(ranks[0], ranks[1], "near-equal magnitudes must tie");
         assert!(tie_sum > 0.0);

@@ -1,7 +1,7 @@
 //! Standard-normal tail probability, accurate enough to compare against
 //! MATLAB's `normcdf` in the deep tail.
 //!
-//! The obvious shortcut — an Abramowitz & Stegun polynomial for Φ — is
+//! The obvious shortcut, an Abramowitz & Stegun polynomial for Φ, is
 //! accurate to ~7.5e-8 in ABSOLUTE terms, which is fine for a threshold
 //! test at q = 0.1 and useless for anything else: a p-value of 2e-16 comes
 //! back as noise around 1e-8. Since these p-values are compared against
@@ -9,12 +9,13 @@
 //! `erfc` is computed by series below 2 and by continued fraction above it,
 //! both to near machine precision.
 
-/// erf(x) by its Maclaurin series. Converges quickly for |x| <= 2; the
+/// erf(x) by its Maclaurin series. Converges quickly for |x| <= 2. The
 /// term ratio is x²/n, so ~30 terms suffice at the top of that range.
 fn erf_series(x: f64) -> f64 {
     let mut term = x;
     let mut sum = x;
     let x2 = x * x;
+    // 200 is a safety cap. The convergence test below exits long before it.
     for n in 1..200 {
         term *= -x2 / n as f64;
         let add = term / (2 * n + 1) as f64;
@@ -32,12 +33,16 @@ fn erf_series(x: f64) -> f64 {
 ///
 /// evaluated with the modified Lentz algorithm.
 fn erfc_cf(x: f64) -> f64 {
+    // Lentz floor: replaces an exact-zero denominator so the recurrence
+    // never divides by zero.
     const TINY: f64 = 1e-300;
     let mut f = TINY;
     let mut c = f;
     let mut d = 0.0f64;
+    // 300 is a safety cap. The convergence test below exits before it.
     for i in 0..300 {
-        // a₁ = 1, aᵢ = (i-1)/2 for i >= 2; every bᵢ = x.
+        // Partial numerators, by the zero-based loop index i: 1 for i = 0
+        // and i/2 after that. Every partial denominator is x.
         let a = if i == 0 { 1.0 } else { i as f64 / 2.0 };
         d = x + a * d;
         if d.abs() < TINY {
