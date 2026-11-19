@@ -3,8 +3,10 @@
 //! These are the bounds the parametric-basis fits use when the caller does
 //! not set its own. They live here so that every caller (the desktop app,
 //! the command-line tool, and the MATLAB and Python wrappers) reads the same
-//! numbers. MATLAB's `param_basis_opts.m` lists the same values in its
-//! `LB_default` and `UB_default` rows.
+//! numbers. MATLAB's `param_basis_opts.m` returns the same values in its
+//! `LB_default` and `UB_default` rows, and
+//! `tests/paramfit_defaults_matlab_parity.rs` holds the two to each other
+//! through a MATLAB-generated fixture.
 //!
 //! Only the three shape parameters have fixed defaults. The bounds on the
 //! amplitude and on the two centers depend on the histogram being fitted,
