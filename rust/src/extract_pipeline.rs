@@ -196,21 +196,27 @@ fn stride_downsample(arr: ArrayView2<f64>, f_stride: usize, t_stride: usize) -> 
 }
 
 /// Resize a label image to `(out_rows, out_cols)` by nearest neighbor,
-/// matching `skimage.transform.resize(..., order=0, preserve_range=True)`.
-/// Output index `j` along an axis reads input index
-///     round_half_even((j + 0.5) * in_len / out_len - 0.5)
-/// clamped to the input. For an integer upsampling factor this is
-/// `j / factor`.
+/// matching MATLAB `imresize(labels, [out_rows out_cols], 'nearest')` as
+/// extractTFPeaks.m calls it.
+///
+/// For an integer upsampling factor this is `j / factor`. When the output
+/// length is not a multiple of the input length, some output positions fall
+/// exactly halfway between two input positions. `imresize` settles those by
+/// its own floating-point arithmetic, so the expression below is written in
+/// the same order as `imresize`'s and must stay that way.
 fn resize_labels_nn(labels: ArrayView2<i64>, out_rows: usize, out_cols: usize) -> Array2<i64> {
     /// Input index that output index `out_index` reads along one axis.
     fn nearest_source_index(out_index: usize, out_len: usize, in_len: usize) -> usize {
         if out_len == 0 || in_len == 0 {
             return 0;
         }
-        let source_position = (out_index as f64 + 0.5) * (in_len as f64) / (out_len as f64) - 0.5;
-        // numpy-style round half to even, as skimage uses.
-        let source_index = source_position.round_ties_even() as i64;
-        source_index.clamp(0, in_len as i64 - 1) as usize
+        // imresize works in 1-based coordinates.
+        let scale = out_len as f64 / in_len as f64;
+        let out_position = (out_index + 1) as f64;
+        let source_position = out_position / scale + 0.5 * (1.0 - 1.0 / scale);
+        let source_one_based = (source_position + 0.5).floor() as i64;
+        let source_clamped = source_one_based.clamp(1, in_len as i64);
+        (source_clamped - 1) as usize
     }
 
     let (in_rows, in_cols) = labels.dim();
@@ -1125,6 +1131,37 @@ mod tests {
         assert_eq!(out[[0, 3]], 2);
         assert_eq!(out[[3, 0]], 3);
         assert_eq!(out[[3, 3]], 4);
+    }
+
+    /// Source index (1-based, as MATLAB prints it) that each output column
+    /// reads when a single row `1..=in_len` is resized to `out_len` columns.
+    fn resized_row(in_len: usize, out_len: usize) -> Vec<i64> {
+        let row: Vec<i64> = (1..=in_len as i64).collect();
+        let labels = Array2::from_shape_vec((1, in_len), row).unwrap();
+        let out = resize_labels_nn(labels.view(), 1, out_len);
+        out.row(0).to_vec()
+    }
+
+    /// Expected values are the output of MATLAB R2025b
+    /// `imresize(1:in_len, [1 out_len], 'nearest')`.
+    #[test]
+    fn resize_labels_nn_matches_imresize_on_odd_lengths() {
+        assert_eq!(resized_row(4, 7), vec![1, 1, 2, 3, 3, 4, 4]);
+        assert_eq!(resized_row(6, 11), vec![1, 1, 2, 2, 3, 4, 4, 5, 5, 6, 6]);
+
+        // A 30 s segment of the default spectrogram is 571 columns wide and
+        // its 2x downsampled image is 286. Column 286 falls halfway between
+        // input columns 143 and 144, and imresize reads 144.
+        let segment = resized_row(286, 571);
+        assert_eq!(&segment[283..288], &[142, 143, 144, 144, 145]);
+        assert_eq!(segment.iter().sum::<i64>(), 81939);
+
+        // Here the halfway column goes the other way: imresize reads the
+        // lower input column.
+        assert_eq!(resized_row(12, 23)[11], 6);
+        assert_eq!(resized_row(34, 67)[33], 17);
+        assert_eq!(resized_row(40, 79)[39], 20);
+        assert_eq!(resized_row(42, 83)[41], 21);
     }
 
     #[test]
