@@ -33,7 +33,6 @@ serde_json = "1"
 # Pure-Rust matrix algebra for the tensor-product B-spline LSQ (small
 # Cholesky on the Gram matrices). WASM-clean.
 nalgebra = { version = "0.34", default-features = false, features = ["std"] }
-levenberg-marquardt = "0.15"
 
 # Pure-Rust multitaper spectrogram, pinned to a commit of its own repo so
 # this crate builds from any checkout with no sibling folders. To develop
