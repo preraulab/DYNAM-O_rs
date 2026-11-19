@@ -1,4 +1,4 @@
-//! Standalone test that replays the same synthesized SOPH as
+//! Standalone test that synthesizes a two-mode SOPH after the MATLAB script
 //! `validate_rotgauss_fit_mex.m`, runs the Rust fit, and prints diagnostics
 //! independent of MATLAB.
 
@@ -12,32 +12,34 @@ fn two_mode_rotgauss_recovers_synthesized_truth() {
     let x: Vec<f64> = (0..nx).map(|i| -3.9 + (23.1 - (-3.9)) * i as f64 / (nx - 1) as f64).collect();
     let y: Vec<f64> = (0..ny).map(|j| 0.2 * j as f64).collect();
 
-    // The surface is the same one validate_rotgauss_fit_mex.m synthesizes,
-    // but every width literal is divided by sqrt(2) because the kernel is
-    // exp(-0.5*(d/σ)²) rather than the historical exp(-(d/w)²): the σ that
-    // draws a given bump is w/sqrt(2). The synthesis below is written out
-    // by hand rather than calling eval_model, so it is an independent check
-    // of the kernel; the printed "expected truth" therefore has to be in σ
-    // units too, or the test would pass while asserting a falsehood.
+    // The surface is two Gaussian modes plus a linear background and a
+    // small deterministic ripple. The kernel is exp(-0.5*(d/σ)²), and each
+    // width is written as w/sqrt(2), where w is the width in the
+    // exp(-(d/w)²) form that validate_rotgauss_fit_mex.m uses. The synthesis
+    // below is written out by hand rather than calling eval_model, so it is
+    // an independent check of the kernel. The printed "expected truth" is in
+    // σ units, the same units the fit returns.
     const S2: f64 = std::f64::consts::SQRT_2;
     // mode 1: amp=4.5, fmean=12, fstd=2.5/√2, pmean=10, pstd=8/√2
     // mode 2: amp=3.0, fmean=2.5, fstd=1.3/√2, pmean= 6, pstd=6/√2
-    let (f_sig1, p_sig1) = (2.5 / S2, 8.0 / S2);
-    let (f_sig2, p_sig2) = (1.3 / S2, 6.0 / S2);
+    let f_sig1 = 2.5 / S2;
+    let p_sig1 = 8.0 / S2;
+    let f_sig2 = 1.3 / S2;
+    let p_sig2 = 6.0 / S2;
     let mut soph = Array2::<f64>::zeros((ny, nx));
     for iy in 0..ny {
         for ix in 0..nx {
             let xv = x[ix];
             let yv = y[iy];
-            let p1 = 4.5 * (-0.5 * (((xv-10.0)/p_sig1).powi(2) + ((yv-12.0)/f_sig1).powi(2))).exp();
-            let p2 = 3.0 * (-0.5 * (((xv- 6.0)/p_sig2).powi(2) + ((yv- 2.5)/f_sig2).powi(2))).exp();
-            let n = ((iy as f64 * 31.0 + ix as f64 * 17.0).sin() * 0.05).abs();
-            soph[[iy, ix]] = p1 + p2 + 0.05 * yv + 0.1 + n;
+            let mode1 = 4.5 * (-0.5 * (((xv-10.0)/p_sig1).powi(2) + ((yv-12.0)/f_sig1).powi(2))).exp();
+            let mode2 = 3.0 * (-0.5 * (((xv- 6.0)/p_sig2).powi(2) + ((yv- 2.5)/f_sig2).powi(2))).exp();
+            let noise = ((iy as f64 * 31.0 + ix as f64 * 17.0).sin() * 0.05).abs();
+            soph[[iy, ix]] = mode1 + mode2 + 0.05 * yv + 0.1 + noise;
         }
     }
 
-    // Seeds and bounds as in validate_rotgauss_fit_mex.m, widths /sqrt(2)
-    // so the seeded shape and the searchable window are unchanged.
+    // Seeds and bounds. Widths carry the same /sqrt(2) conversion to σ
+    // units as the synthesized surface.
     let b0 = Array2::from_shape_vec((2, 6), vec![
         4.0, 11.0, 2.0/S2, 10.0, 8.0/S2, 0.0,
         3.0,  3.0, 1.5/S2,  6.0, 6.0/S2, 0.0,
@@ -52,13 +54,13 @@ fn two_mode_rotgauss_recovers_synthesized_truth() {
     ]).unwrap();
 
     // Background seed: prctile(SOPH(:), 5) for zzz, 0 for slope coefs.
-    let mut all: Vec<f64> = soph.iter().copied().collect();
-    all.sort_by(|a,b| a.partial_cmp(b).unwrap());
-    let idx = ((all.len()-1) as f64 * 0.05).floor() as usize;
-    let bg0 = [0.0, 0.0, all[idx]];
-    let mxv = all.last().copied().unwrap();
+    let mut sorted_values: Vec<f64> = soph.iter().copied().collect();
+    sorted_values.sort_by(|a,b| a.partial_cmp(b).unwrap());
+    let percentile_index = ((sorted_values.len()-1) as f64 * 0.05).floor() as usize;
+    let bg0 = [0.0, 0.0, sorted_values[percentile_index]];
+    let max_value = sorted_values.last().copied().unwrap();
     let bg_lo = [-0.1, -0.1, 0.0];
-    let bg_hi = [0.1, 0.1, mxv];
+    let bg_hi = [0.1, 0.1, max_value];
 
     let out = fit_rotgauss(
         soph.view(), &x, &y, b0.view(), lb.view(), ub.view(),
@@ -66,7 +68,7 @@ fn two_mode_rotgauss_recovers_synthesized_truth() {
     ).expect("fit");
 
     eprintln!("---- two_mode_rotgauss recovery ----");
-    eprintln!("seed zzz = {:.4}, max = {:.4}", bg0[2], mxv);
+    eprintln!("seed zzz = {:.4}, max = {:.4}", bg0[2], max_value);
     for m in 0..2 {
         eprintln!("mode {}: amp={:.4}  fmean={:.4}  fstd={:.4}  pmean={:.4}  pstd={:.4}  theta={:.4}",
             m+1,
@@ -85,7 +87,7 @@ fn two_mode_rotgauss_recovers_synthesized_truth() {
 
     // R² alone is nearly blind to a mis-scaled width: the amplitudes and the
     // background plane absorb most of the damage. Pin the recovered σ against
-    // the synthesized σ so a lost (or doubled) factor of sqrt(2) fails here.
+    // the synthesized σ so a width off by a factor of sqrt(2) fails here.
     for (m, (f_sig, p_sig)) in [(f_sig1, p_sig1), (f_sig2, p_sig2)].iter().enumerate() {
         let f_hat = out.params[[m, 2]];
         let p_hat = out.params[[m, 4]];

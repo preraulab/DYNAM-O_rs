@@ -9,35 +9,43 @@
 //!   (a) column-major pixel indexing throughout (rows-first enumeration)
 //!   (b) column-major neighbor scan order within the 3x3 footprint
 //!   (c) FIFO tie-breaking within equal priorities (insertion order)
-//!
 
 use ndarray::{Array2, ArrayView2};
 use std::collections::BinaryHeap;
+
+/// The 8 neighbors of a pixel as (row offset, column offset), in
+/// column-major scan order (down each column, columns left to right).
+const NEIGHBOR_OFFSETS: [(i32, i32); 8] = [
+    (-1, -1), (0, -1), (1, -1),
+    (-1,  0),          (1,  0),
+    (-1,  1), (0,  1), (1,  1),
+];
 
 /// Regional minima of a 2D image, 8-connectivity.
 ///
 /// A regional minimum is a connected component of equal-value pixels
 /// whose external boundary has all values strictly greater than the
 /// component value. Output: true at regional-min pixels, false elsewhere.
+///
+/// `img` is a column-major flat image with `h` rows and `w` columns.
 fn imregionalmin_8conn(img: &[f64], h: usize, w: usize) -> Vec<bool> {
     let n = h * w;
     let mut visited = vec![false; n];
     let mut out = vec![false; n];
-    // BFS queue of flat (column-major) indices
+    // Stack of flat (column-major) indices still to visit in the flood fill.
     let mut stack: Vec<u32> = Vec::with_capacity(64);
-    // Column-major neighbor offsets in (drow, dcol)
-    const DRC: [(i32, i32); 8] = [
-        (-1, -1), (0, -1), (1, -1),
-        (-1,  0),          (1,  0),
-        (-1,  1), (0,  1), (1,  1),
-    ];
 
     for start in 0..n {
-        if visited[start] { continue; }
+        if visited[start] {
+            continue;
+        }
         let v = img[start];
-        if v.is_nan() { visited[start] = true; continue; }
+        if v.is_nan() {
+            visited[start] = true;
+            continue;
+        }
 
-        // BFS over plateau of equal-value pixels; detect any strictly-lower neighbor.
+        // Flood fill over the plateau of equal-value pixels, noting any strictly lower neighbor.
         visited[start] = true;
         let mut plateau: Vec<u32> = vec![start as u32];
         let mut has_lower = false;
@@ -45,12 +53,14 @@ fn imregionalmin_8conn(img: &[f64], h: usize, w: usize) -> Vec<bool> {
         stack.push(start as u32);
         while let Some(idx) = stack.pop() {
             let idx = idx as usize;
-            let r = idx % h;   // column-major
+            let r = idx % h; // column-major
             let c = idx / h;
-            for &(dr, dc) in &DRC {
+            for &(dr, dc) in &NEIGHBOR_OFFSETS {
                 let nr = r as i32 + dr;
                 let nc = c as i32 + dc;
-                if nr < 0 || nc < 0 || nr >= h as i32 || nc >= w as i32 { continue; }
+                if nr < 0 || nc < 0 || nr >= h as i32 || nc >= w as i32 {
+                    continue;
+                }
                 let nidx = (nc as usize) * h + (nr as usize);
                 let nv = img[nidx];
                 if nv < v {
@@ -76,36 +86,38 @@ fn imregionalmin_8conn(img: &[f64], h: usize, w: usize) -> Vec<bool> {
 /// 8-connected connected-component labeling on a boolean mask.
 /// Labels start at 1 (0 = background). Iteration order matches MATLAB
 /// (column-major scan, so labels are assigned column-by-column).
+///
+/// `mask` is column-major with `h` rows and `w` columns. Returns the
+/// label image (same layout) and the number of labels.
 fn bwlabel_8conn(mask: &[bool], h: usize, w: usize) -> (Vec<u32>, u32) {
     let n = h * w;
     let mut labels = vec![0u32; n];
     let mut next_label: u32 = 1;
     let mut stack: Vec<u32> = Vec::with_capacity(64);
-    const DRC: [(i32, i32); 8] = [
-        (-1, -1), (0, -1), (1, -1),
-        (-1,  0),          (1,  0),
-        (-1,  1), (0,  1), (1,  1),
-    ];
     // Column-major scan: for each column, for each row.
     for c in 0..w {
         for r in 0..h {
             let idx = c * h + r;
-            if !mask[idx] || labels[idx] != 0 { continue; }
-            let lab = next_label;
+            if !mask[idx] || labels[idx] != 0 {
+                continue;
+            }
+            let label = next_label;
             next_label += 1;
-            labels[idx] = lab;
+            labels[idx] = label;
             stack.clear();
             stack.push(idx as u32);
             while let Some(k) = stack.pop() {
                 let kr = (k as usize) % h;
                 let kc = (k as usize) / h;
-                for &(dr, dc) in &DRC {
+                for &(dr, dc) in &NEIGHBOR_OFFSETS {
                     let nr = kr as i32 + dr;
                     let nc = kc as i32 + dc;
-                    if nr < 0 || nc < 0 || nr >= h as i32 || nc >= w as i32 { continue; }
+                    if nr < 0 || nc < 0 || nr >= h as i32 || nc >= w as i32 {
+                        continue;
+                    }
                     let nidx = (nc as usize) * h + (nr as usize);
                     if mask[nidx] && labels[nidx] == 0 {
-                        labels[nidx] = lab;
+                        labels[nidx] = label;
                         stack.push(nidx as u32);
                     }
                 }
@@ -115,10 +127,14 @@ fn bwlabel_8conn(mask: &[bool], h: usize, w: usize) -> (Vec<u32>, u32) {
     (labels, next_label - 1)
 }
 
+/// One pixel waiting in the flooding queue.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct QueueItem {
+    /// Flood level at which the pixel is processed (lowest first).
     priority: f64,
+    /// Insertion counter. Among equal priorities the earliest goes first.
     order: u64,
+    /// Column-major flat index of the pixel.
     idx: u32,
 }
 
@@ -126,9 +142,14 @@ impl Eq for QueueItem {}
 
 impl Ord for QueueItem {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Min-heap by priority, then FIFO by order.
-        other.priority.partial_cmp(&self.priority).unwrap_or(std::cmp::Ordering::Equal)
-            .then(other.order.cmp(&self.order))
+        // BinaryHeap pops the greatest item, so both comparisons are
+        // reversed: lowest priority first, then earliest insertion.
+        // A NaN priority compares as equal and falls through to the order.
+        let by_priority = other
+            .priority
+            .partial_cmp(&self.priority)
+            .unwrap_or(std::cmp::Ordering::Equal);
+        by_priority.then(other.order.cmp(&self.order))
     }
 }
 impl PartialOrd for QueueItem {
@@ -137,8 +158,9 @@ impl PartialOrd for QueueItem {
     }
 }
 
-/// Public entry point. Returns (h, w) u16 label image. 0 = watershed line,
-/// 1..N = basin labels. Matches MATLAB's `watershed(A, 8)` output.
+/// Watershed transform of a 2D image with 8-connectivity. Returns a label
+/// image of the same shape: 0 = watershed line, 1..N = basin labels.
+/// Matches MATLAB's `watershed(A, 8)` output.
 pub fn matlab_watershed_2d(img: ArrayView2<f64>) -> Array2<u16> {
     let (h, w) = img.dim();
     if h == 0 || w == 0 {
@@ -158,34 +180,33 @@ pub fn matlab_watershed_2d(img: ArrayView2<f64>) -> Array2<u16> {
     let min_mask = imregionalmin_8conn(&img_cm, h, w);
 
     // 2) Label minima (8-connectivity, column-major scan)
-    let (labels_u32, n_labels) = bwlabel_8conn(&min_mask, h, w);
-    let mut labels: Vec<u16> = labels_u32.iter()
-        .map(|&v| {
-            if v > u16::MAX as u32 { u16::MAX } else { v as u16 }
-        })
-        .collect();
-    let _ = n_labels;
+    let (labels_u32, _n_labels) = bwlabel_8conn(&min_mask, h, w);
+    // Narrow to u16. A label above u16::MAX saturates at u16::MAX.
+    let mut labels: Vec<u16> = Vec::with_capacity(n);
+    for &label in labels_u32.iter() {
+        if label > u16::MAX as u32 {
+            labels.push(u16::MAX);
+        } else {
+            labels.push(label as u16);
+        }
+    }
 
     // 3) Seed the FIFO priority queue with all neighbors of labeled pixels
     let mut seen = vec![false; n];
     let mut heap: BinaryHeap<QueueItem> = BinaryHeap::with_capacity(n);
     let mut order_counter: u64 = 0;
 
-    const DRC: [(i32, i32); 8] = [
-        (-1, -1), (0, -1), (1, -1),
-        (-1,  0),          (1,  0),
-        (-1,  1), (0,  1), (1,  1),
-    ];
-
     for idx in 0..n {
         if labels[idx] != 0 {
             seen[idx] = true;
             let r = idx % h;
             let c = idx / h;
-            for &(dr, dc) in &DRC {
+            for &(dr, dc) in &NEIGHBOR_OFFSETS {
                 let nr = r as i32 + dr;
                 let nc = c as i32 + dc;
-                if nr < 0 || nc < 0 || nr >= h as i32 || nc >= w as i32 { continue; }
+                if nr < 0 || nc < 0 || nr >= h as i32 || nc >= w as i32 {
+                    continue;
+                }
                 let nidx = (nc as usize) * h + (nr as usize);
                 if !seen[nidx] && labels[nidx] == 0 {
                     seen[nidx] = true;
@@ -200,49 +221,61 @@ pub fn matlab_watershed_2d(img: ArrayView2<f64>) -> Array2<u16> {
         }
     }
 
-    // 4) Flooding loop: pop lowest priority; assign label if 1 distinct,
+    // 4) Flooding loop: pop lowest priority and assign the label if 1 distinct,
     //    else stay 0 (watershed line). New neighbors enqueued with
     //    priority = max(neighbor_value, popped_priority).
-    while let Some(it) = heap.pop() {
-        let idx = it.idx as usize;
-        let p = it.priority;
+    while let Some(item) = heap.pop() {
+        let idx = item.idx as usize;
+        let popped_priority = item.priority;
         let r = idx % h;
         let c = idx / h;
 
         // Collect 8-neighbors and check labels
-        let mut found_lab: u16 = 0;
-        let mut watershed_state = false;
-        let mut nbr_list: [u32; 8] = [u32::MAX; 8];
-        let mut n_nbrs = 0;
-        for &(dr, dc) in &DRC {
+        let mut basin_label: u16 = 0;
+        let mut touches_two_basins = false;
+        let mut neighbor_idx_list: [u32; 8] = [u32::MAX; 8];
+        let mut n_neighbors = 0;
+        for &(dr, dc) in &NEIGHBOR_OFFSETS {
             let nr = r as i32 + dr;
             let nc = c as i32 + dc;
-            if nr < 0 || nc < 0 || nr >= h as i32 || nc >= w as i32 { continue; }
+            if nr < 0 || nc < 0 || nr >= h as i32 || nc >= w as i32 {
+                continue;
+            }
             let nidx = (nc as usize) * h + (nr as usize);
-            nbr_list[n_nbrs] = nidx as u32;
-            n_nbrs += 1;
-            if watershed_state { continue; }
-            let l = labels[nidx];
-            if l != 0 {
-                if found_lab != 0 && l != found_lab {
-                    watershed_state = true;
+            neighbor_idx_list[n_neighbors] = nidx as u32;
+            n_neighbors += 1;
+            if touches_two_basins {
+                continue;
+            }
+            let neighbor_label = labels[nidx];
+            if neighbor_label != 0 {
+                if basin_label != 0 && neighbor_label != basin_label {
+                    touches_two_basins = true;
                 } else {
-                    found_lab = l;
+                    basin_label = neighbor_label;
                 }
             }
         }
 
-        if !watershed_state {
-            labels[idx] = found_lab;
-            for k in 0..n_nbrs {
-                let nidx = nbr_list[k] as usize;
+        if !touches_two_basins {
+            labels[idx] = basin_label;
+            for k in 0..n_neighbors {
+                let nidx = neighbor_idx_list[k] as usize;
                 if !seen[nidx] {
                     seen[nidx] = true;
-                    let nv = img_cm[nidx];
-                    let push_p = if nv > p { nv } else { p };
+                    let neighbor_value = img_cm[nidx];
+                    // Larger of the two. Written as a comparison (not
+                    // f64::max) so that a NaN on either side yields the
+                    // popped priority. f64::max would return the neighbor
+                    // value when the popped priority is NaN.
+                    let neighbor_priority = if neighbor_value > popped_priority {
+                        neighbor_value
+                    } else {
+                        popped_priority
+                    };
                     order_counter += 1;
                     heap.push(QueueItem {
-                        priority: push_p,
+                        priority: neighbor_priority,
                         order: order_counter,
                         idx: nidx as u32,
                     });

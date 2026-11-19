@@ -30,8 +30,8 @@
 //!   intrinsically. Never rescale it alongside `ys`.
 //!
 //! The reported `FreqStd`/`SOphaseStd` columns, the mode-volume integral,
-//! and the peak-containment geometry all consume these directly as σ —
-//! there is no variance⇄σ transform at any boundary.
+//! and the peak-containment geometry all consume these directly as σ.
+//! There is no variance⇄σ transform at any boundary.
 //!
 //! Parameter layout (flat vector, length `6N + 3`):
 //!
@@ -56,7 +56,7 @@
 //! modes out, so it is not used.
 //!
 //! The `unit_row=false` branch is kept for the parity kernel tests. The
-//! numerical Jacobian is used in both branches — row coupling makes the
+//! numerical Jacobian is used in both branches. Row coupling makes the
 //! analytic Jacobian expensive to write and the LM is solver-bound
 //! anyway, so it isn't worth the added complexity.
 
@@ -66,6 +66,16 @@ use nalgebra::DMatrix;
 use super::bounded_lm::{run_bounded_lm, ResidualsAndJacobian};
 use super::{Gof, ParamFitError, ParamFitOut};
 
+/// Parameters per mode: amp, fmean, fstd, phasepref, recikappa, theta.
+const PARAMS_PER_MODE: usize = 6;
+/// Background parameters: xxx, yyy, zzz.
+const N_BACKGROUND_PARAMS: usize = 3;
+
+/// Evaluate the model surface on a grid. `params` is the flat vector laid
+/// out as in the module docs (length `6 * n_modes + 3`), `x_grid` is SO
+/// phase and `y_grid` is frequency. Returns `z[[iy, ix]]`, one row per
+/// frequency. With `unit_row`, each row is then divided by its own sum
+/// (a row summing to exactly zero is left as it is).
 pub fn eval_model(
     params: &[f64],
     n_modes: usize,
@@ -76,33 +86,36 @@ pub fn eval_model(
     let nx = x_grid.len();
     let ny = y_grid.len();
     let mut z = Array2::<f64>::zeros((ny, nx));
-    let xxx = params[6 * n_modes];
-    let yyy = params[6 * n_modes + 1];
-    let zzz = params[6 * n_modes + 2];
+    let background_start = PARAMS_PER_MODE * n_modes;
+    let xxx = params[background_start];
+    let yyy = params[background_start + 1];
+    let zzz = params[background_start + 2];
     for iy in 0..ny {
         let y = y_grid[iy];
         for ix in 0..nx {
             let x = x_grid[ix];
-            let mut v = xxx * (x + yyy).sin() + zzz;
+            let mut value = xxx * (x + yyy).sin() + zzz;
             for n in 0..n_modes {
-                let a  = params[n];
-                let fm = params[n_modes + n];
-                let fs = params[2 * n_modes + n];
-                let pp = params[3 * n_modes + n];
-                let rk = params[4 * n_modes + n];
-                let th = params[5 * n_modes + n];
-                let dy = y - fm;
-                let kappa = 1.0 / (rk * rk);
-                let arg_cos = x - pp + dy * th.sin();
-                v += a * (-0.5 * (dy * dy) / (fs * fs)).exp()
+                let amp = params[n];
+                let fmean = params[n_modes + n];
+                let fstd = params[2 * n_modes + n];
+                let phasepref = params[3 * n_modes + n];
+                let recikappa = params[4 * n_modes + n];
+                let theta = params[5 * n_modes + n];
+                let dy = y - fmean;
+                let kappa = 1.0 / (recikappa * recikappa);
+                let arg_cos = x - phasepref + dy * theta.sin();
+                value += amp * (-0.5 * (dy * dy) / (fstd * fstd)).exp()
                     * (kappa * (arg_cos.cos() - 1.0)).exp();
             }
-            z[[iy, ix]] = v;
+            z[[iy, ix]] = value;
         }
     }
     if unit_row {
         for iy in 0..ny {
             let row_sum: f64 = (0..nx).map(|ix| z[[iy, ix]]).sum();
+            // A row that sums to exactly zero cannot be normalized and is
+            // left as it is.
             if row_sum.abs() > 0.0 {
                 let inv = 1.0 / row_sum;
                 for ix in 0..nx {
@@ -114,32 +127,33 @@ pub fn eval_model(
     z
 }
 
+/// The fit problem handed to the bounded LM solver.
 struct VmGaussProblem<'a> {
     n_modes: usize,
     x_grid: &'a [f64],
     y_grid: &'a [f64],
     z_data: &'a [f64],
-    finite_mask: &'a [bool], // residual is zero at non-finite cells (mirror of MATLAB's prepareSurfaceData NaN drop)
+    /// False where the data is not finite. The residual is zero there
+    /// (MATLAB's `prepareSurfaceData` drops those cells).
+    finite_mask: &'a [bool],
     unit_row: bool,
 }
 
 impl<'a> ResidualsAndJacobian for VmGaussProblem<'a> {
     fn residuals(&self, params: &[f64], out: &mut [f64]) {
         let model = eval_model(params, self.n_modes, self.x_grid, self.y_grid, self.unit_row);
-        for (k, ((zm, zd), m)) in model.iter()
-            .zip(self.z_data.iter())
-            .zip(self.finite_mask.iter())
-            .enumerate()
-        {
-            out[k] = if *m { *zm - *zd } else { 0.0 };
+        for (k, model_value) in model.iter().enumerate() {
+            if self.finite_mask[k] {
+                out[k] = *model_value - self.z_data[k];
+            } else {
+                out[k] = 0.0;
+            }
         }
     }
 
     fn jacobian(&self, params: &[f64], out: &mut DMatrix<f64>) {
-        // Numerical Jacobian via central differences. Analytic forms exist
-        // but are tedious — and at the per-pixel grid sizes we operate on
-        // (n_x ~ 60, n_y ~ 100), numerical Jacobian compute is ≤10% of
-        // LM total time. We'll revisit if profiling demands it.
+        // Numerical Jacobian by central differences (the module docs say
+        // why it is not analytic).
         let n_p = self.n_params();
         let n_r = self.n_residuals();
         let mut r_plus  = vec![0.0_f64; n_r];
@@ -147,6 +161,7 @@ impl<'a> ResidualsAndJacobian for VmGaussProblem<'a> {
         let mut p = params.to_vec();
         for j in 0..n_p {
             let v = params[j];
+            // Step: 1e-6 of the parameter's magnitude, and never below 1e-6.
             let h = 1e-6_f64.max(v.abs() * 1e-6);
             p[j] = v + h;
             self.residuals(&p, &mut r_plus);
@@ -160,10 +175,23 @@ impl<'a> ResidualsAndJacobian for VmGaussProblem<'a> {
         }
     }
 
-    fn n_params(&self) -> usize { 6 * self.n_modes + 3 }
-    fn n_residuals(&self) -> usize { self.x_grid.len() * self.y_grid.len() }
+    fn n_params(&self) -> usize {
+        PARAMS_PER_MODE * self.n_modes + N_BACKGROUND_PARAMS
+    }
+
+    fn n_residuals(&self) -> usize {
+        self.x_grid.len() * self.y_grid.len()
+    }
 }
 
+/// Fit the model to a SOPH by bounded Levenberg-Marquardt.
+///
+/// `soph` is `(y_grid.len(), x_grid.len())`. `initial`, `lower` and
+/// `upper` are `(n_modes, 6)` with columns `[amp, fmean, fstd, phasepref,
+/// recikappa, theta]`. `bg_*` are the background terms `[xxx, yyy, zzz]`.
+/// Non-finite cells of `soph` are left out of the fit and of the
+/// goodness-of-fit. Returns the fitted parameters in the same layout,
+/// the model surface, the goodness-of-fit, and the iteration count.
 pub fn fit_vmgauss(
     soph: ArrayView2<f64>,
     x_grid: &[f64],
@@ -184,7 +212,10 @@ pub fn fit_vmgauss(
             ny, nx, y_grid.len(), x_grid.len()
         )));
     }
-    if initial.ncols() != 6 || lower.ncols() != 6 || upper.ncols() != 6 {
+    if initial.ncols() != PARAMS_PER_MODE
+        || lower.ncols() != PARAMS_PER_MODE
+        || upper.ncols() != PARAMS_PER_MODE
+    {
         return Err(ParamFitError::InvalidArgument(
             "initial/lower/upper must each have 6 columns".into()
         ));
@@ -195,28 +226,26 @@ pub fn fit_vmgauss(
             "initial/lower/upper row counts must match".into()
         ));
     }
-    let n_params = 6 * n_modes + 3;
+    let n_params = PARAMS_PER_MODE * n_modes + N_BACKGROUND_PARAMS;
+    // The background terms sit after all the per-mode parameters.
+    let background_start = PARAMS_PER_MODE * n_modes;
 
-    let mut p0   = vec![0.0_f64; n_params];
+    let mut p0 = vec![0.0_f64; n_params];
     let mut p_lo = vec![0.0_f64; n_params];
     let mut p_hi = vec![0.0_f64; n_params];
-    for col in 0..6 {
+    for col in 0..PARAMS_PER_MODE {
         for m in 0..n_modes {
             let i = col * n_modes + m;
-            p0[i]   = initial[[m, col]];
+            p0[i] = initial[[m, col]];
             p_lo[i] = lower[[m, col]];
             p_hi[i] = upper[[m, col]];
         }
     }
-    p0[6 * n_modes]     = bg_initial[0];
-    p0[6 * n_modes + 1] = bg_initial[1];
-    p0[6 * n_modes + 2] = bg_initial[2];
-    p_lo[6 * n_modes]     = bg_lower[0];
-    p_lo[6 * n_modes + 1] = bg_lower[1];
-    p_lo[6 * n_modes + 2] = bg_lower[2];
-    p_hi[6 * n_modes]     = bg_upper[0];
-    p_hi[6 * n_modes + 1] = bg_upper[1];
-    p_hi[6 * n_modes + 2] = bg_upper[2];
+    for k in 0..N_BACKGROUND_PARAMS {
+        p0[background_start + k] = bg_initial[k];
+        p_lo[background_start + k] = bg_lower[k];
+        p_hi[background_start + k] = bg_upper[k];
+    }
 
     let z_data: Vec<f64> = soph.iter().copied().collect();
     let finite_mask: Vec<bool> = z_data.iter().map(|v| v.is_finite()).collect();
@@ -230,23 +259,26 @@ pub fn fit_vmgauss(
     let report = run_bounded_lm(&problem, &p0, &p_lo, &p_hi, max_iters)
         .map_err(ParamFitError::SolverFailed)?;
 
-    let mut params_out = Array2::<f64>::zeros((n_modes, 6));
-    for col in 0..6 {
+    let mut params_out = Array2::<f64>::zeros((n_modes, PARAMS_PER_MODE));
+    for col in 0..PARAMS_PER_MODE {
         for m in 0..n_modes {
             params_out[[m, col]] = report.params[col * n_modes + m];
         }
     }
     let bg = [
-        report.params[6 * n_modes],
-        report.params[6 * n_modes + 1],
-        report.params[6 * n_modes + 2],
+        report.params[background_start],
+        report.params[background_start + 1],
+        report.params[background_start + 2],
     ];
     let model_soph = eval_model(&report.params, n_modes, x_grid, y_grid, unit_row);
     // Only count finite cells in GoF (matches MATLAB's prepareSurfaceData drop).
-    let mut z_keep_data:  Vec<f64> = Vec::with_capacity(z_data.len());
+    let mut z_keep_data: Vec<f64> = Vec::with_capacity(z_data.len());
     let mut z_keep_model: Vec<f64> = Vec::with_capacity(z_data.len());
-    for ((zd, zm), m) in z_data.iter().zip(model_soph.iter()).zip(finite_mask.iter()) {
-        if *m { z_keep_data.push(*zd); z_keep_model.push(*zm); }
+    for (k, model_value) in model_soph.iter().enumerate() {
+        if finite_mask[k] {
+            z_keep_data.push(z_data[k]);
+            z_keep_model.push(*model_value);
+        }
     }
     let gof = Gof::from_data(&z_keep_data, &z_keep_model, n_params);
 
@@ -267,21 +299,21 @@ mod tests {
     #[test]
     fn eval_matches_matlab_vmgauss_at_known_point() {
         // amp=1, fmean=12, fstd=2.5, phasepref=π/3, recikappa=1.0, theta=0.1.
-        let a: f64 = 1.0;
-        let fm: f64 = 12.0;
-        let fs: f64 = 2.5;
-        let pp: f64 = std::f64::consts::PI / 3.0;
-        let rk: f64 = 1.0;
-        let th: f64 = 0.1;
+        let amp: f64 = 1.0;
+        let fmean: f64 = 12.0;
+        let fstd: f64 = 2.5;
+        let phasepref: f64 = std::f64::consts::PI / 3.0;
+        let recikappa: f64 = 1.0;
+        let theta: f64 = 0.1;
         let x: f64 = 0.5;
         let y: f64 = 11.0;
-        let dy = y - fm;
-        let kappa = 1.0 / (rk * rk);
-        // The ½ is on the Gaussian factor only; the von Mises factor is
+        let dy = y - fmean;
+        let kappa = 1.0 / (recikappa * recikappa);
+        // The ½ is on the Gaussian factor only. The von Mises factor is
         // already its own half-form and is written here unchanged.
-        let expected = a * (-0.5 * (dy * dy) / (fs * fs)).exp()
-            * (kappa * ((x - pp + dy * th.sin()).cos() - 1.0)).exp();
-        let p = vec![a, fm, fs, pp, rk, th, 0.0, 0.0, 0.0];
+        let expected = amp * (-0.5 * (dy * dy) / (fstd * fstd)).exp()
+            * (kappa * ((x - phasepref + dy * theta.sin()).cos() - 1.0)).exp();
+        let p = vec![amp, fmean, fstd, phasepref, recikappa, theta, 0.0, 0.0, 0.0];
         let z = eval_model(&p, 1, &[x], &[y], false);
         assert!((z[[0, 0]] - expected).abs() < 1e-14);
     }
@@ -308,9 +340,16 @@ mod tests {
 
     #[test]
     fn recovers_known_single_mode_phase() {
-        let nx = 40usize; let ny = 40usize;
-        let xg: Vec<f64> = (0..nx).map(|i| -std::f64::consts::PI + 2.0*std::f64::consts::PI*i as f64/(nx-1) as f64).collect();
-        let yg: Vec<f64> = (0..ny).map(|j| 0.5 + 30.0*j as f64/(ny-1) as f64).collect();
+        use std::f64::consts::PI;
+
+        let nx = 40usize;
+        let ny = 40usize;
+        let xg: Vec<f64> = (0..nx)
+            .map(|i| -PI + 2.0 * PI * i as f64 / (nx - 1) as f64)
+            .collect();
+        let yg: Vec<f64> = (0..ny)
+            .map(|j| 0.5 + 30.0 * j as f64 / (ny - 1) as f64)
+            .collect();
         let true_p = [0.08_f64, 11.0, 2.5, std::f64::consts::PI/3.0, 1.0, 0.0,
                        0.0, 0.0, 0.005];
         let z_clean = eval_model(&true_p, 1, &xg, &yg, false);

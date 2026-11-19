@@ -9,6 +9,7 @@
 
 use realfft::num_complex::Complex;
 use realfft::RealFftPlanner;
+use rustfft::FftPlanner;
 
 // ---------------------------------------------------------------------------
 // sosfiltfilt
@@ -38,7 +39,7 @@ fn sosfilt_single_section(sec: &[f64; 6], x: &mut [f64], mut z0: f64, mut z1: f6
 }
 
 /// Steady-state initial conditions for one section, for a unit step input
-/// (MATLAB `filtfilt.m`, `getCoeffsAndInitialConditions`; the same values
+/// (MATLAB `filtfilt.m`, `getCoeffsAndInitialConditions`, the same values
 /// as `scipy.signal.lfilter_zi`). Multiplying them by the first input
 /// sample starts the filter as if that value had been held forever, which
 /// removes the start-up transient for a constant offset.
@@ -164,57 +165,60 @@ pub fn hilbert(x: &[f64]) -> (Vec<f64>, Vec<f64>) {
     if n == 0 {
         return (Vec::new(), Vec::new());
     }
-    // Round up to power-of-two FFT for speed? scipy uses n directly by default.
-    // Match scipy: use length = n.
+    // The FFT length is n, as in scipy.signal.hilbert.
     let mut planner = RealFftPlanner::<f64>::new();
     let fft = planner.plan_fft_forward(n);
-    let ifft = planner.plan_fft_inverse(n);
 
     let mut in_buf: Vec<f64> = x.to_vec();
-    let mut spec: Vec<Complex<f64>> = fft.make_output_vec();
+    let mut spectrum: Vec<Complex<f64>> = fft.make_output_vec();
     let mut scratch: Vec<Complex<f64>> = fft.make_scratch_vec();
-    fft.process_with_scratch(&mut in_buf, &mut spec, &mut scratch).unwrap();
+    fft.process_with_scratch(&mut in_buf, &mut spectrum, &mut scratch).unwrap();
 
     // One-sided → two-sided analytic:
     // Build full-length complex spectrum with scaled positive freqs.
-    let mut full: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); n];
-    full[0] = spec[0]; // DC
-    let nyq = if n % 2 == 0 { Some(n / 2) } else { None };
-    for k in 1..spec.len() {
-        if Some(k) == nyq {
-            full[k] = spec[k]; // Nyquist bin unscaled
+    let mut analytic_spectrum: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); n];
+    // DC bin, unscaled.
+    analytic_spectrum[0] = spectrum[0];
+    // An even length has a Nyquist bin. An odd length has none.
+    let nyquist_bin = if n % 2 == 0 {
+        Some(n / 2)
+    } else {
+        None
+    };
+    for k in 1..spectrum.len() {
+        if Some(k) == nyquist_bin {
+            // Nyquist bin, unscaled.
+            analytic_spectrum[k] = spectrum[k];
         } else {
-            full[k] = spec[k] * 2.0; // positive freqs ×2
+            // Positive frequencies are doubled.
+            analytic_spectrum[k] = spectrum[k] * 2.0;
         }
     }
     // Negative freqs are already zero → analytic signal construction.
 
-    // Inverse FFT: need a Complex→Real? No, analytic is complex. Use full
-    // complex FFT. realfft's inverse returns real only, so we need a
-    // complex FFT here. Use rustfft directly.
-    use rustfft::FftPlanner;
-    let mut cplanner = FftPlanner::<f64>::new();
-    let cfft_inv = cplanner.plan_fft_inverse(n);
-    // We'll do an in-place inverse.
-    let mut buf = full.clone();
-    cfft_inv.process(&mut buf);
+    // The analytic signal is complex, so the inverse needs a complex FFT.
+    // realfft's inverse gives a real output only, so rustfft is used here.
+    let mut complex_planner = FftPlanner::<f64>::new();
+    let inverse_fft = complex_planner.plan_fft_inverse(n);
+    inverse_fft.process(&mut analytic_spectrum);
     // Normalize (rustfft is unnormalized).
     let inv_n = 1.0 / n as f64;
-    let mut re = Vec::with_capacity(n);
-    let mut im = Vec::with_capacity(n);
-    for c in &buf {
-        re.push(c.re * inv_n);
-        im.push(c.im * inv_n);
+    let mut real_part = Vec::with_capacity(n);
+    let mut imag_part = Vec::with_capacity(n);
+    for value in &analytic_spectrum {
+        real_part.push(value.re * inv_n);
+        imag_part.push(value.im * inv_n);
     }
-    let _ = ifft; // unused; we used rustfft's complex IFFT for the analytic signal
-    (re, im)
+    (real_part, imag_part)
 }
 
 // ---------------------------------------------------------------------------
 // unwrap (numpy.unwrap)
 // ---------------------------------------------------------------------------
 
-/// numpy.unwrap with default discont = π.
+/// `numpy.unwrap(p, discont)`: remove jumps larger than `discont` between
+/// neighboring samples by adding multiples of 2π. numpy's own default is
+/// `discont = π`.
 pub fn unwrap(p: &[f64], discont: f64) -> Vec<f64> {
     let n = p.len();
     let mut out = Vec::with_capacity(n);
@@ -226,7 +230,7 @@ pub fn unwrap(p: &[f64], discont: f64) -> Vec<f64> {
     let mut offset = 0.0f64;
     out.push(p[0]);
     for i in 1..n {
-        // delta uses ORIGINAL-adjacent samples (p[i] - p[i-1]); the jump
+        // delta uses ORIGINAL-adjacent samples (p[i] - p[i-1]). The jump
         // location is determined by raw input, consistent with numpy.unwrap.
         let delta = p[i] - p[i - 1];
         if delta > discont {
@@ -242,8 +246,18 @@ pub fn unwrap(p: &[f64], discont: f64) -> Vec<f64> {
 }
 
 // ---------------------------------------------------------------------------
-// movmean  (centered window, partial at edges — MATLAB `movmean`)
+// movmean  (centered window, partial at edges, MATLAB `movmean`)
 // ---------------------------------------------------------------------------
+
+/// How many samples a moving window of length `win` reaches to the left and
+/// to the right of its center sample, as MATLAB `movmean` and `movmedian`
+/// place it. An even-length window sits one sample toward the past, covering
+/// samples `[i - win/2, i + win/2 - 1]`. An odd-length window is symmetric.
+pub(crate) fn matlab_window_halves(win: usize) -> (usize, usize) {
+    let half_left = win / 2;
+    let half_right = (win - 1) / 2;
+    (half_left, half_right)
+}
 
 /// Running mean with centered window of length `win`. Edges use partial
 /// windows (as MATLAB `movmean(x, win)`).
@@ -252,21 +266,18 @@ pub fn movmean(x: &[f64], win: usize) -> Vec<f64> {
     if win <= 1 || n == 0 {
         return x.to_vec();
     }
-    // MATLAB places an even-length window one sample toward the past:
-    // samples [i - win/2, i + win/2 - 1]. Odd lengths are symmetric.
-    let half_l = win / 2;
-    let half_r = (win - 1) / 2;
+    let (half_l, half_r) = matlab_window_halves(win);
     // Prefix sum for O(N) window query.
-    let mut csum = vec![0.0f64; n + 1];
+    let mut prefix_sum = vec![0.0f64; n + 1];
     for i in 0..n {
-        csum[i + 1] = csum[i] + x[i];
+        prefix_sum[i + 1] = prefix_sum[i] + x[i];
     }
     let mut out = vec![0.0f64; n];
     for i in 0..n {
-        let a = i.saturating_sub(half_l);
-        let b = (i + half_r + 1).min(n);
-        let sum = csum[b] - csum[a];
-        out[i] = sum / (b - a) as f64;
+        let window_start = i.saturating_sub(half_l);
+        let window_end = (i + half_r + 1).min(n);
+        let sum = prefix_sum[window_end] - prefix_sum[window_start];
+        out[i] = sum / (window_end - window_start) as f64;
     }
     out
 }
@@ -280,9 +291,9 @@ mod tests {
         // Jumps at indices 2, 5
         let p = vec![0.0, 1.0, -3.0, -2.5, -2.0, 3.0, 3.5];
         let out = unwrap(&p, std::f64::consts::PI);
-        // Diffs: 1,-4,0.5,0.5,5,0.5 → wraps at 2 (add 2π) and 5 (subtract 2π)
-        // Expected unwrap: 0, 1, -3+2π, -2.5+2π, -2+2π, 3, 3.5 (adjusted)
-        // Just sanity: diff(unwrap) magnitudes all ≤ π.
+        // Differences are 1, -4, 0.5, 0.5, 5, 0.5, so index 2 wraps up by
+        // 2π and index 5 wraps back down. The check: no step of the
+        // unwrapped phase exceeds π.
         for i in 1..out.len() {
             assert!((out[i] - out[i - 1]).abs() <= std::f64::consts::PI + 1e-12);
         }

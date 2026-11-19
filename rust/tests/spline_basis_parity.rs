@@ -1,9 +1,9 @@
 //! Parity test: Rust `fit_tensor_product_spline` vs MATLAB `spap2` on
-//! synthesized SOPH fixtures (`/tmp/generate_spline_fixtures.m`).
+//! synthesized SOPH fixtures generated in MATLAB.
 //!
 //! Budgets:
-//!   * `coefs`        ≤ 1e-9   elementwise (separable normal-equations f64 floor)
-//!   * `splinefit`    ≤ 1e-8   elementwise
+//!   * `coefs`        < 1e-12  elementwise
+//!   * `splinefit`    < 1e-12  elementwise
 //!   * `knots_x_aug`, `knots_y_aug`  bit-exact match to `spline_obj.knots{}`
 //!
 //! Fixtures live in `tests/fixtures/spline/sim_{power,phase}_*.npy`.
@@ -29,14 +29,18 @@ fn load_mat(name: &str) -> Array2<f64> {
     read_npy(&p).unwrap_or_else(|e| panic!("read {}: {}", p.display(), e))
 }
 
+/// Largest elementwise |a - b|.
 fn max_abs_diff(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
     assert_eq!(a.dim(), b.dim(), "shape mismatch");
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0_f64, f64::max)
+    let mut largest = 0.0_f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        largest = f64::max(largest, (x - y).abs());
+    }
+    largest
 }
 
+/// Fit one fixture set (`typ` is "power" or "phase") and compare knots,
+/// coefficients, and reconstruction against the MATLAB outputs.
 fn check_one(typ: &str, coef_tol: f64, fit_tol: f64) {
     let soph_input = load_mat(&format!("sim_{}_SOPH_input.npy", typ));      // (n_feat, n_freq)
     let feat_bins = load_vec(&format!("sim_{}_feat_bins.npy", typ));
@@ -55,7 +59,7 @@ fn check_one(typ: &str, coef_tol: f64, fit_tol: f64) {
         &internal_x,
         &internal_y,
         4,
-        3, // DYNAM-O uses augknt(.,3) — multiplicity-3 boundary knots
+        3, // DYNAM-O uses augknt(.,3): multiplicity-3 boundary knots
     )
     .expect("fit_tensor_product_spline");
 
@@ -68,21 +72,21 @@ fn check_one(typ: &str, coef_tol: f64, fit_tol: f64) {
         "[{}] knots_y_aug not bit-exact", typ
     );
 
-    let dc = max_abs_diff(&out.coefs, &mat_coefs);
-    let df = max_abs_diff(&out.splinefit, &mat_fit);
-    println!("[{}] coefs max abs diff = {:.3e}, fit max abs diff = {:.3e}", typ, dc, df);
-    assert!(dc < coef_tol, "[{}] coefs: max abs diff {:.3e} >= {:.3e}", typ, dc, coef_tol);
-    assert!(df < fit_tol,  "[{}] fit:   max abs diff {:.3e} >= {:.3e}", typ, df, fit_tol);
+    let coef_diff = max_abs_diff(&out.coefs, &mat_coefs);
+    let fit_diff = max_abs_diff(&out.splinefit, &mat_fit);
+    println!("[{}] coefs max abs diff = {:.3e}, fit max abs diff = {:.3e}", typ, coef_diff, fit_diff);
+    assert!(coef_diff < coef_tol, "[{}] coefs: max abs diff {:.3e} >= {:.3e}", typ, coef_diff, coef_tol);
+    assert!(fit_diff < fit_tol,  "[{}] fit:   max abs diff {:.3e} >= {:.3e}", typ, fit_diff, fit_tol);
 }
 
 #[test]
 fn spline_basis_matches_matlab_power() {
-    // Observed: coefs ~2e-14, fit ~8e-15 — essentially f64 round-off.
+    // Observed: coefs ~2e-14, fit ~8e-15, essentially f64 round-off.
     check_one("power", 1e-12, 1e-12);
 }
 
 #[test]
 fn spline_basis_matches_matlab_phase() {
-    // Observed: coefs ~5e-16, fit ~2e-16 — essentially f64 round-off.
+    // Observed: coefs ~5e-16, fit ~2e-16, essentially f64 round-off.
     check_one("phase", 1e-12, 1e-12);
 }

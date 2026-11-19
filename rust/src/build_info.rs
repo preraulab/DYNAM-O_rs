@@ -9,16 +9,16 @@
 //!
 //! The sha comes from `build.rs` at compile time (`DYNAMO_GIT_SHA`,
 //! fail-soft `unknown`), so this string identifies the exact source
-//! state the numeric kernels were built from — it is the
+//! state the numeric kernels were built from. It is the
 //! `kernel_version` value every DYNAM-O output artifact records. The
-//! semver alone is not enough: 0.2.0 changed fitted-width semantics
-//! over a byte-identical ABI, which is exactly the class of change the
-//! sha makes visible.
+//! semver alone is not enough, because two builds with the same semver
+//! and a byte-identical ABI can still differ in numeric behavior. The sha
+//! makes that visible.
 
 /// The kernel build identity, e.g. `0.2.2+ab12cd34ef56.dirty`.
 pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("DYNAMO_GIT_SHA"));
 
-/// Runtime accessor for [`VERSION`] — the `kernel_version` stamp value.
+/// Runtime accessor for [`VERSION`], the `kernel_version` stamp value.
 pub fn build_info() -> &'static str {
     VERSION
 }

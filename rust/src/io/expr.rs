@@ -12,16 +12,16 @@
 //!
 //! **`mean(...)` averages the channels that are available.** Cohorts often
 //! name the same montage differently across files, so a reference like
-//! `M = mean(C3-A2, [C3-A2 - B])` lists every spelling; per file, the mean
+//! `M = mean(C3-A2, [C3-A2 - B])` lists every spelling. Per file, the mean
 //! is taken over the arguments whose signals that file actually has
 //! (renormalized `1/M` over the M available ones) and fails only when none
 //! are. An argument counts as available only when every signal inside it
 //! is. Availability is resolved at evaluation, so the mean survives
-//! parsing as a structural [`SignalRef::Mean`] node; when all N arguments
-//! are present the result is identical to the plain `(a + … )/N`
-//! desugaring, bit for bit.
+//! parsing as a structural [`SignalRef::Mean`] node. When all N arguments
+//! are present the result is identical to the written-out `(a + … )/N`
+//! form, bit for bit.
 //!
-//! **Brackets `[...]`** are grouping operators — exact aliases for `(`
+//! **Brackets `[...]`** are grouping operators, exact aliases for `(`
 //! and `)`. Use them anywhere you would use parens (the composer UI
 //! emits `mean([C3-A2 - B], [C4-A1 - A])` which parses identically to
 //! `mean((C3-A2 - B), (C4-A1 - A))`).
@@ -32,19 +32,21 @@
 //! `C3 - A2`. This mirrors `read_EDF.m:133–135`.
 //!
 //! **Linearity rule** (matches `read_EDF.m:73–79`): each term in the
-//! expression contains at most one signal-valued factor — any combination
+//! expression contains at most one signal-valued factor. Any combination
 //! of `signal * signal`, `signal / signal`, or `scalar / signal` is
 //! rejected as nonlinear at parse time. Scalars (numeric literals) may be
 //! multiplied or divided freely.
 //!
 //! AST is a flat sum of terms `coeff · signal_ref` where `signal_ref` is
-//! either a file-channel name or a named-ref name. A scalar-only term
-//! would have `signal_ref = None` but, like MATLAB, we reject scalars
-//! mixed into a signal sum at parse time — see [`ExprError::ScalarTerm`].
+//! a file-channel name, a named-ref name, or a structural `mean(...)`
+//! node. A scalar-only term would have `signal_ref = None` but, like
+//! MATLAB, we reject scalars mixed into a signal sum at parse time (see
+//! [`ExprError::ScalarTerm`]).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+/// Why a channel expression failed to parse, resolve or evaluate.
 #[derive(Debug)]
 pub enum ExprError {
     UnexpectedToken { pos: usize, found: String },
@@ -82,14 +84,15 @@ impl fmt::Display for ExprError {
 impl std::error::Error for ExprError {}
 
 /// One linear-combination term: `coeff · signal`. Scalar-only terms are
-/// represented with `signal = None`, but they are rejected by [`parse`]
-/// — they only exist transiently inside the parser.
+/// represented with `signal = None`, but they are rejected by [`parse`].
+/// They only exist transiently inside the parser.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Term {
     pub coeff: f64,
     pub signal: Option<SignalRef>,
 }
 
+/// What a term's signal factor refers to.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SignalRef {
     /// Reference to a literal EDF channel label.
@@ -103,18 +106,20 @@ pub enum SignalRef {
 }
 
 impl SignalRef {
+    /// The referenced name. A mean has no single name and yields the
+    /// placeholder `mean(…)`.
     pub fn name(&self) -> &str {
         match self {
             SignalRef::Leaf(s) | SignalRef::Named(s) => s,
-            // Only ever surfaces in error text — a mean has no single name;
-            // its constituent signals are reported via `signals()`.
+            // Only ever surfaces in error text. The constituent signals of
+            // a mean are reported via `signals()`.
             SignalRef::Mean(_) => "mean(…)",
         }
     }
 }
 
-/// Parsed expression: a flat sum of terms. The order is not significant;
-/// the evaluator sums them all.
+/// Parsed expression: a flat sum of terms. The order is not significant,
+/// since the evaluator sums them all.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExprAst {
     pub terms: Vec<Term>,
@@ -129,11 +134,15 @@ impl ExprAst {
             for t in terms {
                 match &t.signal {
                     Some(SignalRef::Mean(args)) => {
-                        for a in args { walk(&a.terms, seen, out); }
+                        for arg in args {
+                            walk(&arg.terms, seen, out);
+                        }
                     }
                     Some(s) => {
-                        let n = s.name();
-                        if seen.insert(n.to_string()) { out.push(n.to_string()); }
+                        let name = s.name();
+                        if seen.insert(name.to_string()) {
+                            out.push(name.to_string());
+                        }
                     }
                     None => {}
                 }
@@ -149,7 +158,7 @@ impl ExprAst {
 /// One named-reference assignment, e.g. `("M", parse("mean(A1, A2)")?)`.
 pub type NamedRef = (String, ExprAst);
 
-// ────────────────────────────── tokeniser ──────────────────────────────
+// ────────────────────────────── tokenizer ──────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
@@ -161,14 +170,17 @@ enum Tok {
     Eq,
 }
 
-fn tokenise(s: &str) -> Result<Vec<(usize, Tok)>, ExprError> {
+fn tokenize(s: &str) -> Result<Vec<(usize, Tok)>, ExprError> {
     let bytes = s.as_bytes();
     let mut out: Vec<(usize, Tok)> = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
         // Whitespace.
-        if c.is_ascii_whitespace() { i += 1; continue; }
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
         // Single-character operators / punctuation. `[` and `]` are
         // aliases for `(` and `)` so the composer can wrap grouped
         // expressions in brackets (`mean([C3-A2 - B], …)`).
@@ -183,15 +195,25 @@ fn tokenise(s: &str) -> Result<Vec<(usize, Tok)>, ExprError> {
             b'=' => Some(Tok::Eq),
             _ => None,
         };
-        if let Some(t) = tok { out.push((i, t)); i += 1; continue; }
+        if let Some(t) = tok {
+            out.push((i, t));
+            i += 1;
+            continue;
+        }
         // Number: digits, optional fractional, optional exponent.
         if c.is_ascii_digit() || (c == b'.' && i + 1 < bytes.len() && bytes[i+1].is_ascii_digit()) {
             let start = i;
-            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') { i += 1; }
+            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                i += 1;
+            }
             if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
                 i += 1;
-                if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') { i += 1; }
-                while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
+                if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+                    i += 1;
+                }
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
             }
             let lit = &s[start..i];
             let v: f64 = lit.parse().map_err(|_| ExprError::UnexpectedToken {
@@ -200,15 +222,17 @@ fn tokenise(s: &str) -> Result<Vec<(usize, Tok)>, ExprError> {
             out.push((start, Tok::Number(v)));
             continue;
         }
-        // `$LABEL$` escape (read_EDF.m:133–135) — literal channel name
+        // `$LABEL$` escape (read_EDF.m:133–135): a literal channel name
         // that may contain operator characters like `-` or spaces. The
         // contents are taken verbatim (after interior trim) and emitted
         // as a single Ident token. Brackets `[...]` are NOT a literal
-        // escape — they're grouping (handled above as LParen/RParen).
+        // escape. They are grouping (handled above as LParen/RParen).
         if c == b'$' {
             let start = i + 1;
             i += 1;
-            while i < bytes.len() && bytes[i] != b'$' { i += 1; }
+            while i < bytes.len() && bytes[i] != b'$' {
+                i += 1;
+            }
             if i >= bytes.len() {
                 return Err(ExprError::UnexpectedToken {
                     pos: start - 1, found: "$ without closing $".to_string(),
@@ -243,8 +267,20 @@ struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    fn peek(&self) -> Option<&Tok> { self.toks.get(self.pos).map(|(_, t)| t) }
-    fn cur_pos(&self) -> usize { self.toks.get(self.pos).map(|(p, _)| *p).unwrap_or(usize::MAX) }
+    /// The next token, without consuming it.
+    fn peek(&self) -> Option<&Tok> {
+        match self.toks.get(self.pos) {
+            Some((_, tok)) => Some(tok),
+            None => None,
+        }
+    }
+    /// Character position of the next token (usize::MAX at end of input).
+    fn cur_pos(&self) -> usize {
+        match self.toks.get(self.pos) {
+            Some((char_pos, _)) => *char_pos,
+            None => usize::MAX,
+        }
+    }
     fn bump(&mut self) -> Option<&Tok> {
         let t = self.toks.get(self.pos).map(|(_, t)| t);
         self.pos += 1;
@@ -271,8 +307,19 @@ impl<'a> Parser<'a> {
         let mut terms = self.term()?;
         loop {
             match self.peek() {
-                Some(Tok::Plus)  => { self.bump(); let mut t = self.term()?; terms.append(&mut t); }
-                Some(Tok::Minus) => { self.bump(); let mut t = self.term()?; for x in &mut t { x.coeff = -x.coeff; } terms.append(&mut t); }
+                Some(Tok::Plus) => {
+                    self.bump();
+                    let mut added = self.term()?;
+                    terms.append(&mut added);
+                }
+                Some(Tok::Minus) => {
+                    self.bump();
+                    let mut subtracted = self.term()?;
+                    for term in &mut subtracted {
+                        term.coeff = -term.coeff;
+                    }
+                    terms.append(&mut subtracted);
+                }
                 _ => break,
             }
         }
@@ -303,9 +350,23 @@ impl<'a> Parser<'a> {
     /// factor = number | unary-minus factor | ident | 'mean' '(' arglist ')' | '(' expr ')'
     fn factor(&mut self) -> Result<Vec<Term>, ExprError> {
         match self.peek().cloned() {
-            Some(Tok::Number(v)) => { self.bump(); Ok(vec![Term { coeff: v, signal: None }]) }
-            Some(Tok::Minus) => { self.bump(); let mut inner = self.factor()?; for t in &mut inner { t.coeff = -t.coeff; } Ok(inner) }
-            Some(Tok::Plus)  => { self.bump(); self.factor() }
+            Some(Tok::Number(v)) => {
+                self.bump();
+                Ok(vec![Term { coeff: v, signal: None }])
+            }
+            Some(Tok::Minus) => {
+                // Unary minus: negate every term of the factor that follows.
+                self.bump();
+                let mut inner = self.factor()?;
+                for term in &mut inner {
+                    term.coeff = -term.coeff;
+                }
+                Ok(inner)
+            }
+            Some(Tok::Plus) => {
+                self.bump();
+                self.factor()
+            }
             Some(Tok::LParen) => {
                 self.bump();
                 let inner = self.expr()?;
@@ -328,7 +389,7 @@ impl<'a> Parser<'a> {
                     if args.is_empty() {
                         return Err(ExprError::Empty);
                     }
-                    // All-scalar mean folds to a number; a mean over
+                    // All-scalar mean folds to a number. A mean over
                     // signals stays a structural node so evaluation can
                     // average the AVAILABLE arguments (module doc). An
                     // argument mixing a signal with a bare scalar is
@@ -360,46 +421,51 @@ impl<'a> Parser<'a> {
 }
 
 /// Multiply two linear-combinations. At most one side may carry a signal
-/// in any pair of terms; otherwise the result would be nonlinear.
-fn mul_terms(a: &[Term], b: &[Term]) -> Result<Vec<Term>, ExprError> {
+/// in any pair of terms. Otherwise the result would be nonlinear.
+fn mul_terms(lhs: &[Term], rhs: &[Term]) -> Result<Vec<Term>, ExprError> {
     let mut out: Vec<Term> = Vec::new();
-    for ta in a {
-        for tb in b {
-            match (&ta.signal, &tb.signal) {
-                (Some(sa), Some(sb)) => {
+    for lhs_term in lhs {
+        for rhs_term in rhs {
+            let coeff = lhs_term.coeff * rhs_term.coeff;
+            match (&lhs_term.signal, &rhs_term.signal) {
+                (Some(lhs_signal), Some(rhs_signal)) => {
                     return Err(ExprError::NonLinearMul {
-                        a: sa.name().to_string(), b: sb.name().to_string(),
+                        a: lhs_signal.name().to_string(),
+                        b: rhs_signal.name().to_string(),
                     });
                 }
-                (Some(_), None) => out.push(Term { coeff: ta.coeff * tb.coeff, signal: ta.signal.clone() }),
-                (None, Some(_)) => out.push(Term { coeff: ta.coeff * tb.coeff, signal: tb.signal.clone() }),
-                (None, None)    => out.push(Term { coeff: ta.coeff * tb.coeff, signal: None }),
+                (Some(_), None) => out.push(Term { coeff, signal: lhs_term.signal.clone() }),
+                (None, Some(_)) => out.push(Term { coeff, signal: rhs_term.signal.clone() }),
+                (None, None) => out.push(Term { coeff, signal: None }),
             }
         }
     }
     Ok(out)
 }
 
-/// Divide two linear-combinations. RHS must be scalar; LHS may be any
+/// Divide two linear-combinations. RHS must be scalar. LHS may be any
 /// linear combination.
-fn div_terms(a: &[Term], b: &[Term]) -> Result<Vec<Term>, ExprError> {
+fn div_terms(lhs: &[Term], rhs: &[Term]) -> Result<Vec<Term>, ExprError> {
     // RHS must be a single scalar term.
-    if b.len() != 1 || b[0].signal.is_some() {
-        let rhs_name = b.first().and_then(|t| t.signal.as_ref()).map(|s| s.name().to_string()).unwrap_or_else(|| "<expr>".to_string());
-        // If LHS contained any signal — flag scalar/signal; else generic.
-        if a.iter().any(|t| t.signal.is_some()) {
+    if rhs.len() != 1 || rhs[0].signal.is_some() {
+        let rhs_name = match rhs.first() {
+            Some(Term { signal: Some(sig), .. }) => sig.name().to_string(),
+            _ => "<expr>".to_string(),
+        };
+        // LHS carries a signal: signal / signal. Otherwise: scalar / signal.
+        if lhs.iter().any(|t| t.signal.is_some()) {
             return Err(ExprError::NonLinearDiv { a: "<expr>".to_string(), b: rhs_name });
         } else {
             return Err(ExprError::ScalarOverSignal { b: rhs_name });
         }
     }
-    let denom = b[0].coeff;
+    let denom = rhs[0].coeff;
     if denom == 0.0 {
         return Err(ExprError::UnexpectedToken { pos: 0, found: "divide by zero".to_string() });
     }
-    let mut out: Vec<Term> = Vec::with_capacity(a.len());
-    for ta in a {
-        out.push(Term { coeff: ta.coeff / denom, signal: ta.signal.clone() });
+    let mut out: Vec<Term> = Vec::with_capacity(lhs.len());
+    for lhs_term in lhs {
+        out.push(Term { coeff: lhs_term.coeff / denom, signal: lhs_term.signal.clone() });
     }
     Ok(out)
 }
@@ -407,9 +473,13 @@ fn div_terms(a: &[Term], b: &[Term]) -> Result<Vec<Term>, ExprError> {
 /// Parse a channel expression.
 pub fn parse(s: &str) -> Result<ExprAst, ExprError> {
     let s = s.trim();
-    if s.is_empty() { return Err(ExprError::Empty); }
-    let toks = tokenise(s)?;
-    if toks.is_empty() { return Err(ExprError::Empty); }
+    if s.is_empty() {
+        return Err(ExprError::Empty);
+    }
+    let toks = tokenize(s)?;
+    if toks.is_empty() {
+        return Err(ExprError::Empty);
+    }
     let mut p = Parser { toks: &toks, pos: 0 };
     let terms = p.expr()?;
     if p.pos != toks.len() {
@@ -418,9 +488,8 @@ pub fn parse(s: &str) -> Result<ExprAst, ExprError> {
             found: format!("{:?}", p.peek().unwrap()),
         });
     }
-    // Linearity: combine duplicate signals. Also: if any term has a
-    // signal AND there is any other signal-bearing term, scalar-only
-    // terms mixed in are rejected (matches read_EDF.m).
+    // A signal expression may not contain a nonzero scalar-only term
+    // (matches read_EDF.m). Duplicate signals are combined by `coalesce` below.
     let has_signal = terms.iter().any(|t| t.signal.is_some());
     if has_signal {
         for t in &terms {
@@ -434,8 +503,7 @@ pub fn parse(s: &str) -> Result<ExprAst, ExprError> {
 
 /// Coalesce duplicates (sum coeffs for matching signals, first-occurrence
 /// order) and drop zero-coefficient signal terms. Shared by [`parse`] and
-/// [`flatten`] so the availability-resolved term list matches what the
-/// old parse-time desugaring produced, term for term.
+/// [`flatten`] so both produce the same term list.
 fn coalesce(terms: Vec<Term>) -> Vec<Term> {
     let mut combined: Vec<Term> = Vec::new();
     for t in terms {
@@ -453,14 +521,13 @@ fn coalesce(terms: Vec<Term>) -> Vec<Term> {
 /// available, producing a flat `Leaf`/`Named`-only term list.
 ///
 /// Each mean argument is kept iff every signal inside it (recursively) is
-/// in `available`; the kept arguments are renormalized `1/M`. A mean with
+/// in `available`. The kept arguments are renormalized `1/M`. A mean with
 /// no available argument is the only error. Signals OUTSIDE a mean are
-/// not checked here — [`evaluate`] reports those as `UnknownSignal`, so
-/// legacy behavior for non-mean expressions is unchanged.
+/// not checked here: [`evaluate`] reports those as `UnknownSignal`.
 ///
-/// When all N arguments are available the output is exactly the old
-/// parse-time desugaring — same term order, same `coeff / N` arithmetic —
-/// so previously-working selections stay bit-identical.
+/// When all N arguments are available the output equals the written-out
+/// `(a + ...)/N` form (same term order, same `coeff / N` arithmetic,
+/// bit-identical).
 pub fn flatten(ast: &ExprAst, available: &HashSet<String>) -> Result<Vec<Term>, ExprError> {
     fn all_available(terms: &[Term], available: &HashSet<String>) -> bool {
         terms.iter().all(|t| match &t.signal {
@@ -474,11 +541,13 @@ pub fn flatten(ast: &ExprAst, available: &HashSet<String>) -> Result<Vec<Term>, 
                 Some(SignalRef::Mean(args)) => {
                     let mut kept: Vec<Vec<Term>> = Vec::new();
                     let mut wanted: Vec<String> = Vec::new();
-                    for a in args {
-                        wanted.extend(a.signals());
-                        let mut f: Vec<Term> = Vec::new();
-                        if walk(&a.terms, available, &mut f).is_ok() && all_available(&f, available) {
-                            kept.push(f);
+                    for arg in args {
+                        wanted.extend(arg.signals());
+                        let mut arg_terms: Vec<Term> = Vec::new();
+                        if walk(&arg.terms, available, &mut arg_terms).is_ok()
+                            && all_available(&arg_terms, available)
+                        {
+                            kept.push(arg_terms);
                         }
                     }
                     if kept.is_empty() {
@@ -489,13 +558,17 @@ pub fn flatten(ast: &ExprAst, available: &HashSet<String>) -> Result<Vec<Term>, 
                             ),
                         });
                     }
-                    let m = kept.len() as f64;
-                    for f in kept {
-                        for ft in f {
-                            // Ordering matters for bit-parity with the old
-                            // desugar: divide by M first, then apply the
-                            // outer coefficient.
-                            out.push(Term { coeff: (ft.coeff / m) * t.coeff, signal: ft.signal });
+                    let n_kept = kept.len() as f64;
+                    for arg_terms in kept {
+                        for arg_term in arg_terms {
+                            // Order of operations matters for bit-identical
+                            // results with the written-out `(a + ...)/N`
+                            // form: divide by M first, then apply the outer
+                            // coefficient.
+                            out.push(Term {
+                                coeff: (arg_term.coeff / n_kept) * t.coeff,
+                                signal: arg_term.signal,
+                            });
                         }
                     }
                 }
@@ -525,10 +598,10 @@ pub fn satisfiable(ast: &ExprAst, available: &HashSet<String>) -> bool {
 /// Whether a channel expression can be evaluated against a file exposing
 /// `labels`, resolving named references first: a reference joins the
 /// available set iff its own expression is satisfiable (in dependency
-/// order — pass the [`resolve_references`] output), so a mean over an
+/// order, so pass the [`resolve_references`] output), so a mean over an
 /// unavailable reference simply skips it. This is the shared
 /// availability rule for wizard coverage counts and expression
-/// validators; it must match what [`evaluate`] accepts at run time.
+/// validators. It must match what [`evaluate`] accepts at run time.
 pub fn channel_satisfiable(
     channel: &ExprAst,
     ordered_refs: &[NamedRef],
@@ -554,11 +627,19 @@ pub fn parse_named(s: &str) -> Result<NamedRef, ExprError> {
     if name.is_empty() {
         return Err(ExprError::BadRefName { name: String::new() });
     }
-    // Identifier rule: alpha[alphanumeric_]*. Allow `$x$` escape.
-    let is_ident = name.bytes().enumerate().all(|(i, b)| {
-        if i == 0 { b.is_ascii_alphabetic() || b == b'_' }
-        else { b.is_ascii_alphanumeric() || b == b'_' }
-    });
+    // Identifier rule: a letter or underscore, then letters, digits or underscores.
+    let mut is_ident = true;
+    for (i, byte) in name.bytes().enumerate() {
+        let byte_ok = if i == 0 {
+            byte.is_ascii_alphabetic() || byte == b'_'
+        } else {
+            byte.is_ascii_alphanumeric() || byte == b'_'
+        };
+        if !byte_ok {
+            is_ident = false;
+            break;
+        }
+    }
     if !is_ident {
         return Err(ExprError::BadRefName { name: name.to_string() });
     }
@@ -576,12 +657,16 @@ pub fn resolve_references(refs: &[NamedRef]) -> Result<Vec<NamedRef>, ExprError>
     for (n, ast) in refs {
         let mut d: Vec<String> = Vec::new();
         for sig in ast.signals() {
-            if names.contains(&sig) { d.push(sig); }
+            if names.contains(&sig) {
+                d.push(sig);
+            }
         }
         deps.insert(n.clone(), d);
     }
-    // DFS topo sort.
-    let mut state: HashMap<String, u8> = HashMap::new();  // 0=unseen 1=stack 2=done
+    // DFS topo sort. A name absent from `state` has not been visited yet.
+    const ON_STACK: u8 = 1;
+    const DONE: u8 = 2;
+    let mut state: HashMap<String, u8> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     fn dfs(
         name: &str,
@@ -590,15 +675,17 @@ pub fn resolve_references(refs: &[NamedRef]) -> Result<Vec<NamedRef>, ExprError>
         order: &mut Vec<String>,
     ) -> Result<(), ExprError> {
         match state.get(name) {
-            Some(&2) => return Ok(()),
-            Some(&1) => return Err(ExprError::CircularRef { name: name.to_string() }),
+            Some(&DONE) => return Ok(()),
+            Some(&ON_STACK) => return Err(ExprError::CircularRef { name: name.to_string() }),
             _ => {}
         }
-        state.insert(name.to_string(), 1);
+        state.insert(name.to_string(), ON_STACK);
         if let Some(ds) = deps.get(name) {
-            for d in ds { dfs(d, deps, state, order)?; }
+            for d in ds {
+                dfs(d, deps, state, order)?;
+            }
         }
-        state.insert(name.to_string(), 2);
+        state.insert(name.to_string(), DONE);
         order.push(name.to_string());
         Ok(())
     }
@@ -607,23 +694,26 @@ pub fn resolve_references(refs: &[NamedRef]) -> Result<Vec<NamedRef>, ExprError>
     }
     // Map name→ast for output.
     let map: HashMap<String, ExprAst> = refs.iter().cloned().collect();
-    Ok(order.into_iter().filter_map(|n| map.get(&n).map(|a| (n.clone(), a.clone()))).collect())
+    let mut sorted: Vec<NamedRef> = Vec::with_capacity(order.len());
+    for name in order {
+        if let Some(ast) = map.get(&name) {
+            sorted.push((name.clone(), ast.clone()));
+        }
+    }
+    Ok(sorted)
 }
 
-/// Evaluate the AST against a signal table. Each signal slice must have
-/// the same length; the output is that length. Returns
-/// `ExprError::UnknownSignal` if any referenced name is missing.
 /// Walk a list of channel expressions and named references, collect every
 /// **EDF leaf label** that needs to be loaded from disk to evaluate them.
 ///
 /// Channel expressions like `[C3 - LM]` look like they just need `C3` and
-/// `LM`, but `LM` is a named reference (e.g. `LM = mean(M1, M2)`) — so
+/// `LM`, but `LM` is a named reference (e.g. `LM = mean(M1, M2)`), so
 /// `M1` and `M2` are the real leaves. The dispatcher needs to know every
-/// underlying EDF channel up front, or the partial-load `read_edf_signals`
+/// underlying EDF channel up front, or the partial-load `read_edf_with_signals`
 /// call won't bring `M1` / `M2` into memory and `select_channel_with_refs`
 /// later fails with `unknown signal: M1`.
 ///
-/// `channels` are the cohort's channel expressions (raw user input — not
+/// `channels` are the cohort's channel expressions (raw user input, not
 /// the output aliases). `references` are the named-reference entries in
 /// the `"name = expression"` form persisted to `batch_settings.json`.
 ///
@@ -637,8 +727,6 @@ pub fn collect_leaf_labels(
     channels: &[&str],
     references: &[&str],
 ) -> Result<Vec<String>, ExprError> {
-    use std::collections::HashSet;
-
     // Parse all references → name -> AST map, plus a name set so the
     // walker can tell a Leaf-typed name that's actually a Named ref
     // from a real EDF leaf.
@@ -653,7 +741,7 @@ pub fn collect_leaf_labels(
     // set so a cycle (already prevented by resolve_references on the
     // graph level) doesn't recurse forever if a caller passes weird
     // input. Identifiers that match a reference name expand via
-    // ref_asts; everything else is a real EDF leaf.
+    // ref_asts. Everything else is a real EDF leaf.
     fn walk(
         ast: &ExprAst,
         ref_asts: &HashMap<String, ExprAst>,
@@ -664,7 +752,7 @@ pub fn collect_leaf_labels(
     ) {
         for term in &ast.terms {
             let Some(sig) = &term.signal else { continue };
-            // A mean has no name of its own — its arguments carry the
+            // A mean has no name of its own. Its arguments carry the
             // leaves (all of them: a partial file loads what it has).
             if let SignalRef::Mean(args) = sig {
                 for a in args {
@@ -675,8 +763,8 @@ pub fn collect_leaf_labels(
             let name = sig.name().to_string();
             if ref_names.contains(&name) {
                 if !visiting.insert(name.clone()) {
-                    // cycle — bail (the leaves collected so far are
-                    // still valid for the non-cyclic siblings)
+                    // Cycle: skip this name (the leaves collected so far
+                    // are still valid for the non-cyclic siblings).
                     continue;
                 }
                 if let Some(inner) = ref_asts.get(&name) {
@@ -697,10 +785,10 @@ pub fn collect_leaf_labels(
         match parse(ch) {
             Ok(ast) => walk(&ast, &ref_asts, &ref_names, &mut out, &mut seen, &mut visiting),
             // A channel that doesn't parse as an expression is treated as a
-            // single literal EDF label — e.g. a referential-montage name with
+            // single literal EDF label, e.g. a referential-montage name with
             // a space (`"O2 A1"`, `"C3 A2"`) or a bracketed label. Loading the
             // raw string as a leaf lets `select_channel_with_refs`'s exact-
-            // label fast-path resolve it; a genuine typo simply fails later
+            // label fast-path resolve it. A genuine typo simply fails later
             // with a clear `unknown signal` at evaluation instead of blocking
             // the whole batch here at parse time.
             Err(_) => {
@@ -712,8 +800,8 @@ pub fn collect_leaf_labels(
         }
     }
     // Also include leaves from references that aren't reached by any
-    // channel — defensive: lets the user define a reference now and a
-    // channel that uses it later without surprising load behavior.
+    // channel. This lets the user define a reference now and a channel
+    // that uses it later without surprising load behavior.
     for ast in ref_asts.values() {
         walk(ast, &ref_asts, &ref_names, &mut out, &mut seen, &mut visiting);
     }
@@ -721,9 +809,14 @@ pub fn collect_leaf_labels(
     Ok(out)
 }
 
+/// Evaluate the AST against a signal table. Each signal slice must have
+/// the same length, and the output is that length. Returns
+/// `ExprError::UnknownSignal` if any referenced name is missing.
+/// `mean(...)` nodes average the arguments available in `signals` (see
+/// module doc).
 pub fn evaluate(ast: &ExprAst, signals: &HashMap<String, Vec<f64>>) -> Result<Vec<f64>, ExprError> {
     // Resolve mean(...) nodes against what this signal table actually
-    // holds — the mean of the available arguments (module doc). After
+    // holds: the mean of the available arguments (module doc). After
     // this, every term is a plain Leaf/Named reference.
     let available: HashSet<String> = signals.keys().cloned().collect();
     let flat = flatten(ast, &available)?;
@@ -749,10 +842,12 @@ pub fn evaluate(ast: &ExprAst, signals: &HashMap<String, Vec<f64>>) -> Result<Ve
     for t in &flat {
         if let Some(sig) = &t.signal {
             let data = signals.get(sig.name()).unwrap();
-            for (o, &x) in out.iter_mut().zip(data.iter()) { *o += t.coeff * x; }
+            for (o, &x) in out.iter_mut().zip(data.iter()) {
+                *o += t.coeff * x;
+            }
         }
-        // scalar-only terms are not reachable here (parse rejects them
-        // when mixed with signals; pure-scalar expressions don't
+        // Scalar-only terms are not reachable here (parse rejects them
+        // when mixed with signals, and pure-scalar expressions don't
         // produce a signal vector at all).
     }
     Ok(out)
@@ -764,8 +859,8 @@ pub fn evaluate(ast: &ExprAst, signals: &HashMap<String, Vec<f64>>) -> Result<Ve
 mod tests {
     use super::*;
 
-    /// Flatten with every signal in the AST available — the all-present
-    /// view, which must match the historical parse-time desugaring.
+    /// Flatten with every signal in the AST available: the all-present
+    /// view, which must match the written-out `(a + ...)/N` form.
     fn flat_all(ast: &ExprAst) -> Vec<Term> {
         let avail: HashSet<String> = ast.signals().into_iter().collect();
         flatten(ast, &avail).unwrap()
@@ -853,7 +948,7 @@ mod tests {
     }
     #[test]
     fn brackets_are_grouping() {
-        // `[expr]` is an alias for `(expr)` — contents are parsed as a
+        // `[expr]` is an alias for `(expr)`. Contents are parsed as a
         // sub-expression, not as a literal label.
         let ast = parse("[C3 - A2]").unwrap();
         assert_eq!(ast.terms, vec![one_sig(1.0, "C3"), one_sig(-1.0, "A2")]);
@@ -866,9 +961,8 @@ mod tests {
         assert_eq!(ast.terms, vec![one_sig(1.0, "C3-A2")]);
     }
     #[test]
-    fn parses_users_grouped_mean() {
-        // The user's example: brackets group three-channel differences
-        // inside each mean argument.
+    fn parses_bracket_grouped_mean() {
+        // Brackets group three-channel differences inside each mean argument.
         let ast = parse("mean([C3 - A2 - B], [C4 - A1 - A])").unwrap();
         // Expected (all channels available): mean(C3 - A2 - B, C4 - A1 - A)
         //   = 1/2 C3  - 1/2 A2  - 1/2 B  + 1/2 C4  - 1/2 A1  - 1/2 A
@@ -938,7 +1032,7 @@ mod tests {
         sigs.insert("C".into(), vec![0.3, 3.7e-5, 0.0]);
         let a = evaluate(&mean_ast, &sigs).unwrap();
         let b = evaluate(&sum_ast, &sigs).unwrap();
-        assert_eq!(a, b); // exact — same coefficients, same summation order
+        assert_eq!(a, b); // Exact: same coefficients, same summation order.
     }
 
     #[test]
@@ -956,7 +1050,7 @@ mod tests {
 
     #[test]
     fn channel_satisfiable_resolves_refs_adaptively() {
-        // M lists every montage spelling; a file carrying just one of
+        // M lists every montage spelling. A file carrying just one of
         // them still satisfies both M and the channel that rereferences
         // against it. A file with none satisfies neither.
         let m = parse_named("M = mean($C3-A2$, $[C3-A2 - B]$)").unwrap();
@@ -988,13 +1082,13 @@ mod tests {
 
     #[test]
     fn collect_leaf_labels_expands_named_references() {
-        // The user's CFS bug: LM = mean(M1, M2); channels reference LM.
+        // LM = mean(M1, M2), and the channels reference LM.
         // The dispatcher needs to load M1 and M2 in addition to C3/C4.
         let channels = ["[C3 - LM]", "[C4 - LM]", "-LM"];
         let references = ["LM = mean(M1, M2)"];
         let leaves = collect_leaf_labels(&channels, &references).unwrap();
         // Order: C3 (from channel 1), then M1, M2 (from LM expansion),
-        // then C4 (from channel 2). LM itself is NOT a leaf — it's a
+        // then C4 (from channel 2). LM itself is NOT a leaf. It's a
         // named ref. -LM contributes no new leaves (M1/M2 already in).
         assert!(leaves.contains(&"C3".to_string()));
         assert!(leaves.contains(&"C4".to_string()));
@@ -1005,7 +1099,7 @@ mod tests {
 
     #[test]
     fn collect_leaf_labels_handles_nested_references() {
-        // LM = mean(M1, M2); BIG = mean(LM, C3); channel [C3 - BIG].
+        // LM = mean(M1, M2), BIG = mean(LM, C3), channel [C3 - BIG].
         // BIG's leaves resolve through LM to {M1, M2, C3}.
         let channels = ["[C3 - BIG]"];
         let references = ["LM = mean(M1, M2)", "BIG = mean(LM, C3)"];
@@ -1030,7 +1124,7 @@ mod tests {
 
     #[test]
     fn collect_leaf_labels_bare_literal_channels_unchanged() {
-        // No references defined — the leaves are literally the channel
+        // No references defined. The leaves are literally the channel
         // expressions.
         let channels = ["C3", "C4", "O1"];
         let references: [&str; 0] = [];
@@ -1041,7 +1135,7 @@ mod tests {
     #[test]
     fn collect_leaf_labels_treats_unparseable_channel_as_literal_label() {
         // Referential-montage labels with a space (`O2 A1`, `C3 A2`) don't
-        // parse as expressions (two idents, no operator) — they must be
+        // parse as expressions (two idents, no operator). They must be
         // collected verbatim as literal leaves so the partial EDF load brings
         // the real signal into memory and the eval fast-path resolves it.
         let channels = ["O2 A1", "C3 A2"];

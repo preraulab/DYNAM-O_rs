@@ -84,7 +84,7 @@ fn emit_git_sha() {
     let ver = if dirty { format!("{sha}.dirty") } else { sha };
     println!("cargo:rustc-env=DYNAMO_GIT_SHA={ver}");
 
-    // Re-run when HEAD moves (commit / pull / checkout); logs/HEAD is appended
+    // Re-run when HEAD moves (commit / pull / checkout). Logs/HEAD is appended
     // on every HEAD update, so it catches new commits on the same branch.
     for p in ["logs/HEAD", "HEAD"] {
         if let Some(path) = git(&["rev-parse", "--git-path", p]) {
@@ -155,7 +155,7 @@ fn stage_filter_cache(crate_dir: &std::path::Path) {
     }
 }
 
-/// Write `$OUT_DIR/embedded_filters.rs` — a sorted `EMBEDDED_FILTERS` table of
+/// Write `$OUT_DIR/embedded_filters.rs`. A sorted `EMBEDDED_FILTERS` table of
 /// `(filename, include_bytes!(abs_path))` for every `*.npy` in the sibling
 /// `data_matlab_filters/` dir. `filter_cache.rs` `include!`s this and uses it as
 /// the last on-disk-cache fallback before the cheby1 design.

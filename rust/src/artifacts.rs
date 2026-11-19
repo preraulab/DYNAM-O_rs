@@ -1,4 +1,4 @@
-//! Artifact detection — port of pydynamo `artifacts.py::detect_artifacts`
+//! Artifact detection. Port of pydynamo `artifacts.py::detect_artifacts`
 //! (and MATLAB `toolbox/helper_functions/artifact_detection/detect_artifacts.m`)
 //! with default parameters.
 //!
@@ -28,30 +28,52 @@
 //! `slope_test=false`).
 
 use crate::filter_design::cheby1_sos;
-use crate::signal::{hilbert, sosfiltfilt};
+use crate::signal::{hilbert, movmean, sosfiltfilt};
 use multitaper_rs::dpss::dpss_tapers;
 use multitaper_rs::{compute_spectrogram, DetrendMode, SpectrogramParams, Weighting};
 use ndarray::ArrayView1;
 
+/// Order of the Chebyshev Type-I highpass that isolates each band.
+const BAND_HIGHPASS_ORDER: usize = 4;
+/// Passband ripple of that highpass, in dB.
+const BAND_HIGHPASS_RIPPLE_DB: f64 = 0.2;
+/// Samples this many standard deviations from the mean of the good samples
+/// are flagged before the band tests.
+const OUTLIER_NOISE_SD: f64 = 10.0;
+
 /// Options for `detect_artifacts`. Matches pydynamo defaults.
 #[derive(Debug, Clone)]
 pub struct ArtifactOpts {
+    /// Highpass cutoff of the high-frequency band, in Hz.
     pub hf_pass: f64,
+    /// z-score above which a high-frequency-band sample is flagged.
     pub hf_crit: f64,
+    /// Highpass cutoff of the broad band, in Hz.
     pub bb_pass: f64,
+    /// z-score above which a broad-band sample is flagged.
     pub bb_crit: f64,
+    /// Subtract a moving median from the high-frequency band's log envelope
+    /// before the z-score.
     pub hf_detrend: bool,
+    /// Subtract a moving median from the broad band's log envelope before
+    /// the z-score.
     pub bb_detrend: bool,
+    /// Length of the moving-mean window that smooths the envelope, in seconds.
     pub smooth_duration: f64,
+    /// Length of the moving-median detrend window, in seconds.
     pub detrend_duration: f64,
+    /// Time added to each side of every flagged run, in seconds. 0 adds none.
     pub buffer_duration: f64,
-    /// "robust" (median + MAD, pydynamo default) or "standard" (mean + std).
+    /// How the z-score is centered and scaled.
     pub zscore_method: ZScoreMethod,
 }
 
+/// How `iterative_robust_zscore` centers and scales.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZScoreMethod {
+    /// Median center, mean-absolute-deviation scale (pydynamo default).
     Robust,
+    /// Mean center, standard-deviation scale.
     Standard,
 }
 
@@ -103,11 +125,12 @@ pub fn flat_run_mask_with_tolerance(data: &[f64], min_run: usize, tol: f64) -> V
     for i in 1..=n {
         // Would extending the run to sample i keep its span within tol? A
         // non-finite sample always breaks the run (handled as bad elsewhere).
-        let extend = i < n && data[i].is_finite() && {
-            let lo = run_min.min(data[i]);
-            let hi = run_max.max(data[i]);
-            (hi - lo) <= tol
-        };
+        let mut extend = false;
+        if i < n && data[i].is_finite() {
+            let min_if_extended = run_min.min(data[i]);
+            let max_if_extended = run_max.max(data[i]);
+            extend = (max_if_extended - min_if_extended) <= tol;
+        }
         if extend {
             run_min = run_min.min(data[i]);
             run_max = run_max.max(data[i]);
@@ -168,43 +191,17 @@ pub fn flat_tolerance(data: &[f64]) -> f64 {
     frac * std_dev
 }
 
-/// MATLAB `movmean(x, win)` — centered moving mean with shrinking window
-/// at the endpoints (partial means on the edges).
-fn movmean(x: &[f64], win: usize) -> Vec<f64> {
-    let n = x.len();
-    if win <= 1 || n == 0 {
-        return x.to_vec();
-    }
-    // MATLAB places an even-length window one sample toward the past:
-    // samples [i - win/2, i + win/2 - 1]. Odd lengths are symmetric.
-    let half_l = win / 2;
-    let half_r = (win - 1) / 2;
-    let mut csum = vec![0.0_f64; n + 1];
-    for i in 0..n {
-        csum[i + 1] = csum[i] + x[i];
-    }
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let a = i.saturating_sub(half_l);
-        let b = (i + half_r + 1).min(n);
-        out.push((csum[b] - csum[a]) / (b - a) as f64);
-    }
-    out
-}
-
-/// MATLAB `movmedian(x, win)` — centered moving median with shrinking
+/// MATLAB `movmedian(x, win)`. Centered moving median with shrinking
 /// window at the endpoints.
 ///
-/// Implementation: two-heap with lazy deletion (max-heap of the lower
-/// half + min-heap of the upper half, rebalanced after every
-/// insert/remove). All operations are O(log W) where W is the window
-/// size, with a ~300 KB working set for W ≈ 40 000 — fits in L2 cache,
-/// which is the dominant performance win vs the previous Fenwick-BIT-
-/// over-the-full-n implementation (BIT size N = 5 M ⇒ ~40 MB working
-/// set, mostly cache-missing).
+/// Implementation: two heaps with lazy deletion (a max-heap holding the
+/// lower half of the window and a min-heap holding the upper half,
+/// rebalanced after every insert and remove). Each step costs O(log W)
+/// for a window of W samples, and the working set is the window alone
+/// (about 300 KB for W ≈ 40 000), so it stays in the CPU cache.
 ///
-/// Tested for bit-identity against the Fenwick reference on random
-/// inputs (see `movmedian_two_heap_matches_fenwick`).
+/// The test `movmedian_two_heap_matches_fenwick` checks it bit for bit
+/// against the Fenwick-tree reference `movmedian_fenwick`.
 fn movmedian(x: &[f64], win: usize) -> Vec<f64> {
     movmedian_two_heap(x, win)
 }
@@ -215,17 +212,21 @@ fn movmedian_two_heap(x: &[f64], win: usize) -> Vec<f64> {
     use std::collections::{BinaryHeap, HashMap};
 
     /// Total-ordering wrapper around f64. Uses `partial_cmp` and falls
-    /// back to `Equal` for NaN — matches the Fenwick reference impl.
+    /// back to `Equal` for NaN. Matches the Fenwick reference impl.
     #[derive(Copy, Clone, Debug)]
-    struct Of(f64);
-    impl PartialEq for Of { fn eq(&self, o: &Self) -> bool { self.0.to_bits() == o.0.to_bits() } }
-    impl Eq for Of {}
-    impl PartialOrd for Of {
+    struct OrderedF64(f64);
+    impl PartialEq for OrderedF64 {
+        fn eq(&self, o: &Self) -> bool {
+            self.0.to_bits() == o.0.to_bits()
+        }
+    }
+    impl Eq for OrderedF64 {}
+    impl PartialOrd for OrderedF64 {
         fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
             Some(self.cmp(o))
         }
     }
-    impl Ord for Of {
+    impl Ord for OrderedF64 {
         fn cmp(&self, o: &Self) -> std::cmp::Ordering {
             self.0.partial_cmp(&o.0).unwrap_or(std::cmp::Ordering::Equal)
         }
@@ -235,15 +236,12 @@ fn movmedian_two_heap(x: &[f64], win: usize) -> Vec<f64> {
     if win <= 1 || n == 0 {
         return x.to_vec();
     }
-    // MATLAB places an even-length window one sample toward the past:
-    // samples [i - win/2, i + win/2 - 1]. Odd lengths are symmetric.
-    let half_l = win / 2;
-    let half_r = (win - 1) / 2;
+    let (half_l, half_r) = crate::signal::matlab_window_halves(win);
 
     // lo: max-heap (top is largest of the small half).
     // hi: min-heap (top is smallest of the large half).
-    let mut lo: BinaryHeap<Of> = BinaryHeap::new();
-    let mut hi: BinaryHeap<Reverse<Of>> = BinaryHeap::new();
+    let mut lo: BinaryHeap<OrderedF64> = BinaryHeap::new();
+    let mut hi: BinaryHeap<Reverse<OrderedF64>> = BinaryHeap::new();
     // Lazy-delete counts keyed by f64 bit pattern.
     let mut del_lo: HashMap<u64, u32> = HashMap::new();
     let mut del_hi: HashMap<u64, u32> = HashMap::new();
@@ -252,26 +250,30 @@ fn movmedian_two_heap(x: &[f64], win: usize) -> Vec<f64> {
     let mut n_hi: usize = 0;
 
     // Pop any tops that have been marked for lazy deletion.
-    let prune_lo = |lo: &mut BinaryHeap<Of>, del_lo: &mut HashMap<u64, u32>| {
-        while let Some(&Of(top)) = lo.peek() {
+    let prune_lo = |lo: &mut BinaryHeap<OrderedF64>, del_lo: &mut HashMap<u64, u32>| {
+        while let Some(&OrderedF64(top)) = lo.peek() {
             let bits = top.to_bits();
             match del_lo.get_mut(&bits) {
                 Some(c) if *c > 0 => {
                     *c -= 1;
-                    if *c == 0 { del_lo.remove(&bits); }
+                    if *c == 0 {
+                        del_lo.remove(&bits);
+                    }
                     lo.pop();
                 }
                 _ => break,
             }
         }
     };
-    let prune_hi = |hi: &mut BinaryHeap<Reverse<Of>>, del_hi: &mut HashMap<u64, u32>| {
-        while let Some(&Reverse(Of(top))) = hi.peek() {
+    let prune_hi = |hi: &mut BinaryHeap<Reverse<OrderedF64>>, del_hi: &mut HashMap<u64, u32>| {
+        while let Some(&Reverse(OrderedF64(top))) = hi.peek() {
             let bits = top.to_bits();
             match del_hi.get_mut(&bits) {
                 Some(c) if *c > 0 => {
                     *c -= 1;
-                    if *c == 0 { del_hi.remove(&bits); }
+                    if *c == 0 {
+                        del_hi.remove(&bits);
+                    }
                     hi.pop();
                 }
                 _ => break,
@@ -293,13 +295,13 @@ fn movmedian_two_heap(x: &[f64], win: usize) -> Vec<f64> {
             // Decide which heap on the basis of the current lo-top.
             let goes_lo = match lo.peek() {
                 None => true,
-                Some(&Of(top)) => Of(v).cmp(&Of(top)) != std::cmp::Ordering::Greater,
+                Some(&OrderedF64(top)) => OrderedF64(v).cmp(&OrderedF64(top)) != std::cmp::Ordering::Greater,
             };
             if goes_lo {
-                lo.push(Of(v));
+                lo.push(OrderedF64(v));
                 n_lo += 1;
             } else {
-                hi.push(Reverse(Of(v)));
+                hi.push(Reverse(OrderedF64(v)));
                 n_hi += 1;
             }
             b += 1;
@@ -310,7 +312,7 @@ fn movmedian_two_heap(x: &[f64], win: usize) -> Vec<f64> {
             let v = x[a];
             // Decide which heap by comparing to lo-top.
             let on_lo = match lo.peek() {
-                Some(&Of(top)) => Of(v).cmp(&Of(top)) != std::cmp::Ordering::Greater,
+                Some(&OrderedF64(top)) => OrderedF64(v).cmp(&OrderedF64(top)) != std::cmp::Ordering::Greater,
                 None => false,
             };
             if on_lo {
@@ -329,14 +331,14 @@ fn movmedian_two_heap(x: &[f64], win: usize) -> Vec<f64> {
             prune_lo(&mut lo, &mut del_lo);
             prune_hi(&mut hi, &mut del_hi);
             if n_lo > n_hi + 1 {
-                if let Some(Of(top)) = lo.pop() {
-                    hi.push(Reverse(Of(top)));
+                if let Some(OrderedF64(top)) = lo.pop() {
+                    hi.push(Reverse(OrderedF64(top)));
                     n_lo -= 1;
                     n_hi += 1;
                 } else { break; }
             } else if n_hi > n_lo {
-                if let Some(Reverse(Of(top))) = hi.pop() {
-                    lo.push(Of(top));
+                if let Some(Reverse(OrderedF64(top))) = hi.pop() {
+                    lo.push(OrderedF64(top));
                     n_hi -= 1;
                     n_lo += 1;
                 } else { break; }
@@ -351,11 +353,11 @@ fn movmedian_two_heap(x: &[f64], win: usize) -> Vec<f64> {
         debug_assert_eq!(n_lo + n_hi, m);
         let med = if m % 2 == 1 {
             // Odd: median is lo.top().
-            lo.peek().map(|&Of(v)| v).unwrap_or(f64::NAN)
+            lo.peek().map(|&OrderedF64(v)| v).unwrap_or(f64::NAN)
         } else {
             // Even: avg of lo.top() and hi.top().
-            let l = lo.peek().map(|&Of(v)| v).unwrap_or(f64::NAN);
-            let h = hi.peek().map(|&Reverse(Of(v))| v).unwrap_or(f64::NAN);
+            let l = lo.peek().map(|&OrderedF64(v)| v).unwrap_or(f64::NAN);
+            let h = hi.peek().map(|&Reverse(OrderedF64(v))| v).unwrap_or(f64::NAN);
             0.5 * (l + h)
         };
         out.push(med);
@@ -363,21 +365,16 @@ fn movmedian_two_heap(x: &[f64], win: usize) -> Vec<f64> {
     out
 }
 
+/// Fenwick-tree (binary indexed tree) moving median. Test-only reference:
+/// `movmedian_two_heap` must match it bit for bit. Its tree spans all n
+/// samples rather than one window, so it is slower on long signals.
 #[cfg(test)]
-#[allow(dead_code)]
-/// Original Fenwick-BIT implementation, kept as a regression reference
-/// to assert bit-identity against the new two-heap impl. O(n log n)
-/// total but ~3× slower on a 5 M-sample 30 s window-detrend benchmark
-/// because the BIT is sized N and doesn't fit in cache.
 fn movmedian_fenwick(x: &[f64], win: usize) -> Vec<f64> {
     let n = x.len();
     if win <= 1 || n == 0 {
         return x.to_vec();
     }
-    // MATLAB places an even-length window one sample toward the past:
-    // samples [i - win/2, i + win/2 - 1]. Odd lengths are symmetric.
-    let half_l = win / 2;
-    let half_r = (win - 1) / 2;
+    let (half_l, half_r) = crate::signal::matlab_window_halves(win);
 
     // 1) Rank-sort x: rank[i] = i's position in sorted order.
     //    sorted_vals[r] gives the r-th smallest value.
@@ -459,8 +456,9 @@ fn movmedian_fenwick(x: &[f64], win: usize) -> Vec<f64> {
     out
 }
 
-/// Median of finite values. Returns NaN for all-NaN input.
-#[allow(dead_code)] // used by the test-only reference impl in `mod tests`
+/// Median of finite values. Returns NaN for all-NaN input. Used by the
+/// test-only reference implementation in `mod tests`.
+#[cfg(test)]
 fn median(xs: &[f64]) -> f64 {
     let mut v: Vec<f64> = xs.iter().filter(|x| x.is_finite()).copied().collect();
     if v.is_empty() {
@@ -476,50 +474,51 @@ fn median(xs: &[f64]) -> f64 {
 }
 
 /// MATLAB default `mad(x)`: mean absolute deviation from the mean.
-/// (Not median absolute deviation! pydynamo matches.)
-#[allow(dead_code)] // used by the test-only reference impl in `mod tests`
+/// (Not median absolute deviation! pydynamo matches.) Used by the test-only
+/// reference implementation in `mod tests`.
+#[cfg(test)]
 fn mad_meanabs(xs: &[f64]) -> f64 {
     let finite: Vec<f64> = xs.iter().filter(|x| x.is_finite()).copied().collect();
     if finite.is_empty() {
         return f64::NAN;
     }
-    let mean_ = finite.iter().sum::<f64>() / finite.len() as f64;
-    finite.iter().map(|&v| (v - mean_).abs()).sum::<f64>() / finite.len() as f64
+    let mean = finite.iter().sum::<f64>() / finite.len() as f64;
+    finite.iter().map(|&v| (v - mean).abs()).sum::<f64>() / finite.len() as f64
 }
 
-#[allow(dead_code)] // used by the test-only reference impl in `mod tests`
+/// Mean and sample standard deviation (n - 1) of the finite values. Used by
+/// the test-only reference implementation in `mod tests`.
+#[cfg(test)]
 fn mean_std(xs: &[f64]) -> (f64, f64) {
     let finite: Vec<f64> = xs.iter().filter(|x| x.is_finite()).copied().collect();
     if finite.is_empty() {
         return (f64::NAN, f64::NAN);
     }
     let n = finite.len() as f64;
-    let mean_ = finite.iter().sum::<f64>() / n;
+    let mean = finite.iter().sum::<f64>() / n;
     if finite.len() < 2 {
-        return (mean_, f64::NAN);
+        return (mean, f64::NAN);
     }
-    let var_ = finite.iter().map(|&v| (v - mean_).powi(2)).sum::<f64>() / (n - 1.0);
-    (mean_, var_.sqrt())
+    let variance = finite.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    (mean, variance.sqrt())
 }
 
-/// Iteratively flag samples where |z| > crit, recomputing centering stats on
-/// the shrinking good set until convergence. Returns a bad-sample mask
-/// including the input `bad`.
+/// Iteratively flag samples where |z| > crit, recomputing the center and
+/// scale on the remaining good samples until no new sample is flagged.
+/// Returns a bad-sample mask that includes the input `bad`.
+///
+/// `Robust` centers on the median and scales by the mean absolute
+/// deviation from the mean (MATLAB default `mad(x)`). `Standard` uses
+/// the mean and the sample standard deviation.
 ///
 /// Implementation:
-/// * Reuse a single `good_vals` buffer across iterations — saves ~5 MB
-///   alloc+free per iteration on a 5 M-sample series.
-/// * Use `select_nth_unstable_by` for the median instead of a full sort.
-///   O(n) average vs O(n log n). For n ≈ 4.6 M this is the dominant
-///   win — saves ~150-250 ms per iteration on the BB band.
-/// * For even-n medians, after the partition pass `buf[..k]` contains
-///   the k smallest values (unordered); the max of that range is the
-///   (k-1)-th order statistic. Saves the second select call.
-/// * Bit-identical to the previous "filter → sort → index" path because
-///   `select_nth_unstable` returns the same scalar value at index `k`
-///   as a stable sort would, given identical inputs and tie-breaking
-///   on the values themselves rather than indices (we never reuse the
-///   ordering, only the values).
+/// * One buffer of good values is refilled on every pass.
+/// * The median comes from `select_nth_unstable_by`, which is O(n) on
+///   average where a full sort is O(n log n). It returns the same value
+///   a full sort would put at index `k`.
+/// * For an even count, the partition leaves the `k` smallest values
+///   (unordered) in `buf[..k]`. Their max is the other middle value, so
+///   no second selection is needed.
 pub fn iterative_robust_zscore(
     y: &[f64],
     bad: &[bool],
@@ -542,9 +541,9 @@ pub fn iterative_robust_zscore(
         }
         let (mid, scale) = match method {
             ZScoreMethod::Robust => {
-                // O(n) median via partition + (for even n) max over the
-                // lower half. Matches the prior `median()`'s output bit-
-                // for-bit.
+                // Median by partition, plus (for an even count) the max
+                // of the lower half. Same value as sorting and taking the
+                // middle.
                 let n = buf.len();
                 let k = n / 2;
                 let cmp = |a: &f64, b: &f64| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
@@ -558,19 +557,19 @@ pub fn iterative_robust_zscore(
                     0.5 * (lower_max + mid_val)
                 };
                 // MAD = mean absolute deviation from the mean (not from
-                // the median — matches MATLAB default `mad(x)`).
-                let mean_ = buf.iter().sum::<f64>() / n as f64;
-                let mad = buf.iter().map(|&v| (v - mean_).abs()).sum::<f64>() / n as f64;
+                // the median, matching MATLAB default `mad(x)`).
+                let mean = buf.iter().sum::<f64>() / n as f64;
+                let mad = buf.iter().map(|&v| (v - mean).abs()).sum::<f64>() / n as f64;
                 (med, mad)
             }
             ZScoreMethod::Standard => {
                 let n = buf.len() as f64;
-                let mean_ = buf.iter().sum::<f64>() / n;
+                let mean = buf.iter().sum::<f64>() / n;
                 if buf.len() < 2 {
-                    (mean_, f64::NAN)
+                    (mean, f64::NAN)
                 } else {
-                    let var_ = buf.iter().map(|&v| (v - mean_).powi(2)).sum::<f64>() / (n - 1.0);
-                    (mean_, var_.sqrt())
+                    let variance = buf.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0);
+                    (mean, variance.sqrt())
                 }
             }
         };
@@ -597,60 +596,74 @@ pub fn iterative_robust_zscore(
 /// good samples, returning the union with `bad`.
 fn find_outlier_noise(data: &[f64], bad: &[bool], outlier_scalar: f64) -> Vec<bool> {
     let mut out = bad.to_vec();
-    let good_vals: Vec<f64> = data
-        .iter()
-        .zip(bad.iter())
-        .filter_map(|(v, &m)| if !m && v.is_finite() { Some(*v) } else { None })
-        .collect();
+    let mut good_vals: Vec<f64> = Vec::new();
+    for i in 0..data.len() {
+        if !bad[i] && data[i].is_finite() {
+            good_vals.push(data[i]);
+        }
+    }
     if good_vals.is_empty() {
         return out;
     }
     let n = good_vals.len() as f64;
-    let mean_ = good_vals.iter().sum::<f64>() / n;
+    let mean = good_vals.iter().sum::<f64>() / n;
     if good_vals.len() < 2 {
         return out;
     }
-    let var_ = good_vals.iter().map(|&v| (v - mean_).powi(2)).sum::<f64>() / (n - 1.0);
-    let sd = var_.sqrt();
-    let lo = mean_ - outlier_scalar * sd;
-    let hi = mean_ + outlier_scalar * sd;
+    let variance = good_vals.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    let std_dev = variance.sqrt();
+    let lower_limit = mean - outlier_scalar * std_dev;
+    let upper_limit = mean + outlier_scalar * std_dev;
     for i in 0..data.len() {
-        if data[i] <= lo || data[i] >= hi {
+        if data[i] <= lower_limit || data[i] >= upper_limit {
             out[i] = true;
         }
     }
     out
 }
 
-/// Linear interp over bad samples using the nearest good values on either side
-/// (padded with good-endpoint values). Replaces pydynamo
-/// `detect_artifacts` lines 341-350.
+/// Linear interpolation over bad samples from the nearest good sample on
+/// each side. Before the first good sample and after the last one, the
+/// nearest good value is held. Same as the `np.interp` step in pydynamo
+/// `detect_artifacts`.
 fn interp_bad_samples(data: &[f64], bad: &[bool]) -> Vec<f64> {
     let n = data.len();
     let mut fixed = data.to_vec();
-    let good_idx: Vec<usize> = (0..n).filter(|&i| !bad[i]).collect();
+    let mut good_idx: Vec<usize> = Vec::new();
+    for i in 0..n {
+        if !bad[i] {
+            good_idx.push(i);
+        }
+    }
     if good_idx.is_empty() {
         return fixed;
     }
-    let good_vals: Vec<f64> = good_idx.iter().map(|&i| data[i]).collect();
-    let xp: Vec<f64> = std::iter::once(-1.0)
-        .chain(good_idx.iter().map(|&i| i as f64))
-        .chain(std::iter::once(n as f64))
-        .collect();
-    let fp: Vec<f64> = std::iter::once(*good_vals.first().unwrap())
-        .chain(good_vals.iter().copied())
-        .chain(std::iter::once(*good_vals.last().unwrap()))
-        .collect();
+    // Interpolation knots: every good sample, plus one knot just outside
+    // each end (positions -1 and n) carrying the first and last good
+    // value, so bad samples at the edges take the nearest good value.
+    let first_good = data[good_idx[0]];
+    let last_good = data[good_idx[good_idx.len() - 1]];
+    let mut knot_positions: Vec<f64> = Vec::with_capacity(good_idx.len() + 2);
+    let mut knot_values: Vec<f64> = Vec::with_capacity(good_idx.len() + 2);
+    knot_positions.push(-1.0);
+    knot_values.push(first_good);
+    for &i in &good_idx {
+        knot_positions.push(i as f64);
+        knot_values.push(data[i]);
+    }
+    knot_positions.push(n as f64);
+    knot_values.push(last_good);
 
     for i in 0..n {
         if bad[i] {
             let q = i as f64;
-            // Binary search: find j s.t. xp[j-1] <= q < xp[j]
-            let j = xp.partition_point(|&t| t <= q);
-            let t0 = xp[j - 1];
-            let t1 = xp[j];
-            let y0 = fp[j - 1];
-            let y1 = fp[j];
+            // Binary search: find j such that
+            // knot_positions[j-1] <= q < knot_positions[j].
+            let j = knot_positions.partition_point(|&t| t <= q);
+            let t0 = knot_positions[j - 1];
+            let t1 = knot_positions[j];
+            let y0 = knot_values[j - 1];
+            let y1 = knot_values[j];
             fixed[i] = y0 + (q - t0) / (t1 - t0) * (y1 - y0);
         }
     }
@@ -669,17 +682,20 @@ fn compute_band_artifacts(
     detrend_on: bool,
     zscore_method: ZScoreMethod,
 ) -> Vec<bool> {
-    // Sub-step timing — log at `info` level so it surfaces in the
-    // Tauri stderr stream with default `RUST_LOG=info`. Lets us see
-    // where the per-band budget actually goes (filter, Hilbert, smooth,
-    // z-score) on a real recording.
-    let band_tag = format!("band(pass={:.2}Hz, crit={:.2}, detrend={})", passband, crit, detrend_on);
+    // Time each sub-step (filter design, filter, Hilbert, smooth, detrend,
+    // z-score). The timings are printed at the end of this function, and
+    // only when the `DYNAMO_ARTIFACT_TIMING` environment variable is set.
     let t_band = std::time::Instant::now();
 
-    // Cheby-I order-4 highpass SOS with 0.2 dB ripple.
+    // Chebyshev Type-I highpass, as second-order sections.
     let t = std::time::Instant::now();
-    let sections = cheby1_sos(4, 0.2, &[passband], "highpass", fs);
-    let sos: Vec<[f64; 6]> = sections.into_iter().collect();
+    let sos: Vec<[f64; 6]> = cheby1_sos(
+        BAND_HIGHPASS_ORDER,
+        BAND_HIGHPASS_RIPPLE_DB,
+        &[passband],
+        "highpass",
+        fs,
+    );
     let t_design_ms = t.elapsed().as_secs_f64() * 1e3;
 
     let t = std::time::Instant::now();
@@ -699,8 +715,14 @@ fn compute_band_artifacts(
     let t = std::time::Instant::now();
     let win_smooth = (smooth_duration * fs).round().max(1.0) as usize;
     let mut y = movmean(&env, win_smooth);
+    // Log of the smoothed envelope. A non-positive value has no log and
+    // becomes NaN, which the z-score step skips.
     for v in y.iter_mut() {
-        *v = if *v > 0.0 { v.ln() } else { f64::NAN };
+        if *v > 0.0 {
+            *v = v.ln();
+        } else {
+            *v = f64::NAN;
+        }
     }
     let t_smooth_ms = t.elapsed().as_secs_f64() * 1e3;
 
@@ -724,6 +746,7 @@ fn compute_band_artifacts(
     // see per-band breakdowns on stderr. No `tracing` dep on
     // `dynamo_rs` so we use plain `eprintln!`.
     if std::env::var("DYNAMO_ARTIFACT_TIMING").is_ok() {
+        let band_tag = format!("band(pass={:.2}Hz, crit={:.2}, detrend={})", passband, crit, detrend_on);
         eprintln!(
             "[artifact_timing] {} n={} fs={} total={:.1}ms  design={:.2}ms filter={:.1}ms hilbert={:.1}ms smooth={:.1}ms detrend={:.1}ms zscore={:.1}ms",
             band_tag, data.len(), fs, t_total_ms,
@@ -741,7 +764,7 @@ fn binary_dilate(mask: &[bool], k: usize) -> Vec<bool> {
         return mask.to_vec();
     }
     let mut out = vec![false; n];
-    // Find runs of True; expand each run by k on both sides.
+    // Find runs of True. Expand each run by k on both sides.
     let mut i = 0;
     while i < n {
         if mask[i] {
@@ -797,8 +820,10 @@ pub fn detect_artifacts_with_known_bad(
         assert_eq!(mask.len(), n, "known_bad must have one entry per sample");
     }
 
-    // Flat runs of ≥ 1 s, with a data-scaled tolerance (see flat_tolerance).
-    let flat = flat_run_mask_with_tolerance(data, fs.round().max(1.0) as usize, flat_tolerance(data));
+    // Flat runs of at least one second, with a data-scaled tolerance (see
+    // flat_tolerance).
+    let one_second_samples = fs.round().max(1.0) as usize;
+    let flat = flat_run_mask_with_tolerance(data, one_second_samples, flat_tolerance(data));
     let mut bad: Vec<bool> = Vec::with_capacity(n);
     for i in 0..n {
         let already_known_bad = match known_bad {
@@ -807,12 +832,12 @@ pub fn detect_artifacts_with_known_bad(
         };
         bad.push(!data[i].is_finite() || flat[i] || already_known_bad);
     }
-    bad = find_outlier_noise(data, &bad, 10.0);
+    bad = find_outlier_noise(data, &bad, OUTLIER_NOISE_SD);
 
     // Interp through bad samples so filters don't see NaN / flats.
     let data_fixed = interp_bad_samples(data, &bad);
 
-    // Run the BB and HF bands concurrently — they're independent
+    // Run the BB and HF bands concurrently. They're independent
     // (different filter design, separate copy of `data_fixed`), and
     // each one is sequential internally, so `rayon::join` halves the
     // wall-clock for this phase on any machine with ≥2 cores. The
@@ -820,44 +845,57 @@ pub fn detect_artifacts_with_known_bad(
     // WASM) is bit-identical because each band is a deterministic
     // function of `data_fixed` + `bad`.
     let (hf_art, bb_art) = {
-        let band_hf = (opts.hf_pass, opts.hf_crit, opts.hf_detrend);
-        let band_bb = (opts.bb_pass, opts.bb_crit, opts.bb_detrend);
-        let smooth = opts.smooth_duration;
-        let detrend = opts.detrend_duration;
-        let zsm = opts.zscore_method;
         let data_ref = &data_fixed;
         let bad_ref = &bad;
-        let hf = move || {
+        let run_hf_band = move || {
             compute_band_artifacts(
-                data_ref, fs, band_hf.0, band_hf.1, bad_ref,
-                smooth, detrend, band_hf.2, zsm,
+                data_ref,
+                fs,
+                opts.hf_pass,
+                opts.hf_crit,
+                bad_ref,
+                opts.smooth_duration,
+                opts.detrend_duration,
+                opts.hf_detrend,
+                opts.zscore_method,
             )
         };
-        let bb = move || {
+        let run_bb_band = move || {
             compute_band_artifacts(
-                data_ref, fs, band_bb.0, band_bb.1, bad_ref,
-                smooth, detrend, band_bb.2, zsm,
+                data_ref,
+                fs,
+                opts.bb_pass,
+                opts.bb_crit,
+                bad_ref,
+                opts.smooth_duration,
+                opts.detrend_duration,
+                opts.bb_detrend,
+                opts.zscore_method,
             )
         };
         #[cfg(feature = "parallel")]
-        { rayon::join(hf, bb) }
+        {
+            rayon::join(run_hf_band, run_bb_band)
+        }
         #[cfg(not(feature = "parallel"))]
-        { (hf(), bb()) }
+        {
+            (run_hf_band(), run_bb_band())
+        }
     };
     let mut artifacts: Vec<bool> = (0..n)
         .map(|i| hf_art[i] || bb_art[i] || bad[i])
         .collect();
 
     if opts.buffer_duration > 0.0 {
-        let k = (opts.buffer_duration * fs).round() as usize;
-        if k > 0 {
-            artifacts = binary_dilate(&artifacts, k);
+        let buffer_samples = (opts.buffer_duration * fs).round() as usize;
+        if buffer_samples > 0 {
+            artifacts = binary_dilate(&artifacts, buffer_samples);
         }
     }
     artifacts
 }
 
-/// Slope-test artifact mask — the `slope_test` block of `detect_artifacts.m`.
+/// Slope-test artifact mask. The `slope_test` block of `detect_artifacts.m`.
 ///
 /// ```text
 /// [spect, stimes, sfreqs] = multitaper_spectrogram(data, Fs, [1 min(55,Fs/2)], [10,19], [10 5], ...);
@@ -933,6 +971,8 @@ pub fn slope_test_artifacts(data: &[f64], fs: f64, slope_crit: f64) -> Result<Ve
     // The x side is the same for every window, so it is computed once.
     let mut log_freq: Vec<f64> = Vec::with_capacity(n_freqs);
     for &frequency in frequencies.iter() {
+        // Floor that keeps log() finite. The grid starts at 1 Hz, so it is
+        // not reached in practice.
         log_freq.push(frequency.max(1e-30).ln());
     }
     let mean_log_freq: f64 = log_freq.iter().sum::<f64>() / n_freqs as f64;
@@ -1175,7 +1215,7 @@ mod tests {
     fn tolerance_flat_catches_resampled_flat_but_not_eeg() {
         // A genuinely flat/disconnected segment survives resampling as
         // near-constant (sub-unit ringing), not bit-identical. Exact equality
-        // misses it; a tolerance catches it — while real EEG is never flagged.
+        // misses it. A tolerance catches it, and real EEG is never flagged.
         let min_run = 100usize;
         let mut data = vec![0.0f64; 500];
         // EEG (±20)
@@ -1203,13 +1243,16 @@ mod tests {
     #[test]
     fn movmedian_two_heap_matches_fenwick() {
         // Bit-identity smoke test across a variety of (n, win) sizes
-        // and value distributions, against the kept-in-the-source-tree
-        // Fenwick-BIT reference implementation. Uses an inline xorshift
-        // PRNG so we don't drag in a `rand` dev-dep.
+        // and value distributions, against the Fenwick-tree reference
+        // implementation. Uses an inline xorshift PRNG so we don't drag
+        // in a `rand` dev-dep.
         let mut state: u64 = 0xDEADBEEF;
+        // Uniform value in [0, 1).
         let mut next = || -> f64 {
-            state ^= state << 13; state ^= state >> 7; state ^= state << 17;
-            (state >> 11) as f64 / ((1u64 << 53) as f64)  // in [0, 1)
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / ((1u64 << 53) as f64)
         };
         let cases: &[(usize, usize)] = &[
             (1, 1), (1, 5), (2, 5),
@@ -1224,10 +1267,10 @@ mod tests {
             let x: Vec<f64> = (0..n).map(|_| {
                 if next() < 0.10 { 0.0 } else { next() * 100.0 - 50.0 }
             }).collect();
-            let new_ = movmedian_two_heap(&x, win);
-            let ref_ = movmedian_fenwick(&x, win);
-            assert_eq!(new_.len(), ref_.len(), "(n={}, win={}) length mismatch", n, win);
-            for (i, (a, b)) in new_.iter().zip(ref_.iter()).enumerate() {
+            let two_heap = movmedian_two_heap(&x, win);
+            let fenwick = movmedian_fenwick(&x, win);
+            assert_eq!(two_heap.len(), fenwick.len(), "(n={}, win={}) length mismatch", n, win);
+            for (i, (a, b)) in two_heap.iter().zip(fenwick.iter()).enumerate() {
                 // Use bit-equality so duplicate-median ties are
                 // identical (median is 0.5*(lo + hi) which is exact).
                 assert_eq!(
@@ -1255,7 +1298,7 @@ mod tests {
     fn parallel_band_dispatch_is_bit_identical_to_sequential() {
         // Build a 5-minute synthetic 100 Hz signal with embedded
         // high-frequency bursts (band-HF artifacts) and a flat run.
-        // Run detect_artifacts twice — once via the public API (which
+        // Run detect_artifacts twice. Once via the public API (which
         // uses rayon::join when the `parallel` feature is on), and
         // once via direct sequential band calls. Both must produce
         // bit-identical masks because each band is a pure function of
@@ -1272,14 +1315,16 @@ mod tests {
             })
             .collect();
         // Inject a flat run (≥1 s).
-        for v in data.iter_mut().skip(15_000).take(120) { *v = 0.5; }
+        for v in data.iter_mut().skip(15_000).take(120) {
+            *v = 0.5;
+        }
         // Inject one NaN sample.
         data[20_000] = f64::NAN;
 
         let opts = ArtifactOpts::default();
         let via_api = detect_artifacts(&data, fs, &opts);
 
-        // Sequential reference — mirror the body of detect_artifacts
+        // Sequential reference. Mirror the body of detect_artifacts
         // but without rayon::join.
         let flat = flat_run_mask_with_tolerance(&data, fs.round().max(1.0) as usize, flat_tolerance(&data));
         let mut bad: Vec<bool> = (0..data.len())
@@ -1302,7 +1347,9 @@ mod tests {
             .collect();
         if opts.buffer_duration > 0.0 {
             let k = (opts.buffer_duration * fs).round() as usize;
-            if k > 0 { seq = binary_dilate(&seq, k); }
+            if k > 0 {
+                seq = binary_dilate(&seq, k);
+            }
         }
 
         assert_eq!(via_api.len(), seq.len(), "length mismatch");
@@ -1314,14 +1361,13 @@ mod tests {
 
     #[test]
     fn iter_robust_zscore_matches_sort_reference() {
-        // Compare the optimised select_nth_unstable + buffer-reuse path
+        // Compare the optimized select_nth_unstable + buffer-reuse path
         // against a deliberately-naïve sort + alloc-each-iter reference
         // on a stack of synthetic series. Mask must be bit-identical.
         //
-        // The reference mimics the prior implementation: for each
-        // iteration it collects good values into a fresh Vec, runs the
-        // OLD `median()` + `mad_meanabs()` helpers (sort + sum), then
-        // does the same threshold pass.
+        // The reference collects the good values into a fresh Vec on
+        // every pass and uses the sort-based `median()` and
+        // `mad_meanabs()` helpers, then applies the same threshold.
         fn reference(
             y: &[f64], bad: &[bool], crit: f64, method: ZScoreMethod,
         ) -> Vec<bool> {
@@ -1330,24 +1376,33 @@ mod tests {
                 let good: Vec<f64> = y.iter().zip(mask.iter())
                     .filter_map(|(v, &m)| if !m && v.is_finite() { Some(*v) } else { None })
                     .collect();
-                if good.is_empty() { return mask; }
+                if good.is_empty() {
+                    return mask;
+                }
                 let (mid, scale) = match method {
                     ZScoreMethod::Robust => (median(&good), mad_meanabs(&good)),
                     ZScoreMethod::Standard => mean_std(&good),
                 };
-                if !scale.is_finite() || scale == 0.0 { return mask; }
+                if !scale.is_finite() || scale == 0.0 {
+                    return mask;
+                }
                 let mut any = false;
                 for i in 0..y.len() {
                     if !mask[i] && y[i].is_finite() && ((y[i] - mid) / scale).abs() > crit {
-                        mask[i] = true; any = true;
+                        mask[i] = true;
+                        any = true;
                     }
                 }
-                if !any { return mask; }
+                if !any {
+                    return mask;
+                }
             }
         }
         let mut state: u64 = 0xC0FFEE;
         let mut next = || -> f64 {
-            state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
             (state >> 11) as f64 / ((1u64 << 53) as f64)
         };
         for &n in &[1usize, 2, 7, 64, 1000, 10_000] {

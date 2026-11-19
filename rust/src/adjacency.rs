@@ -2,8 +2,10 @@
 //!
 //! For each region id (label > 0):
 //!   - `interior`  = flat indices (row-major) of pixels IN the region
-//!   - `border`    = flat indices of watershed-0-line pixels adjacent to
-//!                   the region (8-connectivity, 1-pixel dilation ring)
+//!   - `border`    = flat indices of every pixel 8-adjacent to the region
+//!                   that is not in it (watershed-0-line pixels and pixels
+//!                   of other regions)
+//!   - `all_px`    = interior ∪ border
 //!   - `neighbors` = set of region ids reachable via 2-pixel dilation
 //!                   (crossing the watershed line to adjacent regions)
 //!
@@ -14,49 +16,64 @@
 use ndarray::ArrayView2;
 use std::collections::BTreeSet;
 
+/// One watershed region and its pixel lists (flat row-major indices, each
+/// list sorted ascending).
 #[derive(Debug, Default, Clone)]
 pub struct Region {
+    /// The region's watershed label (> 0).
     pub label: i32,
+    /// Pixels carrying this label.
     pub interior: Vec<u32>,
+    /// Pixels 8-adjacent to the region that are not in it. After merges,
+    /// the symmetric difference of the merged regions' borders.
     pub border: Vec<u32>,
     /// MATLAB `Ldata2graph`'s `rgn{}` = `interior ∪ border`, carried
     /// through merges by *union* (`mergeRegions`: `regions{a}=unique([…])`).
     /// Unlike `border` (kept as a symmetric difference for edge weights),
-    /// `all_px` accumulates every pixel — including the now-interior
-    /// 0-lines between absorbed sub-regions — so the cut / trim / stats
+    /// `all_px` accumulates every pixel, including the now-interior
+    /// 0-lines between absorbed sub-regions, so the cut / trim / stats
     /// see a solid region, exactly as `extracthistpeaks.m` does.
     pub all_px: Vec<u32>,
+    /// Labels of the regions within 2 pixels (Chebyshev distance) of this
+    /// one.
     pub neighbors: BTreeSet<i32>,
 }
 
+/// Region adjacency graph of a label image.
 #[derive(Debug, Default)]
 pub struct Graph {
-    /// `regions[i]` — the i-th region (1:1 with dense slot indices).
+    /// One slot per region, in ascending label order. A slot becomes `None`
+    /// when its region is taken out (merged away).
     pub regions: Vec<Option<Region>>,
-    /// label → slot index. Filled lazily; unused labels have sentinel -1.
+    /// Label → slot index into `regions`. Filled by `from_labels`. A label
+    /// is removed when its region is merged away.
     pub label_to_slot: std::collections::HashMap<i32, usize>,
+    /// Image rows.
     pub height: usize,
+    /// Image columns.
     pub width: usize,
 }
 
 impl Graph {
+    /// Build the graph from a watershed label image (0 = watershed line,
+    /// > 0 = region). The image must be C-contiguous.
     pub fn from_labels(labels: ArrayView2<i64>) -> Self {
-        let (h, w) = (labels.nrows(), labels.ncols());
+        let h = labels.nrows();
+        let w = labels.ncols();
         assert!(labels.is_standard_layout(), "labels must be C-contiguous");
         let raw = labels
             .as_slice()
             .expect("labels must be contiguous");
 
-        // First pass: count pixels per label → pre-allocate interior Vec sizes.
+        // Largest label, to size the per-label count table.
         let mut max_label: i32 = 0;
-        for &v in raw.iter() {
-            let v = v as i32;
-            if v > max_label {
-                max_label = v;
+        for &raw_value in raw.iter() {
+            let label_value = raw_value as i32;
+            if label_value > max_label {
+                max_label = label_value;
             }
         }
-        // Grouped counts and region list. We iterate linearly once, placing
-        // interior pixel indices into each region's Vec.
+        // Pixels per label, to size each region's interior list up front.
         let mut counts: Vec<u32> = vec![0; (max_label as usize) + 1];
         for &v in raw.iter() {
             if v > 0 {
@@ -67,18 +84,18 @@ impl Graph {
 
         let mut label_to_slot = std::collections::HashMap::with_capacity(n_regions_nonzero);
         let mut regions: Vec<Option<Region>> = Vec::with_capacity(n_regions_nonzero);
-        for lab in 1..=max_label {
-            let c = counts[lab as usize];
-            if c > 0 {
+        for label in 1..=max_label {
+            let pixel_count = counts[label as usize];
+            if pixel_count > 0 {
                 let slot = regions.len();
                 regions.push(Some(Region {
-                    label: lab,
-                    interior: Vec::with_capacity(c as usize),
+                    label,
+                    interior: Vec::with_capacity(pixel_count as usize),
                     border: Vec::new(),
                     all_px: Vec::new(),
                     neighbors: BTreeSet::new(),
                 }));
-                label_to_slot.insert(lab, slot);
+                label_to_slot.insert(label, slot);
             }
         }
 
@@ -90,24 +107,24 @@ impl Graph {
             }
         }
 
-        let mut g = Graph {
+        let mut graph = Graph {
             regions,
             label_to_slot,
             height: h,
             width: w,
         };
-        g.fill_borders_and_neighbors(raw, h, w);
-        g
+        graph.fill_borders_and_neighbors(raw, h, w);
+        graph
     }
 
     /// Per region (mirrors MATLAB `Ldata2graph.m`):
     /// - `border` = every pixel 8-adjacent to the region whose label differs
-    ///   from the region's own label — i.e. the `conv2(sub_img,[1 1 1;1 -8
+    ///   from the region's own label. I.e. the `conv2(sub_img,[1 1 1;1 -8
     ///   1;1 1 1])>0` rim, which is *all* non-self pixels around the region
     ///   (watershed-0-line pixels AND pixels of other regions). MATLAB then
     ///   redefines `rgn{} = interior ∪ border`.
     /// - `neighbors` = every other region label appearing within a 2-pixel
-    ///   (Chebyshev) dilation of the region — MATLAB's 5×5 `H_dilate`,
+    ///   (Chebyshev) dilation of the region. MATLAB's 5×5 `H_dilate`,
     ///   excluding 0 and the region itself.
     fn fill_borders_and_neighbors(&mut self, raw: &[i64], h: usize, w: usize) {
         for y in 0..h {
@@ -161,30 +178,45 @@ impl Graph {
         // pixels). They're pushed in row-major order so largely sorted.
         // Then build `all_px = interior ∪ border` (MATLAB `rgn{}`).
         for slot in 0..self.regions.len() {
-            if let Some(r) = self.regions[slot].as_mut() {
-                r.border.sort_unstable();
-                r.border.dedup();
-                // interior is already sorted (row-major fill); merge with border.
-                let mut all = Vec::with_capacity(r.interior.len() + r.border.len());
-                let (mut i, mut j) = (0usize, 0usize);
-                while i < r.interior.len() && j < r.border.len() {
-                    match r.interior[i].cmp(&r.border[j]) {
-                        std::cmp::Ordering::Less => { all.push(r.interior[i]); i += 1; }
-                        std::cmp::Ordering::Greater => { all.push(r.border[j]); j += 1; }
-                        std::cmp::Ordering::Equal => { all.push(r.interior[i]); i += 1; j += 1; }
+            if let Some(region) = self.regions[slot].as_mut() {
+                region.border.sort_unstable();
+                region.border.dedup();
+                // interior is already sorted (row-major fill). Merge with border.
+                let mut merged = Vec::with_capacity(region.interior.len() + region.border.len());
+                let mut interior_pos = 0usize;
+                let mut border_pos = 0usize;
+                while interior_pos < region.interior.len() && border_pos < region.border.len() {
+                    match region.interior[interior_pos].cmp(&region.border[border_pos]) {
+                        std::cmp::Ordering::Less => {
+                            merged.push(region.interior[interior_pos]);
+                            interior_pos += 1;
+                        }
+                        std::cmp::Ordering::Greater => {
+                            merged.push(region.border[border_pos]);
+                            border_pos += 1;
+                        }
+                        // A pixel in both lists is kept once.
+                        std::cmp::Ordering::Equal => {
+                            merged.push(region.interior[interior_pos]);
+                            interior_pos += 1;
+                            border_pos += 1;
+                        }
                     }
                 }
-                all.extend_from_slice(&r.interior[i..]);
-                all.extend_from_slice(&r.border[j..]);
-                r.all_px = all;
+                merged.extend_from_slice(&region.interior[interior_pos..]);
+                merged.extend_from_slice(&region.border[border_pos..]);
+                region.all_px = merged;
             }
         }
     }
 
+    /// Slot of the region with this label, or `None` if no such region is
+    /// live.
     pub fn slot_of(&self, label: i32) -> Option<usize> {
         self.label_to_slot.get(&label).copied()
     }
 
+    /// Remove and return the region in `slot`, leaving the slot empty.
     pub fn take(&mut self, slot: usize) -> Option<Region> {
         self.regions[slot].take()
     }

@@ -1,4 +1,4 @@
-//! Hann-window peak-frequency refinement — port of pydynamo
+//! Hann-window peak-frequency refinement. Port of pydynamo
 //! `tfpeaks.refine.refine_peak_frequency`.
 //!
 //! Two stages:
@@ -15,6 +15,19 @@ use crate::parallel::*;
 use realfft::RealFftPlanner;
 use realfft::num_complex::Complex;
 
+/// A refined peak this close (Hz) to either bbox edge counts as an edge peak.
+const EDGE_TOLERANCE_HZ: f64 = 1e-3;
+
+/// How each windowed segment is detrended before tapering: not at all, by
+/// removing its mean, or by removing its least-squares line.
+#[derive(Copy, Clone, Debug)]
+pub enum DetrendOpt {
+    None,
+    Constant,
+    Linear,
+}
+
+/// Smallest power of two that is >= `x` (1 for `x <= 1`).
 fn next_pow2(x: f64) -> usize {
     if x <= 1.0 {
         return 1;
@@ -23,9 +36,12 @@ fn next_pow2(x: f64) -> usize {
 }
 
 /// Batched Hann-windowed FFT of EEG data slices. For each `event_time[i]`,
-/// take a `window_size`-second window centered on it, demean, apply
-/// normalized Hann taper, zero-pad to `nfft = next_pow2(Fs / dsfreqs)`, run
-/// rfft, convert to one-sided PSD.
+/// take a `window_size`-second window centered on it, detrend it as
+/// `detrend` says, apply a normalized Hann taper, zero-pad to
+/// `nfft = next_pow2(fs / dsfreqs)`, run rfft, convert to one-sided PSD.
+///
+/// `t0` is the time of `data[0]`. `dsfreqs` is the desired frequency
+/// resolution in Hz.
 ///
 /// Returns (spect (F_mask, N_events), sfreqs (F_mask,)) where F_mask is
 /// the subset of one-sided freqs inside `freq_range`.
@@ -45,10 +61,11 @@ pub fn hann_event_spectra(
 
     // Precompute normalized Hann taper: h[n] = 0.5*(1-cos(2pi n/(N-1)))
     // then divide by sqrt(sum(h^2)).
-    let mut taper: Vec<f64> = (0..win_samples)
-        .map(|n| 0.5 * (1.0 - ((2.0 * std::f64::consts::PI * n as f64)
-            / (win_samples as f64 - 1.0)).cos()))
-        .collect();
+    let mut taper: Vec<f64> = Vec::with_capacity(win_samples);
+    for n in 0..win_samples {
+        let angle = (2.0 * std::f64::consts::PI * n as f64) / (win_samples as f64 - 1.0);
+        taper.push(0.5 * (1.0 - angle.cos()));
+    }
     let taper_norm: f64 = taper.iter().map(|v| v * v).sum::<f64>().sqrt();
     for v in taper.iter_mut() {
         *v /= taper_norm;
@@ -56,18 +73,15 @@ pub fn hann_event_spectra(
 
     // Build frequency mask once.
     let sfreqs_full: Vec<f64> = (0..n_rfft).map(|i| i as f64 * fs / nfft as f64).collect();
-    let keep_idx: Vec<usize> = sfreqs_full
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &f)| {
-            if f >= freq_range.0 && f <= freq_range.1 {
-                Some(i)
-            } else {
-                None
-            }
-        })
-        .collect();
-    let sfreqs: Vec<f64> = keep_idx.iter().map(|&i| sfreqs_full[i]).collect();
+    // Indices and values of the one-sided frequencies inside freq_range.
+    let mut keep_idx: Vec<usize> = Vec::new();
+    let mut sfreqs: Vec<f64> = Vec::new();
+    for (i, &freq) in sfreqs_full.iter().enumerate() {
+        if freq >= freq_range.0 && freq <= freq_range.1 {
+            keep_idx.push(i);
+            sfreqs.push(freq);
+        }
+    }
     let f_masked = sfreqs.len();
 
     let n_events = event_times.len();
@@ -94,7 +108,8 @@ pub fn hann_event_spectra(
                 let start_idx =
                     ((center - t0 - window_size * 0.5) * fs).floor() as isize;
                 // Fill in_buf[..win_samples] with the windowed segment.
-                // Clamp defensively — caller is expected to have pre-filtered.
+                // Samples outside the data stay zero. The caller is expected to
+                // have pre-filtered such events.
                 in_buf.fill(0.0);
                 for n in 0..win_samples {
                     let idx = start_idx + n as isize;
@@ -113,21 +128,21 @@ pub fn hann_event_spectra(
                         }
                     }
                     DetrendOpt::Linear => {
-                        // y = a*x + b; subtract.
+                        // Least-squares line through the segment, then subtract it.
                         let n = win_samples as f64;
-                        let xm = (n - 1.0) * 0.5;
-                        let ym: f64 = in_buf[..win_samples].iter().sum::<f64>() / n;
-                        let mut xy = 0.0f64;
-                        let mut xx = 0.0f64;
+                        let x_mean = (n - 1.0) * 0.5;
+                        let y_mean: f64 = in_buf[..win_samples].iter().sum::<f64>() / n;
+                        let mut sum_xy = 0.0f64;
+                        let mut sum_xx = 0.0f64;
                         for i in 0..win_samples {
-                            let xi = i as f64 - xm;
-                            xy += xi * (in_buf[i] - ym);
-                            xx += xi * xi;
+                            let x_centered = i as f64 - x_mean;
+                            sum_xy += x_centered * (in_buf[i] - y_mean);
+                            sum_xx += x_centered * x_centered;
                         }
-                        let slope = xy / xx;
+                        let slope = sum_xy / sum_xx;
                         for i in 0..win_samples {
-                            let xi = i as f64 - xm;
-                            in_buf[i] -= slope * xi + ym;
+                            let x_centered = i as f64 - x_mean;
+                            in_buf[i] -= slope * x_centered + y_mean;
                         }
                     }
                     DetrendOpt::None => {}
@@ -136,19 +151,20 @@ pub fn hann_event_spectra(
                 for i in 0..win_samples {
                     in_buf[i] *= taper[i];
                 }
-                // Zero out the pad-region (in case some earlier iteration
-                // left junk; we already fill(0.0) above so this is a no-op,
-                // but keep explicit).
                 // FFT.
                 fft.process_with_scratch(in_buf, out_buf, scratch).unwrap();
                 // Convert to one-sided PSD and keep only the freq_range bins.
                 let mut row = Vec::with_capacity(f_masked);
-                for (mi, &fi) in keep_idx.iter().enumerate() {
-                    let c = out_buf[fi];
-                    let p = (c.re * c.re + c.im * c.im) / fs;
-                    let v = if fi == 0 || fi == n_rfft - 1 { p } else { 2.0 * p };
-                    let _ = mi;
-                    row.push(v);
+                for &freq_idx in keep_idx.iter() {
+                    let coeff = out_buf[freq_idx];
+                    let power = (coeff.re * coeff.re + coeff.im * coeff.im) / fs;
+                    // DC and Nyquist appear once in the two-sided spectrum.
+                    // Every other bin is doubled.
+                    if freq_idx == 0 || freq_idx == n_rfft - 1 {
+                        row.push(power);
+                    } else {
+                        row.push(2.0 * power);
+                    }
                 }
                 row
             },
@@ -163,15 +179,17 @@ pub fn hann_event_spectra(
     (spect, sfreqs)
 }
 
-#[derive(Copy, Clone, Debug)]
-pub enum DetrendOpt {
-    None,
-    Constant,
-    Linear,
+/// Piecewise-cubic coefficients, one entry per piece. On piece i,
+/// y(x) = a[i] + b[i]*dx + c[i]*dx^2 + d[i]*dx^3 with dx = x - xs[i].
+struct SplineCoeffs {
+    a: Vec<f64>,
+    b: Vec<f64>,
+    c: Vec<f64>,
+    d: Vec<f64>,
 }
 
 /// Not-a-knot cubic spline coefficients for y(x), as MATLAB `spline` and
-/// `interp1(..., 'spline')` compute them. Returns (a, b, c, d), each of
+/// `interp1(..., 'spline')` compute them. Returns a, b, c, d, each of
 /// length N-1, so that for x in [xs[i], xs[i+1]]
 /// y(x) = a[i] + b[i]*(x-xs[i]) + c[i]*(x-xs[i])^2 + d[i]*(x-xs[i])^3.
 ///
@@ -180,10 +198,7 @@ pub enum DetrendOpt {
 /// one cubic and so are the last two. With three points that leaves a
 /// single parabola through them, and with two points a straight line,
 /// which is what MATLAB returns in those cases.
-fn not_a_knot_cubic_spline_coeffs(
-    xs: &[f64],
-    ys: &[f64],
-) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+fn not_a_knot_cubic_spline_coeffs(xs: &[f64], ys: &[f64]) -> SplineCoeffs {
     let n = xs.len();
     assert!(n >= 2);
     let n_pieces = n - 1;
@@ -268,15 +283,14 @@ fn not_a_knot_cubic_spline_coeffs(
     }
     let a: Vec<f64> = ys[..n_pieces].to_vec();
     let c: Vec<f64> = c_node[..n_pieces].to_vec();
-    (a, b, c, d)
+    SplineCoeffs { a, b, c, d }
 }
 
 /// Evaluate the cubic spline at a single x-point. Outside the data range
 /// the end piece is extended, as `interp1(..., 'spline')` extrapolates.
 #[inline]
-fn spline_eval(xs: &[f64], coeffs: &(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>), x: f64) -> f64 {
-    // Find piece index via binary search (xs sorted ascending).
-    let (a, b, c, d) = coeffs;
+fn spline_eval(xs: &[f64], coeffs: &SplineCoeffs, x: f64) -> f64 {
+    let SplineCoeffs { a, b, c, d } = coeffs;
     if x <= xs[0] {
         let dx = x - xs[0];
         return a[0] + b[0] * dx + c[0] * dx * dx + d[0] * dx * dx * dx;
@@ -287,7 +301,8 @@ fn spline_eval(xs: &[f64], coeffs: &(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>), x:
         let dx = x - xs[i];
         return a[i] + b[i] * dx + c[i] * dx * dx + d[i] * dx * dx * dx;
     }
-    // binary search for i s.t. xs[i] <= x < xs[i+1]
+    // Binary search (xs sorted ascending) for the piece lo with
+    // xs[lo] <= x < xs[lo+1].
     let mut lo = 0usize;
     let mut hi = last;
     while lo + 1 < hi {
@@ -309,7 +324,8 @@ fn spline_eval(xs: &[f64], coeffs: &(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>), x:
 pub fn refine_from_spectra(
     spect: &Array2<f64>,
     sfreqs: &[f64],
-    bbox_lo: &[f64],   // length N_events (pre-keep filter applied by caller)
+    // One per event (column of `spect`), lower bbox frequency in Hz.
+    bbox_lo: &[f64],
     bbox_hi: &[f64],
     n_grid: usize,
     remove_edge_peaks: bool,
@@ -321,21 +337,21 @@ pub fn refine_from_spectra(
 
     (0..n_events)
         .into_par_iter()
-        .map(|e| {
-            let start_freq = bbox_lo[e];
-            let end_freq = bbox_hi[e];
+        .map(|event| {
+            let start_freq = bbox_lo[event];
+            let end_freq = bbox_hi[event];
             if end_freq <= start_freq {
                 return f64::NAN;
             }
             // Extract column (event's full PSD).
-            let mut curr = Vec::with_capacity(f_mask);
+            let mut event_psd = Vec::with_capacity(f_mask);
             for f in 0..f_mask {
-                curr.push(spect[[f, e]]);
+                event_psd.push(spect[[f, event]]);
             }
-            if curr.len() < 2 {
+            if event_psd.len() < 2 {
                 return f64::NAN;
             }
-            let coeffs = not_a_knot_cubic_spline_coeffs(sfreqs, &curr);
+            let coeffs = not_a_knot_cubic_spline_coeffs(sfreqs, &event_psd);
             let mut best_x = start_freq;
             let mut best_y = f64::NEG_INFINITY;
             // MATLAB `linspace(start_freq, end_freq, n_grid)`:
@@ -355,10 +371,11 @@ pub fn refine_from_spectra(
                 }
             }
             if remove_edge_peaks {
-                if (best_x - start_freq).abs() < 1e-3
-                    || (best_x - end_freq).abs() < 1e-3
+                // end_freq > start_freq is already established by the early
+                // return above.
+                if (best_x - start_freq).abs() < EDGE_TOLERANCE_HZ
+                    || (best_x - end_freq).abs() < EDGE_TOLERANCE_HZ
                     || best_x > end_freq
-                    || end_freq < start_freq
                 {
                     return f64::NAN;
                 }
@@ -447,7 +464,7 @@ mod tests {
     #[test]
     fn refine_picks_interior_peak() {
         // 2 events, both with Gaussian-ish PSD centered at 5 Hz.
-        // bbox = [3, 7] — expect ~5 Hz.
+        // bbox = [3, 7]. Expect ~5 Hz.
         let sfreqs: Vec<f64> = (0..11).map(|i| i as f64).collect();
         let spect_vals: Vec<f64> = sfreqs
             .iter()
@@ -461,7 +478,7 @@ mod tests {
         let lo = vec![3.0, 3.0];
         let hi = vec![7.0, 7.0];
         let out = refine_from_spectra(&spect, &sfreqs, &lo, &hi, 1000, true);
-        // Grid resolution is (7-3)/999 ≈ 4e-3; allow that tolerance.
+        // Grid resolution is (7-3)/999 ≈ 4e-3, so allow that tolerance.
         for &v in &out {
             assert!((v - 5.0).abs() < 5e-3, "{v}");
         }

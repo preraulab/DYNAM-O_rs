@@ -8,17 +8,15 @@
 //! They live in the kernel crate rather than in a consumer so that every
 //! front end runs the *same* code: the desktop app and CLI link it
 //! directly, and pydynamo reaches it through the PyO3 bindings. That is
-//! the point — a second implementation is a second thing to keep in
-//! parity, and the SO-power bug this crate carried for three months is
-//! what that costs.
+//! the point: a second implementation is a second thing to keep in parity.
 //!
 //! Two families, controlling different things:
 //!
-//!   * [`fdr_grid`] — per-bin rank tests with Benjamini–Hochberg /
+//!   * [`fdr_grid`]: per-bin rank tests with Benjamini–Hochberg /
 //!     Benjamini–Yekutieli control of the false discovery rate
-//!     (`FDR_1D.m` / `FDR_2D.m`). More sensitive; answers per bin.
-//!   * [`permtest`] — max-statistic permutation testing with
-//!     family-wise control (`gpermtest.m` / `gpermtest2.m`). Stricter;
+//!     (`FDR_1D.m` / `FDR_2D.m`). More sensitive, and answers per bin.
+//!   * [`permtest`]: max-statistic permutation testing with
+//!     family-wise control (`gpermtest.m` / `gpermtest2.m`). Stricter, and
 //!     answers with one global bound over the whole map, assuming only
 //!     that the group labels are exchangeable.
 

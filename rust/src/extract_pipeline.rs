@@ -22,12 +22,12 @@
 //!   - `PeakFrequency = sum(v*f) / sum(v)`
 //!   - `Duration  = (t_max - t_min + 1) * d_time`   (N_pixels * dt)
 //!   - `Bandwidth = (f_max - f_min + 1) * d_freq`
-//!   - `Height    = max(v) - min(v)`  over label pixels (linear; pow2db'ed in filter)
+//!   - `Height    = max(v) - min(v)`  over label pixels (linear, pow2db'ed in filter)
 //!   - `Volume    = sum(v) * d_time * d_freq`
 
 use ndarray::{Array2, ArrayView1, ArrayView2};
 use crate::parallel::*;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// `TFPEAKS_DEBUG` per-stage region tallies, summed across all segments of
@@ -68,18 +68,25 @@ fn count_labels(a: &Array2<i64>) -> u64 {
 /// `boundaries_xy[i]` is the perimeter in **clockwise traversal order**
 /// (Moore-neighbor trace). This deliberately diverges from MATLAB's pure
 /// path, which stores perimeter pixels in column-major scan order and so
-/// can't be plotted as a polyline without a separate trace pass — see
+/// can't be plotted as a polyline without a separate trace pass. See
 /// trimWshedRegions.m:229 (`find(bnd_mask)`). Storing them traversal-
 /// ordered means downstream plot() of `Boundaries{i}(:, 1:2)` draws a
 /// closed perimeter directly.
 #[derive(Default)]
 pub struct SegmentPeaks {
+    /// Intensity-weighted centroid time of each peak, in seconds.
     pub peak_time: Vec<f64>,
+    /// Intensity-weighted centroid frequency of each peak, in Hz.
     pub peak_freq: Vec<f64>,
+    /// Bounding-box extent along time, in seconds.
     pub duration: Vec<f64>,
+    /// Bounding-box extent along frequency, in Hz.
     pub bandwidth: Vec<f64>,
+    /// max - min of the peak's pixel values (linear power).
     pub height: Vec<f64>,
+    /// Sum of the pixel values times d_time * d_freq.
     pub volume: Vec<f64>,
+    /// 1-based number of the segment each peak came from.
     pub segment_num: Vec<f64>,
     /// Four values per peak (t_tl, f_tl, width_s, height_Hz). The box is the
     /// exact pixel extent, with the corner half a bin before the first pixel
@@ -87,14 +94,24 @@ pub struct SegmentPeaks {
     pub bbox: Vec<f64>,
     /// Area per peak in s*Hz (pixel_count * d_time * d_freq).
     pub area: Vec<f64>,
-    pub peakiness: Vec<f64>, // N/(N-1) * (max - mean) / (max - min) of region pixels, [0, 1]
-    pub height_data: Vec<Vec<f64>>, // pixel values per peak (interior, NaN-excluded)
-    pub boundaries_xy: Vec<Vec<f64>>, // interleaved (t, f) pairs per peak
+    /// N/(N-1) * (max - mean) / (max - min) of the region's pixels, in [0, 1].
+    pub peakiness: Vec<f64>,
+    /// Pixel values per peak (interior, NaN excluded).
+    pub height_data: Vec<Vec<f64>>,
+    /// Interleaved (t, f) pairs per peak.
+    pub boundaries_xy: Vec<Vec<f64>>,
 }
 
 impl SegmentPeaks {
-    pub fn len(&self) -> usize { self.peak_time.len() }
-    pub fn is_empty(&self) -> bool { self.peak_time.is_empty() }
+    /// Number of peaks in the table.
+    pub fn len(&self) -> usize {
+        self.peak_time.len()
+    }
+
+    /// True when the table holds no peaks.
+    pub fn is_empty(&self) -> bool {
+        self.peak_time.is_empty()
+    }
 
     /// Extend self with `other` in order.
     pub fn extend(&mut self, mut other: SegmentPeaks) {
@@ -113,26 +130,47 @@ impl SegmentPeaks {
     }
 }
 
+/// Segment length used when `seg_time` is not positive, in seconds.
+const DEFAULT_SEG_TIME_S: f64 = 30.0;
+
 /// Parameters for `extract_tfpeaks`.
 #[derive(Clone, Copy)]
 pub struct ExtractParams {
+    /// Segment length in seconds. The spectrogram is split into pieces about
+    /// this long. A value <= 0 means 30 s.
     pub seg_time: f64,
+    /// Keep every n-th frequency bin for the watershed and merge. 1 keeps all.
     pub downsample_f: usize,
+    /// Keep every n-th time bin for the watershed and merge. 1 keeps all.
     pub downsample_t: usize,
+    /// Regions keep merging while the heaviest edge weight is above this.
     pub merge_thresh: f64,
+    /// Cap on the number of merges per segment. Infinity means no cap.
     pub max_merges: f64,
+    /// Fraction of each region's volume the trim keeps.
     pub trim_vol_thresh: f64,
-    pub trim_shift_val: f64, // NaN → min(spect) per segment
+    /// Floor from which trim volume is measured. NaN means the segment's
+    /// minimum.
+    pub trim_shift_val: f64,
+    /// A peak is kept when its Duration in seconds is strictly between
+    /// `dur_min` and `dur_max`.
     pub dur_min: f64,
     pub dur_max: f64,
+    /// A peak is kept when its Bandwidth in Hz is strictly between `bw_min`
+    /// and `bw_max`.
     pub bw_min: f64,
     pub bw_max: f64,
+    /// A peak is kept when its PeakFrequency in Hz is strictly between
+    /// `freq_min` and `freq_max`.
     pub freq_min: f64,
     pub freq_max: f64,
+    /// A peak is kept when its Height in dB (10*log10) is above this.
     pub ht_db_min: f64,
-    /// Distance for expand_labels(). 0 = skip (MATLAB-native behavior,
-    /// labels keep 0 on watershed lines). 5 = pydynamo default
-    /// (skimage-style fill so regions touch directly).
+    /// Border-fill mode applied after the merge. 0 = MATLAB paint in label
+    /// order (8-connected 1-pixel dilation, higher labels overwrite lower),
+    /// matching extractTFPeaks.m. N > 0 = skimage-style expand_labels
+    /// (breadth-first fill out to N pixels, lower label wins ties), which is
+    /// what pydynamo does (its default is 5).
     pub expand_labels_distance: u32,
 }
 
@@ -144,48 +182,47 @@ fn stride_downsample(arr: ArrayView2<f64>, f_stride: usize, t_stride: usize) -> 
     let f_stride = f_stride.max(1);
     let t_stride = t_stride.max(1);
     let (h, w) = arr.dim();
-    let oh = (h + f_stride - 1) / f_stride;
-    let ow = (w + t_stride - 1) / t_stride;
-    let mut out = Array2::<f64>::zeros((oh, ow));
-    for i in 0..oh {
-        let si = i * f_stride;
-        for j in 0..ow {
-            let sj = j * t_stride;
-            out[[i, j]] = arr[[si, sj]];
+    let out_rows = (h + f_stride - 1) / f_stride;
+    let out_cols = (w + t_stride - 1) / t_stride;
+    let mut out = Array2::<f64>::zeros((out_rows, out_cols));
+    for i in 0..out_rows {
+        let src_row = i * f_stride;
+        for j in 0..out_cols {
+            let src_col = j * t_stride;
+            out[[i, j]] = arr[[src_row, src_col]];
         }
     }
     out
 }
 
-/// Resize a label image up by nearest-neighbor, matching
-/// `skimage.transform.resize(..., order=0, preserve_range=True)`.
-/// `output_shape = (oh, ow)`. skimage uses
-///     src_y = floor((y + 0.5) * ih / oh - 0.5 + eps)  [rounded]
-/// but for integer factors this reduces to `y // factor_y`, which is what
-/// we need when `oh = ih * f_f` or `oh = ih * f_f + k` for small k.
-/// We implement the exact skimage mapping for correctness on non-integer
-/// ratios.
-fn resize_labels_nn(labels: ArrayView2<i64>, oh: usize, ow: usize) -> Array2<i64> {
-    let (ih, iw) = labels.dim();
-    if ih == oh && iw == ow {
+/// Resize a label image to `(out_rows, out_cols)` by nearest neighbor,
+/// matching `skimage.transform.resize(..., order=0, preserve_range=True)`.
+/// Output index `j` along an axis reads input index
+///     round_half_even((j + 0.5) * in_len / out_len - 0.5)
+/// clamped to the input. For an integer upsampling factor this is
+/// `j / factor`.
+fn resize_labels_nn(labels: ArrayView2<i64>, out_rows: usize, out_cols: usize) -> Array2<i64> {
+    /// Input index that output index `out_index` reads along one axis.
+    fn nearest_source_index(out_index: usize, out_len: usize, in_len: usize) -> usize {
+        if out_len == 0 || in_len == 0 {
+            return 0;
+        }
+        let source_position = (out_index as f64 + 0.5) * (in_len as f64) / (out_len as f64) - 0.5;
+        // numpy-style round half to even, as skimage uses.
+        let source_index = source_position.round_ties_even() as i64;
+        source_index.clamp(0, in_len as i64 - 1) as usize
+    }
+
+    let (in_rows, in_cols) = labels.dim();
+    if in_rows == out_rows && in_cols == out_cols {
         return labels.to_owned();
     }
-    let mut out = Array2::<i64>::zeros((oh, ow));
-    // skimage resize order=0: nearest neighbor with the sampling grid
-    // col = round((j + 0.5) * iw / ow - 0.5).
-    let map_coord = |j: usize, out_n: usize, in_n: usize| -> usize {
-        if out_n == 0 || in_n == 0 { return 0; }
-        let src = (j as f64 + 0.5) * (in_n as f64) / (out_n as f64) - 0.5;
-        // skimage.transform.resize(order=0) uses numpy-style "round half
-        // to even" (banker's rounding). Matches the pydynamo reference.
-        let src = src.round_ties_even() as i64;
-        src.clamp(0, in_n as i64 - 1) as usize
-    };
-    for i in 0..oh {
-        let si = map_coord(i, oh, ih);
-        for j in 0..ow {
-            let sj = map_coord(j, ow, iw);
-            out[[i, j]] = labels[[si, sj]];
+    let mut out = Array2::<i64>::zeros((out_rows, out_cols));
+    for i in 0..out_rows {
+        let src_row = nearest_source_index(i, out_rows, in_rows);
+        for j in 0..out_cols {
+            let src_col = nearest_source_index(j, out_cols, in_cols);
+            out[[i, j]] = labels[[src_row, src_col]];
         }
     }
     out
@@ -203,9 +240,10 @@ fn resize_labels_nn(labels: ArrayView2<i64>, oh: usize, ow: usize) -> Array2<i64
 /// `rgn{ii}` is `union(interior, 8-conn-dilation-border)` from
 /// Ldata2graph.m.
 ///
-/// CRITICAL: uses DENSE 1..N indexing, matching MATLAB's cell index paint.
-/// If we use sparse original labels from Rust merge, regionprops counts
-/// unique-value-regions differently and produces +/-272 peak-count drift.
+/// The output uses DENSE 1..N cell indices, not the input's label values,
+/// because MATLAB paints by cell index. With the sparse original labels,
+/// regionprops counts regions differently and the peak count does not
+/// match MATLAB.
 pub fn matlab_paint_labels_in_order(labels: ArrayView2<i64>) -> Array2<i64> {
     let (h, w) = labels.dim();
     let mut out = Array2::<i64>::zeros((h, w));
@@ -214,12 +252,13 @@ pub fn matlab_paint_labels_in_order(labels: ArrayView2<i64>) -> Array2<i64> {
     }
     // Bucket pixels by label, then paint in ascending label order with dense
     // cell indices (matching MATLAB's 1..N paint).
-    use std::collections::BTreeMap;
     let mut by_label: BTreeMap<i64, Vec<(usize, usize)>> = BTreeMap::new();
     for r in 0..h {
         for c in 0..w {
             let v = labels[[r, c]];
-            if v > 0 { by_label.entry(v).or_insert_with(Vec::new).push((r, c)); }
+            if v > 0 {
+                by_label.entry(v).or_default().push((r, c));
+            }
         }
     }
     if by_label.is_empty() {
@@ -232,7 +271,9 @@ pub fn matlab_paint_labels_in_order(labels: ArrayView2<i64>) -> Array2<i64> {
                 for dc in [-1i32, 0, 1] {
                     let nr = r as i32 + dr;
                     let nc = c as i32 + dc;
-                    if nr < 0 || nr >= h as i32 || nc < 0 || nc >= w as i32 { continue; }
+                    if nr < 0 || nr >= h as i32 || nc < 0 || nc >= w as i32 {
+                        continue;
+                    }
                     out[[nr as usize, nc as usize]] = cell_idx;
                 }
             }
@@ -247,7 +288,7 @@ pub fn matlab_paint_labels_in_order(labels: ArrayView2<i64>) -> Array2<i64> {
 ///
 /// Implemented via multi-source BFS (4-connectivity, stops after `d` steps).
 /// This approximates Euclidean distance but matches the behavior needed
-/// to plug the watershed 0-line — for distance=5 it is effectively
+/// to plug the watershed 0-line. For distance=5 it is effectively
 /// equivalent (skimage itself computes a distance transform which gives
 /// the same result on thin separators).
 fn expand_labels_bfs(labels: ArrayView2<i64>, distance: usize) -> Array2<i64> {
@@ -258,42 +299,48 @@ fn expand_labels_bfs(labels: ArrayView2<i64>, distance: usize) -> Array2<i64> {
     }
     // dist: steps to nearest labeled source; u32::MAX = unreached.
     let mut dist = vec![u32::MAX; h * w];
-    let mut q: VecDeque<(usize, usize)> = VecDeque::new();
+    let mut queue: VecDeque<(usize, usize)> = VecDeque::new();
     for r in 0..h {
         for c in 0..w {
             if out[[r, c]] != 0 {
                 dist[r * w + c] = 0;
-                q.push_back((r, c));
+                queue.push_back((r, c));
             }
         }
     }
-    let dmax = distance as u32;
-    while let Some((r, c)) = q.pop_front() {
-        let d_here = dist[r * w + c];
-        if d_here >= dmax { continue; }
-        let my_lbl = out[[r, c]];
-        let d_new = d_here + 1;
-        let neigh = [
+    let max_steps = distance as u32;
+    while let Some((r, c)) = queue.pop_front() {
+        let steps_here = dist[r * w + c];
+        if steps_here >= max_steps {
+            continue;
+        }
+        let source_label = out[[r, c]];
+        let steps_next = steps_here + 1;
+        // wrapping_sub turns 0 - 1 into usize::MAX, which the bounds check
+        // below rejects.
+        let neighbors = [
             (r.wrapping_sub(1), c),
             (r + 1, c),
             (r, c.wrapping_sub(1)),
             (r, c + 1),
         ];
-        for (nr, nc) in neigh {
-            if nr >= h || nc >= w { continue; }
+        for (nr, nc) in neighbors {
+            if nr >= h || nc >= w {
+                continue;
+            }
             let idx = nr * w + nc;
-            if dist[idx] > d_new {
-                // first visit (or we've found a closer source)
+            if dist[idx] > steps_next {
+                // First visit (or a closer source was found).
                 if out[[nr, nc]] == 0 {
-                    dist[idx] = d_new;
-                    out[[nr, nc]] = my_lbl;
-                    q.push_back((nr, nc));
+                    dist[idx] = steps_next;
+                    out[[nr, nc]] = source_label;
+                    queue.push_back((nr, nc));
                 }
-            } else if dist[idx] == d_new {
+            } else if dist[idx] == steps_next {
                 // Tie → prefer lower label (stable, matches "first reached")
                 let existing = out[[nr, nc]];
-                if existing != 0 && my_lbl != 0 && my_lbl < existing {
-                    out[[nr, nc]] = my_lbl;
+                if existing != 0 && source_label != 0 && source_label < existing {
+                    out[[nr, nc]] = source_label;
                 }
             }
         }
@@ -319,7 +366,7 @@ struct Accum {
     pixel_values: Vec<f64>,    // matches MATLAB regionprops PixelValues
     /// First column-major-encountered in-region pixel (smallest col, then
     /// smallest row within that col). Guaranteed boundary pixel and
-    /// guaranteed to have West/N/NW as out-of-region neighbors — so it's a
+    /// guaranteed to have West/N/NW as out-of-region neighbors. So it's a
     /// safe Moore-neighbor trace start with initial backtrack = West.
     start_r: usize,
     start_c: usize,
@@ -334,8 +381,8 @@ const MOORE_DIRS: [(i32, i32); 8] = [
 
 // After moving in direction `move_idx`, the new backtrack ("where we came
 // from") is at this MOORE_DIRS index from the new position. Derived once
-// algebraically: the OOR pixel just before `move_idx` in the clockwise
-// scan is at MOORE_DIRS[(move_idx+7)%8] from the OLD position; its
+// algebraically: the out-of-region (OOR) pixel just before `move_idx` in the clockwise
+// scan is at MOORE_DIRS[(move_idx+7)%8] from the OLD position. Its
 // position relative to the NEW position is MOORE_DIRS[(move_idx+7)%8]
 // minus MOORE_DIRS[move_idx], which always lands on one of {N, E, S, W}.
 const MOORE_NEW_C_DIR: [usize; 8] = [6, 6, 0, 0, 2, 2, 4, 4];
@@ -343,21 +390,22 @@ const MOORE_NEW_C_DIR: [usize; 8] = [6, 6, 0, 0, 2, 2, 4, 4];
 /// Moore-neighbor boundary trace (Pavlidis-style, 8-conn, clockwise).
 ///
 /// Walks the perimeter of the connected region with label `lbl` starting
-/// at `(start_r, start_c)` (must be a boundary pixel; conventionally the
-/// column-major-first in-region pixel, which guarantees W is OOR so we
-/// can use West as the initial backtrack).
+/// at `(start_r, start_c)` (must be a boundary pixel, conventionally the
+/// column-major-first in-region pixel, which guarantees W is out of the
+/// region (OOR) so we can use West as the initial backtrack).
 ///
-/// Returns pixel coords in clockwise traversal order — consecutive entries
+/// Returns pixel coords in clockwise traversal order. Consecutive entries
 /// are 8-adjacent, so plot()-as-polyline draws a closed perimeter rather
-/// than the sawtooth that column-major scan order produces.
+/// than the sawtooth that column-major scan order produces. The start
+/// pixel is repeated as the last entry, which closes the loop.
 ///
 /// Stopping rule (Pavlidis / Jacob's, "about to repeat first move"):
 /// after entering the loop we record the very first move taken from start;
 /// thereafter, whenever we're back at start AND the next move would equal
 /// the first-recorded move, we've completed a full circuit. This handles
-/// concave shapes (L, U, …) correctly — a naive "same backtrack on revisit"
+/// concave shapes (L, U, …) correctly. A naive "same backtrack on revisit"
 /// check fails on those because the trace can revisit start with a
-/// different c_dir mid-circuit, then run away. A `max_steps` cap is kept
+/// different backtrack direction mid-circuit, then run away. A `max_steps` cap is kept
 /// as a defense-in-depth net.
 pub(crate) fn moore_trace(
     labels: ArrayView2<i64>,
@@ -366,67 +414,72 @@ pub(crate) fn moore_trace(
     start_c: usize,
 ) -> Vec<(usize, usize)> {
     let (h, w) = labels.dim();
-    let in_rgn = |r: i32, c: i32| -> bool {
+    let in_region = |r: i32, c: i32| -> bool {
         r >= 0 && c >= 0 && r < h as i32 && c < w as i32
             && labels[[r as usize, c as usize]] == lbl
     };
-    let s = (start_r as i32, start_c as i32);
+    let start = (start_r as i32, start_c as i32);
     let mut out: Vec<(usize, usize)> = vec![(start_r, start_c)];
 
     // Single-isolated-pixel region: nothing to trace.
-    if !MOORE_DIRS.iter().any(|&(dr, dc)| in_rgn(s.0 + dr, s.1 + dc)) {
+    if !MOORE_DIRS.iter().any(|&(dr, dc)| in_region(start.0 + dr, start.1 + dc)) {
         return out;
     }
 
-    let mut b = s;
-    let mut c_dir: usize = 0; // West (guaranteed OOR for column-major-first start)
+    let mut current = start;
+    // West (guaranteed OOR for a column-major-first start).
+    let mut backtrack_dir: usize = 0;
 
-    // Find the first in-region neighbor scanning clockwise from c_dir+1.
-    let scan = |b: (i32, i32), c_dir: usize| -> Option<usize> {
+    // Find the first in-region neighbor scanning clockwise from
+    // backtrack_dir + 1.
+    let scan = |position: (i32, i32), backtrack_dir: usize| -> Option<usize> {
         for k in 1..=8 {
-            let idx = (c_dir + k) % 8;
+            let idx = (backtrack_dir + k) % 8;
             let (dr, dc) = MOORE_DIRS[idx];
-            if in_rgn(b.0 + dr, b.1 + dc) {
+            if in_region(position.0 + dr, position.1 + dc) {
                 return Some(idx);
             }
         }
         None
     };
 
-    let first_move = match scan(b, c_dir) {
+    let first_move = match scan(current, backtrack_dir) {
         Some(i) => i,
         None => return out,
     };
-    // Take the first move outside the main loop; otherwise the Pavlidis
+    // Take the first move outside the main loop. Otherwise the Pavlidis
     // stop ("at start AND scan would equal first_move") fires immediately
     // on iteration 0 and we never leave the start pixel.
-    let (mdr, mdc) = MOORE_DIRS[first_move];
-    b = (b.0 + mdr, b.1 + mdc);
-    c_dir = MOORE_NEW_C_DIR[first_move];
-    out.push((b.0 as usize, b.1 as usize));
+    let (move_dr, move_dc) = MOORE_DIRS[first_move];
+    current = (current.0 + move_dr, current.1 + move_dc);
+    backtrack_dir = MOORE_NEW_C_DIR[first_move];
+    out.push((current.0 as usize, current.1 as usize));
 
     // Step bound: each unique (pixel, backtrack_dir) state is visited at
     // most once before the algorithm closes, so 8·h·w is a safe upper
-    // bound. Fine-tuning the bound doesn't matter — we should always exit
+    // bound. Fine-tuning the bound doesn't matter. We should always exit
     // via the natural Pavlidis stop in correct runs.
     let max_steps = h.saturating_mul(w).saturating_mul(8) + 16;
     for _ in 0..max_steps {
-        let m = match scan(b, c_dir) {
+        let next_move = match scan(current, backtrack_dir) {
             Some(i) => i,
             None => break,
         };
         // Stop: at start AND about to repeat the first move.
-        if b == s && m == first_move {
+        if current == start && next_move == first_move {
             break;
         }
-        let (mdr, mdc) = MOORE_DIRS[m];
-        b = (b.0 + mdr, b.1 + mdc);
-        c_dir = MOORE_NEW_C_DIR[m];
-        out.push((b.0 as usize, b.1 as usize));
+        let (move_dr, move_dc) = MOORE_DIRS[next_move];
+        current = (current.0 + move_dr, current.1 + move_dc);
+        backtrack_dir = MOORE_NEW_C_DIR[next_move];
+        out.push((current.0 as usize, current.1 as usize));
     }
     out
 }
 
+/// Peak table for one segment from its trimmed label image: one row per
+/// label, in ascending label order. `spect` is the full-resolution segment
+/// and `stimes` / `sfreqs` are its axes.
 fn compute_peak_props_from_trim(
     trim_labels: ArrayView2<i64>,
     spect: ArrayView2<f64>,
@@ -456,35 +509,58 @@ fn compute_peak_props_from_trim(
     // post-loop as the Moore-trace start: West is guaranteed OOR, so the
     // trace is well-formed with West as the initial backtrack.
     //
-    // Boundary pixels themselves are NOT collected during this pass —
-    // unordered perimeter pixels can't be plotted as a polyline (column-
+    // Boundary pixels themselves are NOT collected during this pass.
+    // Unordered perimeter pixels can't be plotted as a polyline (column-
     // major scan would produce sawtooth crossing lines). They're emitted
     // post-loop in clockwise traversal order via `moore_trace`.
     let mut map: HashMap<i64, Accum> = HashMap::new();
     for c in 0..w {
         for r in 0..h {
             let lbl = trim_labels[[r, c]];
-            if lbl <= 0 { continue; }
+            if lbl <= 0 {
+                continue;
+            }
             let v = spect[[r, c]];
-            // Skip NaN pixels — matches MATLAB `Ldata(regions{ii}(~isnan(data(...))))`.
-            if v.is_nan() { continue; }
+            // Skip NaN pixels. Matches MATLAB `Ldata(regions{ii}(~isnan(data(...))))`.
+            if v.is_nan() {
+                continue;
+            }
             let e = map.entry(lbl).or_insert(Accum {
-                sum_v: 0.0, sum_v_r: 0.0, sum_v_c: 0.0,
-                min_v: f64::INFINITY, max_v: f64::NEG_INFINITY,
-                r_min: r, r_max: r, c_min: c, c_max: c,
+                sum_v: 0.0,
+                sum_v_r: 0.0,
+                sum_v_c: 0.0,
+                min_v: f64::INFINITY,
+                max_v: f64::NEG_INFINITY,
+                r_min: r,
+                r_max: r,
+                c_min: c,
+                c_max: c,
                 pixel_count: 0,
                 pixel_values: Vec::new(),
-                start_r: r, start_c: c,
+                start_r: r,
+                start_c: c,
             });
             e.sum_v += v;
             e.sum_v_r += v * (r as f64);
             e.sum_v_c += v * (c as f64);
-            if v < e.min_v { e.min_v = v; }
-            if v > e.max_v { e.max_v = v; }
-            if r < e.r_min { e.r_min = r; }
-            if r > e.r_max { e.r_max = r; }
-            if c < e.c_min { e.c_min = c; }
-            if c > e.c_max { e.c_max = c; }
+            if v < e.min_v {
+                e.min_v = v;
+            }
+            if v > e.max_v {
+                e.max_v = v;
+            }
+            if r < e.r_min {
+                e.r_min = r;
+            }
+            if r > e.r_max {
+                e.r_max = r;
+            }
+            if c < e.c_min {
+                e.c_min = c;
+            }
+            if c > e.c_max {
+                e.c_max = c;
+            }
             e.pixel_count += 1;
             e.pixel_values.push(v);
         }
@@ -497,11 +573,13 @@ fn compute_peak_props_from_trim(
     for k in keys {
         let a = &map[&k];
         // skimage centroid_weighted = Σ v·idx / Σ v in pixel-index space.
+        // A region whose values do not sum above zero has no weighted
+        // centroid and takes its bounding-box corner.
         let centroid_r = if a.sum_v > 0.0 { a.sum_v_r / a.sum_v } else { a.r_min as f64 };
         let centroid_c = if a.sum_v > 0.0 { a.sum_v_c / a.sum_v } else { a.c_min as f64 };
         let peak_time = centroid_c * d_time + t0;
         let peak_freq = centroid_r * d_freq + f0;
-        // N_pixels along each axis = (max - min + 1); pydynamo uses
+        // N_pixels along each axis = (max - min + 1). Pydynamo uses
         // skimage bbox which is (min, max+1) → (maxc - minc) = N_pixels.
         let n_t = (a.c_max - a.c_min + 1) as f64;
         let n_f = (a.r_max - a.r_min + 1) as f64;
@@ -510,15 +588,15 @@ fn compute_peak_props_from_trim(
         let height = a.max_v - a.min_v;
         let volume = a.sum_v * d_time * d_freq;
         let area = (a.pixel_count as f64) * d_time * d_freq;
-        // peakiness = N/(N-1) * (max - mean) / (max - min) of the region's
-        // N pixels, in [0, 1]. The N/(N-1) factor is a small-sample
-        // correction: a single-pixel spike has mean = min + (max-min)/N,
-        // so the raw ratio caps at 1 - 1/N; corrected, a spike scores
-        // exactly 1 for every region size. 0 = flat plateau (asymptotic;
-        // floor 1/(N-1)). Affine-invariant (gain and additive pedestal
-        // both cancel; requires NaN masking, never 0). Degenerate flat
-        // regions (max == min) give 0/0 = NaN (N = 1 gives inf * NaN =
-        // NaN), propagated so downstream consumers can decide.
+        // peakiness = N/(N-1) * (max - mean) / (max - min) over the
+        // region's N pixels. A single-pixel spike on a flat floor has
+        // mean = min + (max - min)/N, so the raw ratio tops out at
+        // 1 - 1/N. The N/(N-1) factor corrects that, and a spike scores
+        // exactly 1 at every region size. The smallest possible value is
+        // 1/(N-1), which approaches 0 for a large flat plateau. Gain and
+        // additive offset both cancel. NaN pixels are excluded above. A
+        // flat region (max == min) gives 0/0 = NaN, and so does N = 1.
+        // The NaN is passed on for the caller to handle.
         let n_px = a.pixel_count as f64;
         let mean_v = a.sum_v / n_px;
         let peakiness =
@@ -535,7 +613,7 @@ fn compute_peak_props_from_trim(
         let h_hz = n_f * d_freq;
 
         // Moore-neighbor trace from the column-major-first in-region pixel
-        // — produces clockwise-ordered perimeter coords suitable for direct
+        // that produces clockwise-ordered perimeter coords suitable for direct
         // plot()-as-polyline (interleaved t, f).
         let trace = moore_trace(trim_labels, k, a.start_r, a.start_c);
         let mut bxy: Vec<f64> = Vec::with_capacity(trace.len() * 2);
@@ -565,9 +643,8 @@ fn compute_peak_props_from_trim(
 
 /// Run the full pipeline on one (F, T) spectrogram segment with its own
 /// stimes. Returns peak stats (no filtering yet) AND the trimmed label
-/// image aligned with those peaks (row k in the returned `SegmentPeaks`
-/// corresponds to label `k + 1` in the label image; zero pixels are
-/// background).
+/// image aligned with those peaks: row k of the returned `SegmentPeaks` is
+/// label `k + 1` in the label image, and zero pixels are background.
 ///
 /// `segment_num` is a 1-based tag assigned per segment (matches MATLAB).
 pub fn extract_tfpeaks_segment(
@@ -582,9 +659,9 @@ pub fn extract_tfpeaks_segment(
         return Ok((SegmentPeaks::default(), Array2::<i64>::zeros((f, t))));
     }
     // 1) Downsample.
-    let f_s = params.downsample_f.max(1);
-    let t_s = params.downsample_t.max(1);
-    let seg_lr = stride_downsample(spect, f_s, t_s);
+    let freq_stride = params.downsample_f.max(1);
+    let time_stride = params.downsample_t.max(1);
+    let seg_lr = stride_downsample(spect, freq_stride, time_stride);
     let (f_lr, t_lr) = seg_lr.dim();
     if f_lr < 2 || t_lr < 2 {
         return Ok((SegmentPeaks::default(), Array2::<i64>::zeros((f, t))));
@@ -609,13 +686,12 @@ pub fn extract_tfpeaks_segment(
         DBG_MERGE.fetch_add(count_labels(&merged_i64), Ordering::Relaxed);
     }
 
-    // 4) Border handling. Options:
-    //      0 => MATLAB paint-in-label-order (8-conn 1-px dilation, higher
-    //           labels overwrite lower). Exactly matches extractTFPeaks.m +
-    //           Ldata2graph.m. Confirmed via bisection 2026-04-21 as the
-    //           step that closes the +2% peak-count gap.
+    // 4) Border handling, by `expand_labels_distance`:
+    //      0   => MATLAB paint-in-label-order (8-connected 1-pixel
+    //             dilation, higher labels overwrite lower), as
+    //             extractTFPeaks.m + Ldata2graph.m do.
     //      N>0 => skimage-style expand_labels (BFS to distance N, lower
-    //           label wins ties). Pydynamo semantic (default 5).
+    //             label wins ties). The pydynamo behavior (its default is 5).
     let expanded_lr = if params.expand_labels_distance == 0 {
         matlab_paint_labels_in_order(merged_i64.view())
     } else {
@@ -623,52 +699,72 @@ pub fn extract_tfpeaks_segment(
     };
 
     // 5) Resize up to full segment shape (nearest-neighbor).
-    let labels_full = if f_s > 1 || t_s > 1 {
+    let labels_full = if freq_stride > 1 || time_stride > 1 {
         resize_labels_nn(expanded_lr.view(), f, t)
     } else {
         expanded_lr
     };
 
-    // 5b) Pre-trim dur/bw filter — pydynamo extract.py:182-193 /
-    //     MATLAB extractTFPeaks.m:300-307. Drop regions whose
-    //     (max_idx - min_idx - 1) * dx fails the dur_min / bw_min cut
-    //     BEFORE trim runs. This both changes the final peak count
-    //     (trim creates spurious sub-regions from jagged bboxes on
-    //     rejected peaks) and skips unnecessary trim work.
+    // 5b) Pre-trim duration / bandwidth cut (MATLAB `extractTFPeaks.m`).
+    //     Drop regions whose bounding-box span, (max_idx - min_idx + 1) * dx,
+    //     fails the dur_min / bw_min cut BEFORE trim runs. This both
+    //     changes the final peak count (trim creates spurious sub-regions
+    //     from jagged bboxes on rejected peaks) and skips unneeded trim work.
     let mut labels_full = labels_full;
     if params.dur_min > 0.0 || params.bw_min > 0.0 {
+        /// Inclusive bounding box of one label, in pixel indices.
+        struct LabelBounds {
+            row_min: usize,
+            row_max: usize,
+            col_min: usize,
+            col_max: usize,
+        }
         let d_time = stimes[1] - stimes[0];
         let d_freq = sfreqs[1] - sfreqs[0];
         let (h, w) = labels_full.dim();
-        let mut bb: HashMap<i64, (usize, usize, usize, usize)> = HashMap::new();
+        let mut bounds_by_label: HashMap<i64, LabelBounds> = HashMap::new();
         for r in 0..h {
             for c in 0..w {
                 let lbl = labels_full[[r, c]];
-                if lbl <= 0 { continue; }
-                let e = bb.entry(lbl).or_insert((r, r, c, c));
-                if r < e.0 { e.0 = r; }
-                if r > e.1 { e.1 = r; }
-                if c < e.2 { e.2 = c; }
-                if c > e.3 { e.3 = c; }
+                if lbl <= 0 {
+                    continue;
+                }
+                let bounds = bounds_by_label.entry(lbl).or_insert(LabelBounds {
+                    row_min: r,
+                    row_max: r,
+                    col_min: c,
+                    col_max: c,
+                });
+                if r < bounds.row_min {
+                    bounds.row_min = r;
+                }
+                if r > bounds.row_max {
+                    bounds.row_max = r;
+                }
+                if c < bounds.col_min {
+                    bounds.col_min = c;
+                }
+                if c > bounds.col_max {
+                    bounds.col_max = c;
+                }
             }
         }
-        let mut drop: std::collections::HashSet<i64> = std::collections::HashSet::new();
-        for (lbl, (r_min, r_max, c_min, c_max)) in &bb {
-            // Span = N_pixels * dx = (max - min + 1) * dx with inclusive
-            // r_max/c_max. Matches the MATLAB extractTFPeaks.m filter as
-            // of commit 7fef48f, which fixed an off-by-one (the old form
-            // (max-min)*dx dropped peaks of true span dur_min by one bin).
-            let pre_dur = (*c_max as f64 - *c_min as f64 + 1.0) * d_time;
-            let pre_bw  = (*r_max as f64 - *r_min as f64 + 1.0) * d_freq;
+        let mut labels_to_drop: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for (lbl, bounds) in &bounds_by_label {
+            // Span = N_pixels * dx = (max - min + 1) * dx, with inclusive
+            // row_max / col_max. Same form as the MATLAB `extractTFPeaks.m`
+            // cut.
+            let pre_dur = (bounds.col_max as f64 - bounds.col_min as f64 + 1.0) * d_time;
+            let pre_bw = (bounds.row_max as f64 - bounds.row_min as f64 + 1.0) * d_freq;
             if !(pre_dur > params.dur_min && pre_bw > params.bw_min) {
-                drop.insert(*lbl);
+                labels_to_drop.insert(*lbl);
             }
         }
-        if !drop.is_empty() {
+        if !labels_to_drop.is_empty() {
             for r in 0..h {
                 for c in 0..w {
                     let lbl = labels_full[[r, c]];
-                    if drop.contains(&lbl) {
+                    if labels_to_drop.contains(&lbl) {
                         labels_full[[r, c]] = 0;
                     }
                 }
@@ -683,6 +779,7 @@ pub fn extract_tfpeaks_segment(
     // 6) Trim on the full-resolution spect.
     let labels_full_i32: Array2<i32> = labels_full.mapv(|v| v as i32);
     let shift_val = if params.trim_shift_val.is_nan() {
+        // Smallest value in the segment. `f64::min` skips NaN.
         spect.iter().cloned().fold(f64::INFINITY, f64::min)
     } else {
         params.trim_shift_val
@@ -705,22 +802,25 @@ pub fn extract_tfpeaks_segment(
     //    over unique label IDs in sorted order, so the k-th peak in the
     //    output corresponds to the k-th smallest label in `trimmed_i64`.
     //    Build a remap old_id -> new_id = rank+1 (1-based), zero stays 0.
-    let mut ids: Vec<i64> = Vec::new();
-    {
-        let mut seen = std::collections::BTreeSet::new();
-        for &v in trimmed_i64.iter() {
-            if v > 0 { seen.insert(v); }
+    // Distinct positive labels in ascending order.
+    let mut seen = std::collections::BTreeSet::new();
+    for &v in trimmed_i64.iter() {
+        if v > 0 {
+            seen.insert(v);
         }
-        ids.extend(seen);
     }
+    let ids: Vec<i64> = seen.into_iter().collect();
     debug_assert_eq!(ids.len(), peaks.len());
-    // Use a HashMap for the remap; small N.
     let mut remap: HashMap<i64, i64> = HashMap::with_capacity(ids.len());
     for (k, old) in ids.iter().enumerate() {
         remap.insert(*old, (k as i64) + 1);
     }
     let labels_out = trimmed_i64.mapv(|v| {
-        if v <= 0 { 0 } else { *remap.get(&v).unwrap_or(&0) }
+        if v <= 0 {
+            0
+        } else {
+            *remap.get(&v).unwrap_or(&0)
+        }
     });
 
     Ok((peaks, labels_out))
@@ -735,6 +835,12 @@ pub fn extract_tfpeaks_segment(
 /// remaining segments' watershed. This keeps a host's Stop control
 /// responsive. A canceled call returns within about one segment instead of
 /// the whole multi-segment extract. With `cancel: None` every segment runs.
+///
+/// `baseline`, when given, has one value per frequency and each spectrogram
+/// row is divided by its value first (a zero or non-finite value leaves the
+/// row as it is). `progress_cb(done, total)` is called after each segment.
+/// Returns the filtered peak table and a full-size label image in which
+/// peak row k carries label k + 1.
 pub fn extract_tfpeaks(
     spect: ArrayView2<f64>,
     stimes: ArrayView1<f64>,
@@ -773,7 +879,9 @@ pub fn extract_tfpeaks(
         let mut m = spect.to_owned();
         for r in 0..f {
             let denom = bl[r];
-            if !denom.is_finite() || denom == 0.0 { continue; }
+            if !denom.is_finite() || denom == 0.0 {
+                continue;
+            }
             for c in 0..t {
                 m[[r, c]] /= denom;
             }
@@ -785,7 +893,11 @@ pub fn extract_tfpeaks(
 
     // MATLAB-compatible segmentation.
     let dt = stimes[1] - stimes[0];
-    let seg_time = if params.seg_time > 0.0 { params.seg_time } else { 30.0 };
+    let seg_time = if params.seg_time > 0.0 {
+        params.seg_time
+    } else {
+        DEFAULT_SEG_TIME_S
+    };
     let max_dx = (seg_time / dt).floor() as usize;
     if max_dx < 2 {
         return Err("seg_time too small relative to dt (max_dx < 2)".to_string());
@@ -793,17 +905,29 @@ pub fn extract_tfpeaks(
     let n_segs = ((t as f64) / (max_dx as f64)).ceil() as usize;
     let new_dx = (((t as f64) / (n_segs as f64)).ceil() as usize).max(1);
 
-    let mut seg_bounds: Vec<(usize, usize, usize)> = Vec::with_capacity(n_segs);
+    /// One segment: its 1-based number and its column range `[start, end)`.
+    #[derive(Clone, Copy)]
+    struct SegmentBounds {
+        segment_num: usize,
+        start: usize,
+        end: usize,
+    }
+    let mut seg_bounds: Vec<SegmentBounds> = Vec::with_capacity(n_segs);
     for ii in 0..n_segs {
         let start = ii * new_dx;
         let end = (start + new_dx).min(t);
+        // A segment narrower than 2 columns cannot hold a peak and is skipped.
         if end.saturating_sub(start) < 2 {
             continue;
         }
-        seg_bounds.push((ii + 1, start, end));
+        seg_bounds.push(SegmentBounds {
+            segment_num: ii + 1,
+            start,
+            end,
+        });
     }
 
-    // Parallel extract; collect per-segment results preserving order.
+    // Parallel extract. Collect per-segment results preserving order.
     let n_segs_total = seg_bounds.len() as u32;
     if tfpeaks_debug() {
         DBG_WS.store(0, Ordering::Relaxed);
@@ -814,26 +938,34 @@ pub fn extract_tfpeaks(
     let done = std::sync::atomic::AtomicU32::new(0);
     let results: Vec<Result<(SegmentPeaks, Array2<i64>), String>> = seg_bounds
         .par_iter()
-        .map(|&(si, start, end)| {
-            // Bail before a segment's watershed if the run was canceled —
+        .map(|segment| {
+            // Bail before a segment's watershed if the run was canceled. This
             // keeps a host's Stop responsive within ~one segment instead of
             // the whole multi-segment extract.
-            if cancel.is_some_and(|c| c()) {
-                return Err("cancelled".to_string());
+            if let Some(is_canceled) = cancel {
+                if is_canceled() {
+                    return Err("cancelled".to_string());
+                }
             }
-            // Make the segment spect contiguous — trim / merge require it.
+            // Make the segment spect contiguous. Trim / merge require it.
             let sub_spect = spect_owned
-                .slice(ndarray::s![.., start..end])
+                .slice(ndarray::s![.., segment.start..segment.end])
                 .to_owned();
-            let sub_times = stimes.slice(ndarray::s![start..end]).to_owned();
-            let r = extract_tfpeaks_segment(
-                sub_spect.view(), sub_times.view(), sfreqs, si as f64, params,
+            let sub_times = stimes
+                .slice(ndarray::s![segment.start..segment.end])
+                .to_owned();
+            let segment_result = extract_tfpeaks_segment(
+                sub_spect.view(),
+                sub_times.view(),
+                sfreqs,
+                segment.segment_num as f64,
+                params,
             );
-            if let Some(cb) = progress_cb {
-                let n = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                cb(n, n_segs_total);
+            if let Some(report_progress) = progress_cb {
+                let n_done = done.fetch_add(1, Ordering::SeqCst) + 1;
+                report_progress(n_done, n_segs_total);
             }
-            r
+            segment_result
         })
         .collect();
 
@@ -851,43 +983,39 @@ pub fn extract_tfpeaks(
     // Stitch per-segment labels into a full (F, T) image with running
     // label offset so that peak row k in the concatenated SegmentPeaks
     // maps to label k+1 in the global image.
-    let mut all = SegmentPeaks::default();
+    let mut all_peaks = SegmentPeaks::default();
     let mut labels_full = Array2::<i64>::zeros((f, t));
     let mut offset: i64 = 0;
-    let mut per_seg: Vec<(usize, usize, Array2<i64>)> = Vec::with_capacity(seg_bounds.len());
-    for (r, &(_si, start, end)) in results.into_iter().zip(seg_bounds.iter()) {
-        match r {
-            Ok((p, lbl)) => {
-                let n_here = p.len() as i64;
+    for (segment_result, segment) in results.into_iter().zip(seg_bounds.iter()) {
+        match segment_result {
+            Ok((segment_peaks, segment_labels)) => {
+                let n_here = segment_peaks.len() as i64;
                 // Write with offset into the global image.
-                let (fh, tw) = lbl.dim();
-                debug_assert_eq!(fh, f);
-                debug_assert_eq!(tw, end - start);
-                for r in 0..fh {
-                    for c in 0..tw {
-                        let v = lbl[[r, c]];
+                let (n_rows, n_cols) = segment_labels.dim();
+                debug_assert_eq!(n_rows, f);
+                debug_assert_eq!(n_cols, segment.end - segment.start);
+                for r in 0..n_rows {
+                    for c in 0..n_cols {
+                        let v = segment_labels[[r, c]];
                         if v > 0 {
-                            labels_full[[r, start + c]] = v + offset;
+                            labels_full[[r, segment.start + c]] = v + offset;
                         }
                     }
                 }
-                all.extend(p);
+                all_peaks.extend(segment_peaks);
                 offset += n_here;
-                per_seg.push((start, end, lbl));
             }
             Err(e) => return Err(e),
         }
     }
-    // `per_seg` is kept so the debug_assert above can be cheap; drop it.
-    drop(per_seg);
 
     // filterStatsTable: Duration ∈ (dur_min, dur_max), Bandwidth ∈ (bw_min, bw_max),
     // PeakFrequency ∈ (freq_min, freq_max), pow2db(Height) > ht_db_min.
-    let keep = filter_indices(&all, params);
+    let keep = filter_indices(&all_peaks, params);
 
     // Build a remap from old global label id -> new label id (1..n_kept).
-    // Peaks not in `keep` -> 0.
-    let mut remap_filter: Vec<i64> = vec![0; all.len() + 1]; // index by old id (1-based)
+    // Peaks not in `keep` -> 0. Indexed by the old id (1-based).
+    let mut remap_filter: Vec<i64> = vec![0; all_peaks.len() + 1];
     for (new_idx, &old_idx) in keep.iter().enumerate() {
         // old label id = old_idx + 1 (1-based global id)
         remap_filter[old_idx + 1] = (new_idx as i64) + 1;
@@ -895,13 +1023,20 @@ pub fn extract_tfpeaks(
     for v in labels_full.iter_mut() {
         if *v > 0 {
             let old = *v as usize;
-            *v = if old < remap_filter.len() { remap_filter[old] } else { 0 };
+            if old < remap_filter.len() {
+                *v = remap_filter[old];
+            } else {
+                *v = 0;
+            }
         }
     }
 
-    Ok((take_indices(&all, &keep), labels_full))
+    Ok((take_indices(&all_peaks, &keep), labels_full))
 }
 
+/// Row indices of the peaks that pass MATLAB `filterStatsTable`: Duration,
+/// Bandwidth and PeakFrequency strictly inside their limits, and Height in
+/// dB above `ht_db_min`.
 fn filter_indices(
     p: &SegmentPeaks,
     params: &ExtractParams,
@@ -913,16 +1048,13 @@ fn filter_indices(
         let pf = p.peak_freq[i];
         let h = p.height[i];
         let h_db = if h > 0.0 { 10.0 * h.log10() } else { f64::NAN };
-        // Span = Duration = N_pixels*dx (inclusive bbox). MATLAB's
-        // extractTFPeaks.m post-trim filter and filterStatsTable.m both
-        // compare Duration > dur_min directly as of MATLAB commit 7fef48f
-        // (which fixed an off-by-one: the old form (max-min)*dx = dur-dx
-        // dropped peaks of true span dur_min by one bin). pydynamo's
-        // extract.py:262-264 still uses the (N-1)*dx form and is now
-        // slightly stricter than this Rust path; pydynamo should be
-        // updated for parity if it is used as a numerical reference.
+        // Duration and Bandwidth are inclusive bounding-box spans
+        // (N_pixels * dx). MATLAB `extractTFPeaks.m` and
+        // `filterStatsTable.m` compare them to the limits directly, and
+        // so does this. pydynamo's `extract.py` uses the (N - 1) * dx
+        // form, which is stricter by one bin.
         let dur_ok = dur > params.dur_min && dur < params.dur_max;
-        let bw_ok  = bw  > params.bw_min  && bw  < params.bw_max;
+        let bw_ok = bw > params.bw_min && bw < params.bw_max;
         let pf_ok = pf > params.freq_min && pf < params.freq_max;
         let ht_ok = h_db.is_finite() && h_db > params.ht_db_min;
         if dur_ok && bw_ok && pf_ok && ht_ok {
@@ -932,6 +1064,7 @@ fn filter_indices(
     out
 }
 
+/// Copy of the peak table holding only the rows in `idx`, in that order.
 fn take_indices(p: &SegmentPeaks, idx: &[usize]) -> SegmentPeaks {
     let mut out = SegmentPeaks::default();
     out.peak_time.reserve(idx.len());
@@ -1026,7 +1159,8 @@ mod tests {
         );
         // Successive pixels are 8-adjacent.
         for w in t.windows(2) {
-            let (a, b) = (w[0], w[1]);
+            let a = w[0];
+            let b = w[1];
             let dr = (a.0 as i32 - b.0 as i32).abs();
             let dc = (a.1 as i32 - b.1 as i32).abs();
             assert!(dr <= 1 && dc <= 1 && (dr + dc) >= 1,
@@ -1066,7 +1200,8 @@ mod tests {
         assert_eq!(t.first().copied(), Some((2, 0)));
         // Each step must be 8-adjacent.
         for w in t.windows(2) {
-            let (a, b) = (w[0], w[1]);
+            let a = w[0];
+            let b = w[1];
             let dr = (a.0 as i32 - b.0 as i32).abs();
             let dc = (a.1 as i32 - b.1 as i32).abs();
             assert!(
@@ -1084,8 +1219,13 @@ mod tests {
         //   X . X
         //   X X X
         let mut lab = Array2::<i64>::zeros((3, 3));
-        for r in 0..3 { lab[[r, 0]] = 5; lab[[r, 2]] = 5; }
-        for c in 0..3 { lab[[2, c]] = 5; }
+        for r in 0..3 {
+            lab[[r, 0]] = 5;
+            lab[[r, 2]] = 5;
+        }
+        for c in 0..3 {
+            lab[[2, c]] = 5;
+        }
         // Column-major first: column 0 has rows 0,1,2 in region. First = (0,0).
         let t = moore_trace(lab.view(), 5, 0, 0);
         assert!(
@@ -1094,7 +1234,8 @@ mod tests {
             t.len()
         );
         for w in t.windows(2) {
-            let (a, b) = (w[0], w[1]);
+            let a = w[0];
+            let b = w[1];
             let dr = (a.0 as i32 - b.0 as i32).abs();
             let dc = (a.1 as i32 - b.1 as i32).abs();
             assert!(dr <= 1 && dc <= 1 && (dr + dc) >= 1);
@@ -1104,13 +1245,17 @@ mod tests {
     #[test]
     fn filter_basic() {
         let mut p = SegmentPeaks::default();
-        p.peak_time.push(1.0); p.peak_freq.push(10.0);
-        p.duration.push(1.0);  p.bandwidth.push(5.0);
-        p.height.push(100.0);  p.volume.push(1.0);
+        p.peak_time.push(1.0);
+        p.peak_freq.push(10.0);
+        p.duration.push(1.0);
+        p.bandwidth.push(5.0);
+        p.height.push(100.0);
+        p.volume.push(1.0);
         p.segment_num.push(1.0);
         p.bbox.extend_from_slice(&[0.0, 0.0, 0.0, 0.0]);
         p.area.push(5.0);
-        p.peakiness.push(0.5); // (max - mean) / (max - min), unitless [0, 1]
+        // N/(N-1) * (max - mean) / (max - min), unitless.
+        p.peakiness.push(0.5);
         p.height_data.push(vec![1.0, 2.0]);
         p.boundaries_xy.push(vec![0.0, 10.0]);
         let params = ExtractParams {
@@ -1132,8 +1277,6 @@ mod tests {
         let kept = filter_indices(&p, &params);
         assert!(kept.is_empty());
     }
-
-    fn _unused(_a: Array1<f64>) {}
 
     #[test]
     fn extract_tfpeaks_rejects_mismatched_axis_lengths() {
@@ -1188,7 +1331,7 @@ mod tests {
     #[test]
     fn extract_tfpeaks_labels_shape_and_stitching() {
         // Construct a 2-segment spect: 32 freq bins, 600 time bins at
-        // dt=0.1 s → T*dt = 60 s; with seg_time = 30 s the pipeline
+        // dt=0.1 s → T*dt = 60 s. With seg_time = 30 s the pipeline
         // produces two segments.
         let n_f = 32usize;
         let n_t = 600usize;
@@ -1212,7 +1355,9 @@ mod tests {
             }
         }
         // Small positive floor so pow2db is finite everywhere.
-        for v in spect.iter_mut() { *v += 0.1; }
+        for v in spect.iter_mut() {
+            *v += 0.1;
+        }
 
         let stimes: Array1<f64> = Array1::from_iter((0..n_t).map(|i| i as f64 * dt));
         let sfreqs: Array1<f64> = Array1::from_iter((0..n_f).map(|i| i as f64 * df));
@@ -1273,7 +1418,9 @@ mod tests {
         for r in 0..n_f {
             for c in 0..n_t {
                 let v = labels[[r, c]];
-                if v <= 0 { continue; }
+                if v <= 0 {
+                    continue;
+                }
                 let idx = (v - 1) as usize;
                 let seg = peaks.segment_num[idx];
                 let boundary = n_t / 2;
@@ -1293,7 +1440,7 @@ mod tests {
     }
 
     /// A cancel callback that always fires makes `extract_tfpeaks` return
-    /// `Err` instead of running every segment's watershed — this is what
+    /// `Err` instead of running every segment's watershed. This is what
     /// keeps a host's Stop control responsive mid-extract.
     #[test]
     fn extract_tfpeaks_cancels() {

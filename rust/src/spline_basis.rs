@@ -7,8 +7,8 @@
 //!
 //! # Algorithm
 //!
-//! The fit is a separable bivariate LSQ — on a regular grid the normal
-//! equations factor into two 1-D problems (Boor 1978, *A Practical Guide
+//! The fit is a separable bivariate LSQ. On a regular grid the normal
+//! equations factor into two 1-D problems (de Boor 1978, *A Practical Guide
 //! to Splines*, §XVII). Given the 1-D basis matrices
 //!
 //! ```text
@@ -36,15 +36,19 @@
 //!   which `spline_basis.m` reshapes to `size(SOPH') = (n_features, n_freqs)`).
 //!
 //! The MATLAB-side wrapper transposes from MATLAB `(n_freqs, n_features)`
-//! column-major to `(n_features, n_freqs)` row-major before the FFI call;
-//! `feature_bins` is the x-axis, `freq_bins` is the y-axis.
+//! column-major to `(n_features, n_freqs)` row-major before the FFI call.
+//! `feature_bins` is the x-axis and `freq_bins` is the y-axis.
 
 use nalgebra::{Cholesky, DMatrix};
 use ndarray::{Array2, ArrayView2};
 
+/// Why a spline fit could not be run.
 #[derive(Debug)]
 pub enum SplineError {
+    /// Input shapes, order, multiplicity, or knot counts are inconsistent.
     InvalidArgument(String),
+    /// A Gram matrix is not positive definite, so its Cholesky factorization
+    /// failed.
     Singular,
 }
 
@@ -61,29 +65,33 @@ impl std::error::Error for SplineError {}
 
 /// Output of [`fit_tensor_product_spline`].
 pub struct SplineBasisOut {
-    /// Coefficient matrix, shape `(m_y, m_x)` — matches MATLAB
+    /// Coefficient matrix, shape `(m_y, m_x)`, matching MATLAB
     /// `squeeze(spline_obj.coefs)'`.
     pub coefs: Array2<f64>,
     /// Splinefit reconstruction on the input grid, shape `(n_x, n_y)`.
     pub splinefit: Array2<f64>,
-    /// Augmented knot vectors (the output of `augknt(internal, order-1)`).
+    /// Augmented x-axis knot vector, the output of
+    /// `augknt(internal_knots_x, boundary_multiplicity)`.
     pub knots_x_aug: Vec<f64>,
+    /// Augmented y-axis knot vector, the output of
+    /// `augknt(internal_knots_y, boundary_multiplicity)`.
     pub knots_y_aug: Vec<f64>,
 }
 
 /// Fit a tensor-product B-spline on a regular grid via separable normal-equations LSQ.
 ///
-/// * `soph` — input data, shape `(n_x, n_y)` where x = feature axis,
+/// * `soph`: input data, shape `(n_x, n_y)` where x = feature axis,
 ///   y = freq axis. This is the orientation that MATLAB's `spline_basis.m`
 ///   feeds to `spap2` (i.e. `SOPH'` of the originally-`(n_freqs,
 ///   n_features)`-laid-out histogram).
-/// * `x_eval`, `y_eval` — grid points on each axis, length `n_x` / `n_y`.
-/// * `internal_knots_x`, `internal_knots_y` — pre-augmented knot
-///   vectors (the spline_basis.m `knots_x` / `knots_y` locals at line 162).
-/// * `order` — spline order (4 = cubic; MATLAB uses 4 for both axes).
-/// * `boundary_multiplicity` — `augknt(.,k)` second argument; 3 for the
-///   DYNAM-O spline (under-clamped: order-4 spline with multiplicity-3
-///   boundary knots).
+/// * `x_eval`, `y_eval`: grid points on each axis, length `n_x` / `n_y`.
+/// * `internal_knots_x`, `internal_knots_y`: knot vectors before boundary
+///   augmentation (the `knots_x` / `knots_y` locals in `spline_basis.m`).
+///   [`augknt`] is applied to them here.
+/// * `order`: spline order (4 = cubic, which MATLAB uses for both axes).
+/// * `boundary_multiplicity`: the second argument of `augknt(.,k)`. It is 3
+///   for the DYNAM-O spline, which is under-clamped (an order-4 spline with
+///   multiplicity-3 boundary knots).
 pub fn fit_tensor_product_spline(
     soph: ArrayView2<f64>,
     x_eval: &[f64],
@@ -216,14 +224,14 @@ pub fn augknt(knots: &[f64], k: usize) -> Vec<f64> {
 /// `n_basis = t.len() - order`.
 ///
 /// Implementation: Cox–de Boor recursion. For each evaluation point we
-/// locate the knot span and recurse upward; matches `scipy.interpolate.BSpline.design_matrix`
-/// to f64 round-off.
+/// locate the knot span and recurse upward. The result matches
+/// `scipy.interpolate.BSpline.design_matrix` to f64 round-off.
 ///
 /// **Boundary convention** matches MATLAB Curve Fitting Toolbox `spcol` /
-/// `spap2`: evaluating *exactly* at the right boundary knot returns the
-/// limit-from-the-left (so the last basis function evaluates to 1.0 at
-/// `t[t.len()-1]` rather than to 0.0). We implement this by clamping
-/// the eval point's "active" span at `n_basis - 1` if `x == t[-1]`.
+/// `spap2`: a point at or beyond the right end of the basis interval,
+/// `x >= t[n_basis]`, is evaluated in the last span (`n_basis - 1`), which
+/// gives the limit from the left. A point at or below `t[degree]` is
+/// evaluated in the first span.
 pub fn bspline_basis_matrix(t: &[f64], order: usize, x_eval: &[f64]) -> Array2<f64> {
     let degree = order - 1;
     let n_basis = t.len().saturating_sub(order);
@@ -231,8 +239,8 @@ pub fn bspline_basis_matrix(t: &[f64], order: usize, x_eval: &[f64]) -> Array2<f
     let mut out = Array2::<f64>::zeros((n_eval, n_basis));
 
     for (i, &x) in x_eval.iter().enumerate() {
-        // Locate span k such that t[k] <= x < t[k+1], with a right-boundary
-        // clamp so x == t[n_basis + degree] still hits the last span.
+        // Locate span k such that t[k] <= x < t[k+1]. Points at or beyond
+        // t[n_basis] are clamped to the last span.
         let k = find_span(t, n_basis, degree, x);
         // Compute the `order` non-zero basis functions at x: N[k-degree..=k].
         let basis = cox_de_boor(t, degree, k, x);
@@ -250,11 +258,12 @@ fn find_span(t: &[f64], n_basis: usize, degree: usize, x: f64) -> usize {
     // Span index k means the non-zero basis at x ∈ [t[k], t[k+1]] are
     // N_{k-degree}..=N_k. Valid k range: [degree, n_basis - 1].
     let high = n_basis - 1;
-    // Right boundary: MATLAB spap2 / spcol's "extend-from-left" convention —
-    // x == t[n_basis] still hits the last span.
+    // Right boundary: MATLAB spap2 / spcol's "extend-from-left" convention.
+    // Any x >= t[n_basis] uses the last span.
     if x >= t[n_basis] {
         return high;
     }
+    // Left boundary: any x <= t[degree] uses the first span.
     if x <= t[degree] {
         return degree;
     }
@@ -276,7 +285,9 @@ fn find_span(t: &[f64], n_basis: usize, degree: usize, x: f64) -> usize {
 fn cox_de_boor(t: &[f64], degree: usize, k: usize, x: f64) -> Vec<f64> {
     // Returns the `degree + 1` non-zero basis-function values at x for the
     // knot span starting at index k. Standard de-Boor recursion (e.g.
-    // Piegl & Tiller, *The NURBS Book*, Algorithm A2.2).
+    // Piegl & Tiller, *The NURBS Book*, Algorithm A2.2). Names follow that
+    // algorithm: p is the degree, n holds the basis values, and left / right
+    // hold the distances from x to the knots on each side.
     let p = degree;
     let mut left = vec![0.0_f64; p + 1];
     let mut right = vec![0.0_f64; p + 1];
@@ -403,7 +414,7 @@ mod tests {
         let nx = 31;
         let ny = 41;
         // Eval range must span the full internal-knot range so every basis
-        // function has data support — otherwise the Gram is singular.
+        // function has data support. Otherwise the Gram is singular.
         let x_eval: Vec<f64> = (0..nx).map(|i| -2.0 + 6.0 * i as f64 / (nx - 1) as f64).collect();
         let y_eval: Vec<f64> = (0..ny).map(|j| -1.0 + 6.0 * j as f64 / (ny - 1) as f64).collect();
         let mut z = Array2::<f64>::zeros((nx, ny));

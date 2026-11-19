@@ -1,8 +1,8 @@
-//! Port of `read_staging.m` — sleep-stage CSV/TSV parser.
+//! Port of `read_staging.m`. Sleep-stage CSV/TSV parser.
 //!
 //! Reads a delimited text file, takes two columns (time and stage string),
 //! maps stage strings to numeric codes with the MATLAB default table, and
-//! returns (times_seconds, stage_values).
+//! returns them as a `StagingOut`.
 //!
 //! Stage number mapping (stage_numbers in the MATLAB source):
 //!   artifact / 'A' / '6'           → 6
@@ -21,14 +21,22 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Seconds in a day, added each time the clock passes midnight.
+const SECONDS_PER_DAY: f64 = 86400.0;
+
+/// Why a staging file could not be read.
 #[derive(Debug)]
 pub enum StagingError {
+    /// An I/O error with no file path attached.
     Io(std::io::Error),
+    /// The staging file does not exist.
     NotFound(std::path::PathBuf),
+    /// The staging file exists but could not be read.
     ReadFailed {
         path: std::path::PathBuf,
         source: std::io::Error,
     },
+    /// The file was read but its contents could not be interpreted.
     Format(String),
 }
 
@@ -56,23 +64,30 @@ impl From<std::io::Error> for StagingError {
 /// Arguments matching `read_staging`.
 #[derive(Debug, Clone)]
 pub struct StagingOpts {
-    pub time_col: usize,      // 1-based
-    pub stage_col: usize,     // 1-based
+    /// 1-based column holding the time.
+    pub time_col: usize,
+    /// 1-based column holding the stage.
+    pub stage_col: usize,
+    /// Lines to skip at the top of the file.
     pub header_lines: usize,
+    /// Field separator.
     pub delimiter: char,
+    /// Epoch length in seconds, used when the time column holds epoch
+    /// numbers.
     pub epoch_dur: f64,
-    /// Optional start-time 'HH:MM:SS [AM|PM]' string — only used for Case 3.
+    /// Optional start-time 'HH:MM:SS [AM|PM]' string. Only used for case
+    /// (c), clock-time strings.
     pub start_time: Option<String>,
-    /// Length of the recording in seconds, when the caller knows it — only
-    /// used for Case 3 together with `start_time`. It lets the reader tell
+    /// Length of the recording in seconds, when the caller knows it. Only
+    /// used for case (c), clock-time strings, together with `start_time`. It lets the reader tell
     /// a first scored epoch after midnight from staging that starts before
     /// the recording does (see the next-day rule in `read_staging`).
     pub recording_duration: Option<f64>,
     /// Per-stage label aliases in canonical order
     /// `[artifact, wake, REM, N1, N2, N3, unknown]`. Each inner list is
-    /// the set of strings (case-insensitive) that map to that stage —
+    /// the set of strings (case-insensitive) that map to that stage. It
     /// matches MATLAB `read_staging`'s `stage_vals` parameter. A
-    /// length-7 list overrides the built-in default table; any other
+    /// length-7 list overrides the built-in default table. Any other
     /// length (incl. empty) falls back to the defaults.
     pub stage_vals: Vec<Vec<String>>,
 }
@@ -94,26 +109,26 @@ impl Default for StagingOpts {
 
 /// Parse a delimited line honoring simple quoted fields.
 fn split_line(line: &str, delim: char) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut in_q = false;
+    let mut fields: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
     for c in line.chars() {
         if c == '"' {
-            in_q = !in_q;
+            in_quotes = !in_quotes;
             continue;
         }
-        if c == delim && !in_q {
-            out.push(cur.trim().to_string());
-            cur.clear();
+        if c == delim && !in_quotes {
+            fields.push(current.trim().to_string());
+            current.clear();
         } else {
-            cur.push(c);
+            current.push(c);
         }
     }
-    out.push(cur.trim().to_string());
-    out
+    fields.push(current.trim().to_string());
+    fields
 }
 
-/// MATLAB `read_staging` default `stage_vals` — 7 alias lists in
+/// MATLAB `read_staging` default `stage_vals`: 7 alias lists in
 /// canonical order [artifact, wake, REM, N1, N2, N3, unknown].
 const DEFAULT_STAGE_VALS: [&[&str]; 7] = [
     &["art", "artifact", "a", "6"],
@@ -130,15 +145,15 @@ const DEFAULT_STAGE_VALS: [&[&str]; 7] = [
 const STAGE_CODES: [i32; 7] = [6, 5, 4, 3, 2, 1, 0];
 
 /// Build the case-insensitive alias→code lookup. A length-7 `custom`
-/// list overrides the defaults; any other length falls back to the
+/// list overrides the defaults. Any other length falls back to the
 /// MATLAB default table. When two stage slots share an alias the
-/// later (higher-numbered) slot wins — matches MATLAB's overwrite order.
+/// later (higher-numbered) slot wins. Matches MATLAB's overwrite order.
 fn build_stage_map(custom: &[Vec<String>]) -> HashMap<String, i32> {
     let mut map: HashMap<String, i32> = HashMap::new();
     if custom.len() == 7 {
         for (i, aliases) in custom.iter().enumerate() {
-            for a in aliases {
-                let key = a.trim().to_ascii_lowercase();
+            for alias in aliases {
+                let key = alias.trim().to_ascii_lowercase();
                 if !key.is_empty() {
                     map.insert(key, STAGE_CODES[i]);
                 }
@@ -146,8 +161,8 @@ fn build_stage_map(custom: &[Vec<String>]) -> HashMap<String, i32> {
         }
     } else {
         for (i, aliases) in DEFAULT_STAGE_VALS.iter().enumerate() {
-            for a in *aliases {
-                map.insert((*a).to_string(), STAGE_CODES[i]);
+            for alias in *aliases {
+                map.insert((*alias).to_string(), STAGE_CODES[i]);
             }
         }
     }
@@ -156,13 +171,13 @@ fn build_stage_map(custom: &[Vec<String>]) -> HashMap<String, i32> {
 
 /// Strip a leading ISO 8601 / RFC 3339 date prefix, returning the
 /// time-of-day portion. Handles both separators:
-///   - `2014-06-26T01:29:29.420000` (T separator — strict ISO 8601)
-///   - `2014-06-26 01:29:29.420000` (space separator — RFC 3339 §5.6)
+///   - `2014-06-26T01:29:29.420000` (T separator, strict ISO 8601)
+///   - `2014-06-26 01:29:29.420000` (space separator, RFC 3339 §5.6)
 ///
 /// The space form is only stripped when the part before the space
 /// looks like a date (contains `-` or `/` and otherwise only digits/
 /// separators), so a bare `"12:00:00 AM"` time-of-day is not
-/// mis-handled — the AM/PM-side space stays intact and the AM/PM
+/// mis-handled. The AM/PM-side space stays intact and the AM/PM
 /// branch downstream sees it.
 fn strip_date_prefix(s: &str) -> &str {
     if let Some(i) = s.rfind('T') {
@@ -181,7 +196,7 @@ fn strip_date_prefix(s: &str) -> &str {
 
 /// Strip a trailing timezone marker (`Z` or `+HH:MM` / `-HH:MM` /
 /// `+HHMM` / `-HHMM`). We only care about wall-clock time, so any
-/// timezone offset is silently dropped. Heuristic — only treats a
+/// timezone offset is silently dropped. Heuristic: it only treats a
 /// trailing `+`/`-` as a TZ marker when it's followed by digits (so
 /// it doesn't strip a `-` inside a negative second field, which
 /// wouldn't be valid anyway).
@@ -213,7 +228,7 @@ fn strip_tz_suffix(s: &str) -> &str {
 /// Parse 'HH:MM:SS[.ff] [AM|PM]' → seconds of day. Also accepts EDF's
 /// "hh.mm.ss" (dot-separated). ISO 8601 datetime inputs
 /// (`2014-06-26T01:29:29.420000`, with or without trailing TZ) are
-/// also accepted — the date and timezone are stripped before parsing,
+/// also accepted. The date and timezone are stripped before parsing,
 /// and only the wall-clock time-of-day is returned. Returns `None`
 /// for empty / unparseable input.
 ///
@@ -226,8 +241,8 @@ pub fn parse_time_of_day(t: &str) -> Option<f64> {
         return None;
     }
     // ISO 8601 / RFC 3339 date-time inputs (`2014-06-26T01:29:29.420000`,
-    // `2014-06-26 01:29:29.420000+05:30`) — we only care about the
-    // wall-clock time-of-day; the date drops and the timezone is
+    // `2014-06-26 01:29:29.420000+05:30`). We only care about the
+    // wall-clock time-of-day. The date drops and the timezone is
     // ignored. The midnight-wrap detector in `read_staging` reconstructs
     // cross-day runs from time-of-day deltas, so dropping the date
     // here loses no information for the cohort use case.
@@ -250,38 +265,54 @@ pub fn parse_time_of_day(t: &str) -> Option<f64> {
     }
 
     // Staging clock times use "HH:MM:SS"; EDF start times use "hh.mm.ss" (dots,
-    // per the EDF spec). Split on whichever separator is present — prefer ':'
+    // per the EDF spec). Split on whichever separator is present. Prefer ':'
     // so a fractional-second "HH:MM:SS.s" keeps its decimal.
     let sep = if core.contains(':') { ':' } else { '.' };
     let parts: Vec<&str> = core.split(sep).collect();
     if parts.len() < 2 {
         return None;
     }
-    let h: f64 = parts[0].trim().parse().ok()?;
-    let m: f64 = parts[1].trim().parse().ok()?;
-    let s: f64 = if parts.len() > 2 {
+    let mut hours: f64 = parts[0].trim().parse().ok()?;
+    let minutes: f64 = parts[1].trim().parse().ok()?;
+    let seconds: f64 = if parts.len() > 2 {
         parts[2].trim().parse().ok()?
     } else {
         0.0
     };
-    let mut hour = h;
     if is_ampm {
-        if hour == 12.0 {
-            hour = 0.0;
+        if hours == 12.0 {
+            hours = 0.0;
         }
         if pm {
-            hour += 12.0;
+            hours += 12.0;
         }
     }
-    Some(hour * 3600.0 + m * 60.0 + s)
+    Some(hours * 3600.0 + minutes * 60.0 + seconds)
 }
 
 /// Result of a staging-file parse: times in seconds + integer stage codes.
 pub struct StagingOut {
+    /// Time of each scored row, in seconds.
     pub times: Vec<f64>,
+    /// Stage code of each row (see `STAGE_CODES`), stored as f64.
     pub vals: Vec<f64>,
 }
 
+/// Read a sleep-staging file into times (seconds) and stage codes.
+///
+/// The time column is read as one of three kinds (see the module docs):
+/// (a) epoch numbers, (b) seconds, or (c) clock times. Rows whose stage
+/// string matches no alias are dropped, as in MATLAB.
+///
+/// Clock times (c) are made relative: with `start_time` they are seconds
+/// from the recording start, otherwise seconds from the first row.
+/// Next-day rule: a first row with an earlier clock time than
+/// `start_time` is taken to fall on the following day. When
+/// `recording_duration` is given and that reading lands past the end of
+/// the recording, the file is refused.
+///
+/// For every kind of time column, when `start_time` is set and the first
+/// time is not 0, a leading row at time 0 with stage 0 (unknown) is added.
 pub fn read_staging<P: AsRef<Path>>(
     path: P,
     opts: &StagingOpts,
@@ -290,7 +321,7 @@ pub fn read_staging<P: AsRef<Path>>(
     // staging files in Windows-1252 / Latin-1 (degree signs, em-dashes in
     // the metadata header), which `read_to_string` rejects. The actual data
     // rows are pure ASCII (Wake/N1/N2/...), so a lossy decode produces
-    // correct results — invalid bytes become U+FFFD and only show up in
+    // correct results. Invalid bytes become U+FFFD and only show up in
     // the metadata header that we skip anyway.
     let raw = std::fs::read(path.as_ref()).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -358,11 +389,12 @@ pub fn read_staging<P: AsRef<Path>>(
         let all_int = vals.iter().all(|v| v.fract() == 0.0);
         let sorted = vals.windows(2).all(|w| w[0] <= w[1]);
         if all_int && sorted && vals.len() >= 2 {
-            // Median of diff == 1?
+            // Consecutive epoch numbers step by 1. Test the median step (the
+            // upper middle value for an even count) rather than every step.
             let mut diffs: Vec<f64> = vals.windows(2).map(|w| w[1] - w[0]).collect();
             diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let med = diffs[diffs.len() / 2];
-            if (med - 1.0).abs() < f64::EPSILON {
+            let median_step = diffs[diffs.len() / 2];
+            if (median_step - 1.0).abs() < f64::EPSILON {
                 if opts.epoch_dur <= 0.0 {
                     return Err(StagingError::Format("epoch_dur must be > 0".into()));
                 }
@@ -374,7 +406,7 @@ pub fn read_staging<P: AsRef<Path>>(
             times_all = vals;
         }
     } else {
-        // Case 3: time strings.
+        // Case (c), clock-time strings.
         let mut secs: Vec<f64> = Vec::with_capacity(time_strs.len());
         for (i, s) in time_strs.iter().enumerate() {
             match parse_time_of_day(s) {
@@ -396,24 +428,24 @@ pub fn read_staging<P: AsRef<Path>>(
             }
         }
         // Midnight wrap.
-        let mut day_off = 0.0;
-        let mut out = Vec::with_capacity(secs.len());
-        let mut prev = None::<f64>;
-        for v in secs.iter() {
-            if let Some(p) = prev {
-                if *v < p {
-                    day_off += 86400.0;
+        let mut day_offset = 0.0;
+        let mut unwrapped = Vec::with_capacity(secs.len());
+        let mut last_clock = None::<f64>;
+        for clock in secs.iter() {
+            if let Some(last) = last_clock {
+                if *clock < last {
+                    day_offset += SECONDS_PER_DAY;
                 }
             }
-            out.push(*v + day_off);
-            prev = Some(*v);
+            unwrapped.push(*clock + day_offset);
+            last_clock = Some(*clock);
         }
 
         // start_offset: times_seconds(1) - seconds(timeofday(datetime(start_time)))
         let start_offset = match &opts.start_time {
-            Some(st) => {
-                let st_sec = parse_time_of_day(st).ok_or_else(|| {
-                    // `st` is the EDF's recording_starttime field. EDF spec
+            Some(start_text) => {
+                let start_seconds = parse_time_of_day(start_text).ok_or_else(|| {
+                    // `start_text` is the EDF's recording_starttime field. EDF spec
                     // is "hh.mm.ss"; common in-the-wild deviations are
                     // "HH:MM:SS", AM/PM suffixes, and partial fills with
                     // NULL padding ("22:07:2\0") from non-compliant writers.
@@ -421,7 +453,7 @@ pub fn read_staging<P: AsRef<Path>>(
                         "EDF recording_starttime is malformed ({:?}); expected hh.mm.ss or HH:MM:SS. \
                          If the EDF was de-identified or written by a non-spec writer, this field \
                          may have been corrupted",
-                        st
+                        start_text
                     ))
                 })?;
                 // Next-day rule. Clock times carry no date, so a first
@@ -430,14 +462,14 @@ pub fn read_staging<P: AsRef<Path>>(
                 // falling on the next day: the whole staging time vector
                 // moves forward by 24 h. The row-to-row wrap above cannot
                 // see this crossing because it happens before row 1.
-                let first_row_is_before_start = out[0] < st_sec;
+                let first_row_is_before_start = unwrapped[0] < start_seconds;
                 if first_row_is_before_start {
-                    for v in out.iter_mut() {
-                        *v += 86400.0;
+                    for v in unwrapped.iter_mut() {
+                        *v += SECONDS_PER_DAY;
                     }
                 }
-                let off = out[0] - st_sec;
-                if off < 0.0 {
+                let first_row_offset = unwrapped[0] - start_seconds;
+                if first_row_offset < 0.0 {
                     return Err(StagingError::Format(
                         "start_time is later than first time point".into(),
                     ));
@@ -449,28 +481,28 @@ pub fn read_staging<P: AsRef<Path>>(
                 // recording length is known, that reading is refused.
                 if first_row_is_before_start {
                     if let Some(duration) = opts.recording_duration {
-                        if off >= duration {
+                        if first_row_offset >= duration {
                             return Err(StagingError::Format(format!(
                                 "the first staging time is earlier than the recording start time. \
                                  Read as the next day it would fall {:.2} h after the start, past \
                                  the end of the {:.2} h recording. Staging cannot begin before the \
                                  recording does: check the staging time column and the EDF start time",
-                                off / 3600.0,
+                                first_row_offset / 3600.0,
                                 duration / 3600.0
                             )));
                         }
                     }
                 }
-                off
+                first_row_offset
             }
             None => 0.0,
         };
 
-        let t0 = out[0];
-        times_all = out.iter().map(|v| v - t0 + start_offset).collect();
+        let t0 = unwrapped[0];
+        times_all = unwrapped.iter().map(|v| v - t0 + start_offset).collect();
     }
 
-    // Stage codes; drop unmatched rows (MATLAB does `~unmatched_idx`).
+    // Stage codes. Drop unmatched rows (MATLAB does `~unmatched_idx`).
     let stage_map = build_stage_map(&opts.stage_vals);
     let mut times: Vec<f64> = Vec::new();
     let mut vals: Vec<f64> = Vec::new();
@@ -619,7 +651,7 @@ mod tests {
             None,
         )
         .expect("no recording length, no refusal");
-        let next_day_offset = 86400.0 - 4.0 * 60.0;
+        let next_day_offset = super::SECONDS_PER_DAY - 4.0 * 60.0;
         assert!(staging.times.contains(&next_day_offset), "times: {:?}", staging.times);
     }
 

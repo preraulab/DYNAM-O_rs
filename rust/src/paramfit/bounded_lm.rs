@@ -1,25 +1,27 @@
 //! Bound-constrained trust-region-reflective (Coleman–Li) solver.
 //!
 //! Direct port of scipy's `scipy/optimize/_lsq/trf.py` and the bits of
-//! `common.py` it depends on (`exact` tr_solver branch only — small dense
-//! problems, n_params ≤ ~30 in this codebase). Same algorithm and equation
-//! references as MATLAB's `lsqcurvefit` default (Coleman & Li 1994/1996,
-//! "An interior trust region approach for nonlinear minimization subject
-//! to bounds"; Branch, Coleman, Li 1999 STIR paper).
+//! `common.py` it depends on. Only the `exact` tr_solver branch is ported,
+//! which suits small dense problems (n_params ≤ ~30 in this codebase). Same
+//! algorithm and equation references as MATLAB's `lsqcurvefit` default:
+//! Coleman & Li 1994/1996, "An interior trust region approach for nonlinear
+//! minimization subject to bounds", and the Branch, Coleman, Li 1999 STIR
+//! paper.
 //!
-//! Replaces an earlier unit-cube reparameterization, which produced visibly
-//! different iterates from MATLAB when the optimum touched a facet. The
-//! reparam version is preserved in git history.
+//! Model kernels (`rot_gauss.rs`, `vm_gauss.rs`) plug in through the
+//! [`ResidualsAndJacobian`] trait and call [`run_bounded_lm`].
 //!
-//! The trait surface (`ResidualsAndJacobian`, `run_bounded_lm`) is
-//! unchanged so `rot_gauss.rs` / `vm_gauss.rs` need no edits.
-//!
-//! Operates on Jacobians shape `(n_residuals, n_params)` in row-major
-//! (residual index = row), matching scipy.
+//! Jacobians have shape `(n_residuals, n_params)`: one row per residual and
+//! one column per parameter, matching scipy. nalgebra stores them
+//! column-major.
 
 use nalgebra::{DMatrix, DVector};
 use std::cell::Cell;
 
+// Per-thread profiling accumulators, printed when DYNAMO_PARAMFIT_PROFILE is
+// set. T_* are total seconds per phase (Jacobian, residuals, J^T J,
+// eigendecomposition, trust-region subproblem, step selection). N_* are call
+// counts (N_OUT counts outer iterations).
 thread_local! {
     static T_JAC: Cell<f64> = const { Cell::new(0.0) };
     static T_RES: Cell<f64> = const { Cell::new(0.0) };
@@ -32,22 +34,35 @@ thread_local! {
     static N_OUT: Cell<u32> = const { Cell::new(0) };
 }
 
-pub fn perf_dump() -> String {
-    fn one(t: &'static std::thread::LocalKey<Cell<f64>>, n: &'static std::thread::LocalKey<Cell<u32>>, label: &str) -> String {
-        let tv = t.with(|c| c.get());
-        let nv = n.with(|c| c.get());
-        format!("  {:<12} {:>3}x  total={:.3}s  per={:.3}ms\n", label, nv, tv, if nv > 0 { tv * 1000.0 / nv as f64 } else { 0.0 })
+/// One report line: call count, total seconds, and mean milliseconds per call.
+fn format_timer_line(
+    total_seconds: &'static std::thread::LocalKey<Cell<f64>>,
+    call_count: &'static std::thread::LocalKey<Cell<u32>>,
+    label: &str,
+) -> String {
+    let seconds = total_seconds.with(|c| c.get());
+    let calls = call_count.with(|c| c.get());
+    let mut ms_per_call = 0.0;
+    if calls > 0 {
+        ms_per_call = seconds * 1000.0 / calls as f64;
     }
+    format!("  {:<12} {:>3}x  total={:.3}s  per={:.3}ms\n", label, calls, seconds, ms_per_call)
+}
+
+/// Format the profiling accumulators of the current thread as a multi-line
+/// report.
+pub fn perf_dump() -> String {
     let mut s = String::new();
-    s.push_str(&one(&T_JAC, &N_JAC, "jac"));
-    s.push_str(&one(&T_RES, &N_RES, "residuals"));
-    s.push_str(&one(&T_JTJ, &N_OUT, "J^T J"));
-    s.push_str(&one(&T_EIG, &N_OUT, "eigendecomp"));
-    s.push_str(&one(&T_SLV, &N_OUT, "subprob"));
-    s.push_str(&one(&T_SEL, &N_OUT, "select_step"));
+    s.push_str(&format_timer_line(&T_JAC, &N_JAC, "jac"));
+    s.push_str(&format_timer_line(&T_RES, &N_RES, "residuals"));
+    s.push_str(&format_timer_line(&T_JTJ, &N_OUT, "J^T J"));
+    s.push_str(&format_timer_line(&T_EIG, &N_OUT, "eigendecomp"));
+    s.push_str(&format_timer_line(&T_SLV, &N_OUT, "subprob"));
+    s.push_str(&format_timer_line(&T_SEL, &N_OUT, "select_step"));
     s
 }
 
+/// Zero the profiling accumulators of the current thread.
 pub fn perf_reset() {
     T_JAC.with(|t| t.set(0.0));
     T_RES.with(|t| t.set(0.0));
@@ -60,13 +75,21 @@ pub fn perf_reset() {
     N_OUT.with(|n| n.set(0));
 }
 
+/// A least-squares problem: residuals r(params) and their Jacobian
+/// dr/dparams.
 pub trait ResidualsAndJacobian {
+    /// Write the residual vector (length `n_residuals`) into `out`.
     fn residuals(&self, params: &[f64], out: &mut [f64]);
+    /// Write the Jacobian, shape `(n_residuals, n_params)`, into `out`.
     fn jacobian(&self, params: &[f64], out: &mut DMatrix<f64>);
+    /// Number of fitted parameters.
     fn n_params(&self) -> usize;
+    /// Number of residuals.
     fn n_residuals(&self) -> usize;
 }
 
+/// Result of [`run_bounded_lm`]: fitted parameters, residuals at the
+/// solution, the iteration count, and the full solver report.
 pub struct BoundedLmReport {
     pub params: Vec<f64>,
     pub residuals: Vec<f64>,
@@ -74,6 +97,9 @@ pub struct BoundedLmReport {
     pub solver_report: TrfReport,
 }
 
+/// Solver diagnostics, named after scipy's `OptimizeResult` fields: `nfev`
+/// and `njev` are residual and Jacobian evaluation counts, `cost` is
+/// 0.5 * sum(r^2), `g_norm` is the infinity norm of the scaled gradient.
 #[derive(Clone, Debug)]
 pub struct TrfReport {
     pub status: TrfStatus,
@@ -84,15 +110,28 @@ pub struct TrfReport {
     pub g_norm: f64,
 }
 
+/// Why the solver stopped.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TrfStatus {
-    GtolSatisfied,    // 1
-    FtolSatisfied,    // 2
-    XtolSatisfied,    // 3
-    BothFtolXtol,     // 4
-    MaxNfevReached,   // 0
+    /// Scaled gradient norm below gtol (scipy status 1).
+    GtolSatisfied,
+    /// Relative cost reduction below ftol (scipy status 2).
+    FtolSatisfied,
+    /// Relative step size below xtol (scipy status 3).
+    XtolSatisfied,
+    /// Both ftol and xtol satisfied (scipy status 4).
+    BothFtolXtol,
+    /// Residual-evaluation cap reached (scipy status 0).
+    MaxNfevReached,
 }
 
+/// scipy's default relative step for moving the starting point off a bound.
+const INITIAL_FEASIBILITY_RSTEP: f64 = 1e-10;
+
+/// Minimize 0.5 * sum(residuals^2) subject to `lower <= params <= upper` with
+/// the trust-region-reflective method. `max_iters` caps the number of
+/// residual evaluations (0 means 100 * n_params). Returns an error string on
+/// a size mismatch or when a lower bound exceeds its upper bound.
 pub fn run_bounded_lm<R: ResidualsAndJacobian>(
     model: &R,
     initial: &[f64],
@@ -119,22 +158,22 @@ pub fn run_bounded_lm<R: ResidualsAndJacobian>(
     // comparable iter counts to MATLAB on these well-conditioned problems.
     let ftol = 1e-6_f64;
     let xtol = 1e-6_f64;
-    let gtol = 1e-8_f64;
+    let gtol = 1e-8_f64; // scipy default
     let max_nfev = if max_iters == 0 { (n_p as u32) * 100 } else { max_iters };
 
     let profile = std::env::var("DYNAMO_PARAMFIT_PROFILE").is_ok();
     if profile { perf_reset(); }
-    let _t_total = std::time::Instant::now();
+    let total_timer = std::time::Instant::now();
 
     // Make x0 strictly feasible (scipy expects x in interior).
     let mut x0 = initial.to_vec();
-    make_strictly_feasible_in_place(&mut x0, lower, upper, 1e-10);
+    make_strictly_feasible_in_place(&mut x0, lower, upper, INITIAL_FEASIBILITY_RSTEP);
 
     let (out_x, out_r, report) =
         trf_bounds(model, &x0, lower, upper, ftol, xtol, gtol, max_nfev, n_r, n_p)?;
 
     if profile {
-        let total = _t_total.elapsed().as_secs_f64();
+        let total = total_timer.elapsed().as_secs_f64();
         eprintln!("[paramfit perf] total={:.3}s  iters={} nfev={} njev={}", total, report.iterations, report.nfev, report.njev);
         eprint!("{}", perf_dump());
     }
@@ -162,23 +201,23 @@ fn trf_bounds<R: ResidualsAndJacobian>(
     // State.
     let mut x = x0.to_vec();
     let mut f = vec![0.0_f64; n_r];
-    let _t = std::time::Instant::now();
+    let timer = std::time::Instant::now();
     model.residuals(&x, &mut f);
-    T_RES.with(|t| t.set(t.get() + _t.elapsed().as_secs_f64()));
+    T_RES.with(|t| t.set(t.get() + timer.elapsed().as_secs_f64()));
     N_RES.with(|n| n.set(n.get() + 1));
     let mut nfev: u32 = 1;
     let mut njev: u32 = 1;
 
     let mut j_buf = DMatrix::<f64>::zeros(n_r, n_p);
-    let _t = std::time::Instant::now();
+    let timer = std::time::Instant::now();
     model.jacobian(&x, &mut j_buf);
-    T_JAC.with(|t| t.set(t.get() + _t.elapsed().as_secs_f64()));
+    T_JAC.with(|t| t.set(t.get() + timer.elapsed().as_secs_f64()));
     N_JAC.with(|n| n.set(n.get() + 1));
 
     let mut cost = 0.5 * dot(&f, &f);
     let mut g = jt_dot_f(&j_buf, &f);
 
-    // x_scale = 1.0 (vector of 1s) — no Jacobian scaling.
+    // x_scale = 1.0 (vector of 1s), so there is no Jacobian scaling.
     let scale = vec![1.0_f64; n_p];
     let scale_inv = vec![1.0_f64; n_p];
 
@@ -196,18 +235,18 @@ fn trf_bounds<R: ResidualsAndJacobian>(
         delta = 1.0;
     }
 
+    // Levenberg-Marquardt damping parameter, carried between trust-region
+    // solves as the next initial guess.
     let mut alpha = 0.0_f64;
     let mut status: Option<TrfStatus> = None;
     let mut iteration: u32 = 0;
-    let mut step_norm: f64 = 0.0;
 
     loop {
         // Recompute scaling vector each iter.
         let (v_new, dv) = cl_scaling_vector(&x, &g, lb, ub);
         v = v_new;
 
-        // ||g * v||_inf
-        let g_norm_inf = g.iter().zip(v.iter()).map(|(gi, vi)| (gi * vi).abs()).fold(0.0_f64, f64::max);
+        let g_norm_inf = scaled_gradient_inf_norm(&g, &v);
         if g_norm_inf < gtol {
             status = Some(TrfStatus::GtolSatisfied);
         }
@@ -245,31 +284,30 @@ fn trf_bounds<R: ResidualsAndJacobian>(
         // taking its symmetric eigendecomp is much faster than the full SVD.
         // We also need uf_eff = V^T (J_h^T f) for the Moré-Hebden phi.
         // Identity: U^T f_aug = (S^{-1} V^T) * J_aug^T f_aug = (S^{-1} V^T) * J_h^T f,
-        // so suf := s * uf = V^T (J_h^T f) — and the SVD-based formulas in
-        // solve_lsq_trust_region work directly on suf without needing uf itself.
-        // We pass `suf` in the `uf` slot and `s` as the eigvec sqrt(λ).
+        // so suf := s * uf = V^T (J_h^T f). We divide by s to recover uf (zero
+        // where s == 0) and pass `uf` and `s = sqrt(max(λ, 0))` to
+        // solve_lsq_trust_region, which keeps scipy's (uf, s, V) interface.
 
         // B = J_h^T J_h + diag(diag_h). Use nalgebra's optimized matmul
-        // (BLAS-3, SIMD via matrixmultiply) instead of a manual triple loop —
-        // dominant cost is forming J^T J (m*n²), so the constant matters.
-        let _t = std::time::Instant::now();
+        // (BLAS-3, SIMD via matrixmultiply) instead of a manual triple loop.
+        // The dominant cost is forming J^T J (m*n²), so the constant matters.
+        let timer = std::time::Instant::now();
         let mut b = j_h.tr_mul(&j_h);
         for i in 0..n_p { b[(i, i)] += diag_h[i]; }
-        T_JTJ.with(|t| t.set(t.get() + _t.elapsed().as_secs_f64()));
+        T_JTJ.with(|t| t.set(t.get() + timer.elapsed().as_secs_f64()));
         N_OUT.with(|n| n.set(n.get() + 1));
 
         // Symmetric eigendecomp B = Q diag(λ) Q^T.
-        let _t = std::time::Instant::now();
+        let timer = std::time::Instant::now();
         let sym = nalgebra::SymmetricEigen::new(b);
-        T_EIG.with(|t| t.set(t.get() + _t.elapsed().as_secs_f64()));
+        T_EIG.with(|t| t.set(t.get() + timer.elapsed().as_secs_f64()));
         let eigvals = sym.eigenvalues;   // unordered
         let q_mat = sym.eigenvectors;    // columns are eigenvectors
 
         // singular_values of J_aug = sqrt(max(λ, 0))
-        let mut s_vec: Vec<f64> = eigvals.iter().map(|l| if *l > 0.0 { l.sqrt() } else { 0.0 }).collect();
+        let s_vec: Vec<f64> = eigvals.iter().map(|l| if *l > 0.0 { l.sqrt() } else { 0.0 }).collect();
 
-        // suf = sign-aware (V^T J_h^T f) so s * uf gives the same expression
-        // as scipy's `s * uf`. In SVD form, s*uf = V^T J_h^T f exactly.
+        // suf = V^T (J_h^T f), which equals scipy's `s * uf`.
         let jt_f = jt_dot_f(&j_h, &f);
         let jt_f_d = DVector::from_vec(jt_f.clone());
         let v_t_jtf = q_mat.transpose() * &jt_f_d;  // V^T (J_h^T f)
@@ -279,8 +317,7 @@ fn trf_bounds<R: ResidualsAndJacobian>(
             if s_vec[i] > 0.0 { suf_vec[i] / s_vec[i] } else { 0.0 }
         }).collect();
 
-        // Right singular vectors = eigenvectors of B (columns of Q).
-        let v_mat = q_mat;
+        // Right singular vectors are the eigenvectors of B (columns of q_mat).
 
         // Sort by descending singular value to match scipy's SVD output (so
         // the full_rank / threshold logic in solve_lsq_trust_region behaves
@@ -291,46 +328,44 @@ fn trf_bounds<R: ResidualsAndJacobian>(
         let uf_sorted: Vec<f64> = order.iter().map(|&i| uf_vec[i]).collect();
         let mut v_sorted = DMatrix::<f64>::zeros(n_p, n_p);
         for (new_col, &old_col) in order.iter().enumerate() {
-            for r in 0..n_p { v_sorted[(r, new_col)] = v_mat[(r, old_col)]; }
+            for r in 0..n_p {
+                v_sorted[(r, new_col)] = q_mat[(r, old_col)];
+            }
         }
-        s_vec = s_sorted;
-        let uf_vec = uf_sorted;
-        let v_mat = v_sorted;
 
-        // theta controls step-back from boundary
+        // theta in [0.995, 1) is the fraction of the distance to a bound that
+        // a step may use (scipy).
         let theta = 0.995_f64.max(1.0 - g_norm_inf);
 
         let mut actual_reduction = -1.0;
-        let mut delta_new;
-        let mut ratio;
         let mut x_new = x.clone();
         let mut f_new = f.clone();
         let mut cost_new = cost;
 
         while actual_reduction <= 0.0 && nfev < max_nfev {
             // Solve TR subproblem in hat space → p_h
-            let _t = std::time::Instant::now();
+            let timer = std::time::Instant::now();
             let (p_h_v, alpha_new, _n_iter) = solve_lsq_trust_region(
-                n_p, n_r + n_p, &uf_vec, &s_vec, &v_mat, delta, Some(alpha))?;
-            T_SLV.with(|t| t.set(t.get() + _t.elapsed().as_secs_f64()));
+                n_p, &uf_sorted, &s_sorted, &v_sorted, delta, Some(alpha))?;
+            T_SLV.with(|t| t.set(t.get() + timer.elapsed().as_secs_f64()));
             alpha = alpha_new;
 
             // Map to original space: p = d * p_h
             let p: Vec<f64> = (0..n_p).map(|i| d[i] * p_h_v[i]).collect();
 
             // Select step among constrained TR step, reflected, and Cauchy
-            let _t = std::time::Instant::now();
+            let timer = std::time::Instant::now();
             let (step, step_h, predicted_reduction) =
                 select_step(&x, &j_h, &diag_h, &g_h, p, p_h_v, &d, delta, lb, ub, theta);
-            T_SEL.with(|t| t.set(t.get() + _t.elapsed().as_secs_f64()));
+            T_SEL.with(|t| t.set(t.get() + timer.elapsed().as_secs_f64()));
 
             // x + step → strictly feasible
             let mut x_try = (0..n_p).map(|i| x[i] + step[i]).collect::<Vec<_>>();
             make_strictly_feasible_in_place(&mut x_try, lb, ub, 0.0);
 
-            let _t = std::time::Instant::now();
+            let timer = std::time::Instant::now();
             model.residuals(&x_try, &mut f_new);
-            T_RES.with(|t| t.set(t.get() + _t.elapsed().as_secs_f64()));
+            T_RES.with(|t| t.set(t.get() + timer.elapsed().as_secs_f64()));
             N_RES.with(|n| n.set(n.get() + 1));
             nfev += 1;
 
@@ -344,28 +379,29 @@ fn trf_bounds<R: ResidualsAndJacobian>(
             cost_new = 0.5 * dot(&f_new, &f_new);
             actual_reduction = cost - cost_new;
 
+            // scipy: the step counts as hitting the trust-region boundary
+            // above 95% of the radius.
             let bound_hit = step_h_norm > 0.95 * delta;
-            let (dn, r) = update_tr_radius(delta, actual_reduction, predicted_reduction, step_h_norm, bound_hit);
-            delta_new = dn;
-            ratio = r;
+            let (delta_new, ratio) =
+                update_tr_radius(delta, actual_reduction, predicted_reduction, step_h_norm, bound_hit);
 
-            step_norm = norm(&step);
+            let step_norm = norm(&step);
             let x_norm = norm(&x);
             let termination = check_termination(actual_reduction, cost, step_norm, x_norm, ratio, ftol, xtol);
-            if let Some(t) = termination {
+            if let Some(termination_status) = termination {
                 // Apply the accepted step before finalizing the termination report.
                 x = x_try.clone();
                 f.copy_from_slice(&f_new);
                 cost = cost_new;
                 // Refresh Jacobian/gradient before exit-finalize
-                let _t = std::time::Instant::now();
+                let timer = std::time::Instant::now();
                 model.jacobian(&x, &mut j_buf);
-                T_JAC.with(|t| t.set(t.get() + _t.elapsed().as_secs_f64()));
+                T_JAC.with(|t| t.set(t.get() + timer.elapsed().as_secs_f64()));
                 N_JAC.with(|n| n.set(n.get() + 1));
                 njev += 1;
                 g = jt_dot_f(&j_buf, &f);
-                let g_norm_inf2 = g.iter().zip(v.iter()).map(|(gi, vi)| (gi * vi).abs()).fold(0.0, f64::max);
-                return Ok(finalize(x, f.clone(), iteration + 1, nfev, njev, cost, g_norm_inf2, t));
+                let g_norm_inf2 = scaled_gradient_inf_norm(&g, &v);
+                return Ok(finalize(x, f.clone(), iteration + 1, nfev, njev, cost, g_norm_inf2, termination_status));
             }
 
             alpha *= delta / delta_new;
@@ -374,30 +410,28 @@ fn trf_bounds<R: ResidualsAndJacobian>(
             if actual_reduction > 0.0 {
                 x_new = x_try;
             }
-            // Otherwise keep looping; delta has shrunk via update_tr_radius.
+            // Otherwise keep looping. delta has shrunk via update_tr_radius.
         }
 
         if actual_reduction > 0.0 {
             x = x_new.clone();
             f.copy_from_slice(&f_new);
             cost = cost_new;
-            let _t = std::time::Instant::now();
+            let timer = std::time::Instant::now();
             model.jacobian(&x, &mut j_buf);
-            T_JAC.with(|t| t.set(t.get() + _t.elapsed().as_secs_f64()));
+            T_JAC.with(|t| t.set(t.get() + timer.elapsed().as_secs_f64()));
             N_JAC.with(|n| n.set(n.get() + 1));
             njev += 1;
             g = jt_dot_f(&j_buf, &f);
-        } else {
-            // No reduction at all this iter — accept zero step, loop will recheck gtol or max_nfev.
-            step_norm = 0.0;
         }
+        // With no reduction this iteration x is kept. The next pass rechecks
+        // gtol and max_nfev.
 
         iteration += 1;
         if nfev >= max_nfev {
-            let g_norm_inf2 = g.iter().zip(v.iter()).map(|(gi, vi)| (gi * vi).abs()).fold(0.0, f64::max);
+            let g_norm_inf2 = scaled_gradient_inf_norm(&g, &v);
             return Ok(finalize(x, f.clone(), iteration, nfev, njev, cost, g_norm_inf2, TrfStatus::MaxNfevReached));
         }
-        let _ = step_norm;
     }
 }
 
@@ -427,6 +461,15 @@ fn norm(a: &[f64]) -> f64 {
     dot(a, a).sqrt()
 }
 
+/// Infinity norm of the Coleman-Li scaled gradient, max_i |g[i] * v[i]|.
+fn scaled_gradient_inf_norm(g: &[f64], v: &[f64]) -> f64 {
+    let mut largest = 0.0_f64;
+    for (g_i, v_i) in g.iter().zip(v.iter()) {
+        largest = f64::max(largest, (g_i * v_i).abs());
+    }
+    largest
+}
+
 fn jt_dot_f(j: &DMatrix<f64>, f: &[f64]) -> Vec<f64> {
     let (m, n) = j.shape();
     debug_assert_eq!(f.len(), m);
@@ -439,7 +482,10 @@ fn jt_dot_f(j: &DMatrix<f64>, f: &[f64]) -> Vec<f64> {
     g
 }
 
-/// Coleman-Li scaling vector.
+/// Coleman-Li scaling vector. Returns `(v, dv)`: `v[i]` is the distance from
+/// `x[i]` to the bound the negative gradient points at (1 if that bound is
+/// infinite or the gradient is zero), and `dv[i]` is its derivative with
+/// respect to `x[i]` (-1, +1, or 0).
 fn cl_scaling_vector(x: &[f64], g: &[f64], lb: &[f64], ub: &[f64]) -> (Vec<f64>, Vec<f64>) {
     let n = x.len();
     let mut v = vec![1.0_f64; n];
@@ -466,7 +512,7 @@ fn in_bounds(x: &[f64], lb: &[f64], ub: &[f64]) -> bool {
     true
 }
 
-/// Step size to first bound; returns (step, hits) where hits[i] is -1/0/+1.
+/// Step size to first bound. Returns (step, hits) where hits[i] is -1/0/+1.
 fn step_size_to_bound(x: &[f64], s: &[f64], lb: &[f64], ub: &[f64]) -> (f64, Vec<i32>) {
     let n = x.len();
     let mut steps = vec![f64::INFINITY; n];
@@ -481,19 +527,28 @@ fn step_size_to_bound(x: &[f64], s: &[f64], lb: &[f64], ub: &[f64]) -> (f64, Vec
     let mut hits = vec![0_i32; n];
     for i in 0..n {
         if steps[i] == min_step {
-            hits[i] = if s[i] > 0.0 { 1 } else if s[i] < 0.0 { -1 } else { 0 };
+            if s[i] > 0.0 {
+                hits[i] = 1;
+            } else if s[i] < 0.0 {
+                hits[i] = -1;
+            }
         }
     }
     (min_step, hits)
 }
 
+/// Move any coordinate that sits on (or within `rstep` relative distance of)
+/// a bound to just inside it. With `rstep == 0` the shift is one relative
+/// machine epsilon, which stands in for scipy's `nextafter`. A coordinate
+/// still outside its bounds afterwards is set to the midpoint.
 fn make_strictly_feasible_in_place(x: &mut [f64], lb: &[f64], ub: &[f64], rstep: f64) {
     let n = x.len();
     for i in 0..n {
         let lo = lb[i];
         let hi = ub[i];
         if rstep == 0.0 {
-            // nextafter analog
+            // Stand-in for numpy.nextafter: step one relative epsilon into
+            // the interior.
             if lo.is_finite() && x[i] <= lo { x[i] = lo + lo.abs().max(1.0) * f64::EPSILON; }
             if hi.is_finite() && x[i] >= hi { x[i] = hi - hi.abs().max(1.0) * f64::EPSILON; }
         } else {
@@ -518,7 +573,7 @@ fn make_strictly_feasible_in_place(x: &mut [f64], lb: &[f64], ub: &[f64], rstep:
     }
 }
 
-/// intersect_trust_region: solve ||x + s*t||^2 = Delta^2; returns (t_neg, t_pos).
+/// intersect_trust_region: solve ||x + s*t||^2 = Delta^2. Returns (t_neg, t_pos).
 fn intersect_trust_region(x: &[f64], s: &[f64], delta: f64) -> Result<(f64, f64), String> {
     let a = dot(s, s);
     if a == 0.0 { return Err("`s` is zero in intersect_trust_region".to_string()); }
@@ -584,7 +639,10 @@ fn minimize_quadratic_1d(a: f64, b: f64, lb: f64, ub: f64, c: f64) -> (f64, f64)
     let mut best_y = ts[0] * (a * ts[0] + b) + c;
     for &t in &ts[1..] {
         let y = t * (a * t + b) + c;
-        if y < best_y { best_y = y; best_t = t; }
+        if y < best_y {
+            best_y = y;
+            best_t = t;
+        }
     }
     (best_t, best_y)
 }
@@ -608,10 +666,9 @@ fn evaluate_quadratic(j: &DMatrix<f64>, g: &[f64], s: &[f64], diag: Option<&[f64
 /// as columns) and finds alpha such that ||p(alpha)|| = Delta where
 /// p(alpha) = -V * (s * uf / (s^2 + alpha)).
 fn solve_lsq_trust_region(
-    n: usize, m: usize, uf: &[f64], s: &[f64], v_mat: &DMatrix<f64>, delta: f64,
+    n: usize, uf: &[f64], s: &[f64], v_mat: &DMatrix<f64>, delta: f64,
     initial_alpha: Option<f64>,
 ) -> Result<(Vec<f64>, f64, u32), String> {
-    let _ = m;
     let eps_f = f64::EPSILON;
     let n_sv = s.len();
     let suf: Vec<f64> = (0..n_sv).map(|i| s[i] * uf[i]).collect();
@@ -644,11 +701,12 @@ fn solve_lsq_trust_region(
     if full_rank {
         let (phi0, phi0_prime) = phi_and_derivative(0.0, &suf, s, delta);
         alpha_lower = -phi0 / phi0_prime;
-        let _ = phi0;
     }
 
+    // Reuse the previous damping value when it is positive. Otherwise start
+    // from scipy's default guess.
     let mut alpha = match initial_alpha {
-        Some(a) if a > 0.0 && !(full_rank && a == 0.0) => a,
+        Some(a) if a > 0.0 => a,
         _ => (0.001 * alpha_upper).max((alpha_lower * alpha_upper).sqrt()),
     };
 
@@ -661,19 +719,14 @@ fn solve_lsq_trust_region(
             alpha = (0.001 * alpha_upper).max((alpha_lower * alpha_upper).sqrt());
         }
         let (phi, phi_prime) = phi_and_derivative(alpha, &suf, s, delta);
-        if phi < 0.0 { /* alpha_upper update */
-            // alpha_upper = alpha (scipy)
-        }
-        let mut au = alpha_upper;
-        if phi < 0.0 { au = alpha; }
+        // scipy tightens alpha_upper to alpha here when phi < 0. This port
+        // keeps alpha_upper fixed at its initial value norm(suf) / delta.
         let ratio = phi / phi_prime;
         alpha_lower = alpha_lower.max(alpha - ratio);
         alpha -= (phi + delta) * ratio / delta;
         if phi.abs() < rtol * delta {
-            let _ = au;
             break;
         }
-        let _ = au;
     }
 
     // p = -V * (suf / (s^2 + alpha))
@@ -694,6 +747,8 @@ fn solve_lsq_trust_region(
     Ok((p, alpha, it + 1))
 }
 
+/// phi(alpha) = ||p(alpha)|| - delta and its derivative, where
+/// p(alpha) = -V * (suf / (s^2 + alpha)).
 fn phi_and_derivative(alpha: f64, suf: &[f64], s: &[f64], delta: f64) -> (f64, f64) {
     let n = s.len();
     let mut p_sq = 0.0_f64;
@@ -713,6 +768,9 @@ fn phi_and_derivative(alpha: f64, suf: &[f64], s: &[f64], delta: f64) -> (f64, f
     (phi, phi_prime)
 }
 
+/// Choose among the trust-region step, its reflection off the first bound
+/// hit, and the Cauchy step, whichever gives the lowest quadratic-model
+/// value. Returns `(step, step_in_scaled_space, predicted_reduction)`.
 #[allow(clippy::too_many_arguments)]
 fn select_step(
     x: &[f64], j_h: &DMatrix<f64>, diag_h: &[f64], g_h: &[f64],
@@ -735,18 +793,37 @@ fn select_step(
     let mut r: Vec<f64> = (0..n).map(|i| d[i] * r_h[i]).collect();
 
     // Restrict TR step to first bound hit.
-    for i in 0..n { p[i] *= p_stride; p_h[i] *= p_stride; }
+    for i in 0..n {
+        p[i] *= p_stride;
+        p_h[i] *= p_stride;
+    }
     let x_on_bound: Vec<f64> = (0..n).map(|i| x[i] + p[i]).collect();
 
-    let to_tr_intersect = intersect_trust_region(&p_h, &r_h, delta).map(|(_n, pos)| pos).unwrap_or(0.0);
+    // Positive root of the trust-region intersection. If it cannot be
+    // computed (zero direction, or p_h outside the region), use 0 so the
+    // reflected step is rejected below.
+    let to_tr_intersect = match intersect_trust_region(&p_h, &r_h, delta) {
+        Ok((_negative_root, positive_root)) => positive_root,
+        Err(_) => 0.0,
+    };
     let (to_bound, _) = step_size_to_bound(&x_on_bound, &r, lb, ub);
 
     let r_stride = to_bound.min(to_tr_intersect);
-    let (r_stride_l, r_stride_u) = if r_stride > 0.0 {
-        let l = (1.0 - theta) * p_stride / r_stride;
-        let u = if r_stride == to_bound { theta * to_bound } else { to_tr_intersect };
-        (l, u)
-    } else { (0.0_f64, -1.0_f64) };
+    // Allowed range [r_stride_l, r_stride_u] for the reflected step. An
+    // empty range (lower > upper) means the reflected step is not usable.
+    let r_stride_l: f64;
+    let r_stride_u: f64;
+    if r_stride > 0.0 {
+        r_stride_l = (1.0 - theta) * p_stride / r_stride;
+        if r_stride == to_bound {
+            r_stride_u = theta * to_bound;
+        } else {
+            r_stride_u = to_tr_intersect;
+        }
+    } else {
+        r_stride_l = 0.0;
+        r_stride_u = -1.0;
+    }
 
     let r_value;
     if r_stride_l <= r_stride_u {
@@ -760,15 +837,18 @@ fn select_step(
     }
 
     // Strictly-interior p
-    for i in 0..n { p[i] *= theta; p_h[i] *= theta; }
+    for i in 0..n {
+        p[i] *= theta;
+        p_h[i] *= theta;
+    }
     let p_value = evaluate_quadratic(j_h, g_h, &p_h, Some(diag_h));
 
-    // Cauchy step along -g_h
-    let neg_g_h: Vec<f64> = g_h.iter().map(|x| -x).collect();
-    let ag_h_dir = neg_g_h.clone();
+    // Cauchy step along the anti-gradient ("ag") direction -g_h.
+    let ag_h_dir: Vec<f64> = g_h.iter().map(|g_i| -g_i).collect();
     let ag_dir: Vec<f64> = (0..n).map(|i| d[i] * ag_h_dir[i]).collect();
 
-    let to_tr = if norm(&ag_h_dir) > 0.0 { delta / norm(&ag_h_dir) } else { 0.0 };
+    let ag_h_norm = norm(&ag_h_dir);
+    let to_tr = if ag_h_norm > 0.0 { delta / ag_h_norm } else { 0.0 };
     let (to_bound_ag, _) = step_size_to_bound(x, &ag_dir, lb, ub);
     let ag_stride_cap = if to_bound_ag < to_tr { theta * to_bound_ag } else { to_tr };
 
@@ -786,6 +866,7 @@ fn select_step(
     }
 }
 
+/// Returns `(new_radius, ratio)` where ratio = actual / predicted reduction.
 fn update_tr_radius(delta: f64, actual_reduction: f64, predicted_reduction: f64,
                     step_norm: f64, bound_hit: bool) -> (f64, f64) {
     let ratio = if predicted_reduction > 0.0 {
@@ -794,11 +875,18 @@ fn update_tr_radius(delta: f64, actual_reduction: f64, predicted_reduction: f64,
         1.0
     } else { 0.0 };
     let mut new_delta = delta;
-    if ratio < 0.25 { new_delta = 0.25 * step_norm; }
-    else if ratio > 0.75 && bound_hit { new_delta = delta * 2.0; }
+    // scipy's rule: shrink to a quarter of the step when the model predicted
+    // poorly, double when it predicted well and the step reached the boundary.
+    if ratio < 0.25 {
+        new_delta = 0.25 * step_norm;
+    } else if ratio > 0.75 && bound_hit {
+        new_delta = delta * 2.0;
+    }
     (new_delta, ratio)
 }
 
+/// scipy's ftol / xtol tests. `d_f` is the cost reduction, `f` the current
+/// cost.
 fn check_termination(d_f: f64, f: f64, dx_norm: f64, x_norm: f64, ratio: f64,
                      ftol: f64, xtol: f64) -> Option<TrfStatus> {
     let ftol_ok = d_f < ftol * f && ratio > 0.25;
@@ -814,11 +902,10 @@ fn check_termination(d_f: f64, f: f64, dx_norm: f64, x_norm: f64, ratio: f64,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array2;
 
-    /// Simple synthetic test: fit `y = a*exp(-b*x)` with a single peak.
-    /// Verifies the TRR solver lands on the optimum from a random start
-    /// inside loose bounds.
+    /// Synthetic problem: fit `y = a*exp(-b*x)` to noise-free data. Verifies
+    /// the TRF solver reaches the true parameters from a fixed start inside
+    /// loose bounds.
     struct Expo { x: Vec<f64>, y: Vec<f64> }
     impl ResidualsAndJacobian for Expo {
         fn n_params(&self) -> usize { 2 }
@@ -840,7 +927,8 @@ mod tests {
     #[test]
     fn fits_exponential() {
         let x: Vec<f64> = (0..50).map(|i| 0.1 * i as f64).collect();
-        let a_true = 3.0_f64; let b_true = 0.4_f64;
+        let a_true = 3.0_f64;
+        let b_true = 0.4_f64;
         let y: Vec<f64> = x.iter().map(|xi| a_true * (-b_true * xi).exp()).collect();
         let m = Expo { x, y };
         let r = run_bounded_lm(&m, &[1.0, 0.1], &[0.0, 0.0], &[10.0, 5.0], 200).unwrap();
@@ -860,11 +948,5 @@ mod tests {
         assert!((v[1] - 0.5).abs() < 1e-12);   // x - lb because g>0
         assert_eq!(dv[0], -1.0);
         assert_eq!(dv[1],  1.0);
-    }
-
-    /// Jacobian-induced row count sanity.
-    #[test]
-    fn jacobian_layout_compat() {
-        let _ = Array2::<f64>::zeros((10, 3));   // (n_r, n_p) row-major
     }
 }

@@ -1,15 +1,15 @@
 //! Parametric-basis fits for SOPH dimensionality reduction.
 //!
 //! Two kernels, mirroring `DYNAM-O/toolbox/SOPH_dim_reduction/parametric_basis/`:
-//! * [`rot_gauss`] — sum of N rotated 2-D Gaussians + linear background plane
+//! * [`rot_gauss`]: sum of N rotated 2-D Gaussians + linear background plane
 //!   (`xxx*x + yyy*y + zzz`). Used for SO-power histograms.
-//! * [`vm_gauss`] — sum of N von-Mises × Gaussian peaks + sinusoidal baseline
+//! * [`vm_gauss`]: sum of N von-Mises × Gaussian peaks + sinusoidal baseline
 //!   (`xxx*sin(x + yyy) + zzz`). Used for SO-phase histograms.
 //!
-//! Each kernel exposes a `fit_*` driver that runs a bound-constrained
-//! Levenberg–Marquardt solver (via the [`levenberg_marquardt`] crate) on a
-//! flat parameter vector laid out exactly as MATLAB's Curve-Fitting-Toolbox
-//! `fittype` orders its alphabetized coefficients:
+//! Each kernel exposes a `fit_*` driver that runs the bound-constrained
+//! trust-region-reflective solver in [`bounded_lm`] on a flat parameter
+//! vector laid out exactly as MATLAB's Curve-Fitting-Toolbox `fittype`
+//! orders its alphabetized coefficients:
 //!
 //!   `[amp_1..amp_N, fmean_1..fmean_N, fstd_1..fstd_N, ...,
 //!     theta_1..theta_N, xxx, yyy, zzz]`
@@ -17,11 +17,8 @@
 //! The MATLAB-side `fit_rotGauss.m` / `fit_vmGauss.m` `reshape(B0, 1, [])`
 //! flattening (column-major over an Nx6 matrix) produces this exact layout.
 //!
-//! The `levenberg-marquardt` crate implements the classical MINPACK-style
-//! unbounded Levenberg–Marquardt. MATLAB's `lsqcurvefit` defaults to a
-//! trust-region-reflective bounded solver. We get bounded behavior here
-//! by projecting parameters into the feasible box after each step
-//! (active-set / projected-gradient style — see `bounded_lm`).
+//! [`bounded_lm`] is a port of scipy's trust-region-reflective solver, the
+//! same algorithm MATLAB's `lsqcurvefit` uses by default.
 
 pub mod rot_gauss;
 pub mod vm_gauss;
@@ -33,12 +30,12 @@ use ndarray::Array2;
 /// `fit(...)` returns. All quantities computed on the residuals
 /// `r = z_data - z_model`:
 ///
-/// * `sse`        — `sum(r.^2)`
-/// * `dfe`        — `numel(z) - n_params`
-/// * `dfm`        — `n_params`  (for completeness; MATLAB reports `df`/`dfm`)
-/// * `rmse`       — `sqrt(sse / dfe)`
-/// * `rsquare`    — `1 - sse / sst`, `sst = sum((z - mean(z)).^2)`
-/// * `adjrsquare` — `1 - (sse / dfe) / (sst / (numel(z) - 1))`
+/// * `sse`: `sum(r.^2)`
+/// * `dfe`: `numel(z) - n_params`
+/// * `dfm`: `n_params` (for completeness, MATLAB reports `df`/`dfm`)
+/// * `rmse`: `sqrt(sse / dfe)`
+/// * `rsquare`: `1 - sse / sst`, `sst = sum((z - mean(z)).^2)`
+/// * `adjrsquare`: `1 - (sse / dfe) / (sst / (numel(z) - 1))`
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Gof {
     pub sse: f64,
@@ -66,7 +63,9 @@ impl Gof {
         let rsq = if sst > 0.0 { 1.0 - sse / sst } else { f64::NAN };
         let adj = if sst > 0.0 && dfe > 0.0 {
             1.0 - (sse / dfe) / (sst / (n - 1.0))
-        } else { f64::NAN };
+        } else {
+            f64::NAN
+        };
         let rmse = if dfe > 0.0 { (sse / dfe).sqrt() } else { f64::NAN };
         Gof { sse, rsquare: rsq, adjrsquare: adj, rmse, dfe, dfm: n_params as f64 }
     }
@@ -74,20 +73,26 @@ impl Gof {
 
 /// Final state of a parametric fit.
 pub struct ParamFitOut {
-    /// Per-mode parameters, shape `(N, 6)` row-major.
+    /// Per-mode parameters, shape `(N, 6)`: one row per mode, columns
+    /// `[amp, fmean, fstd, pmean, pstd, theta]`.
     pub params: Array2<f64>,
     /// `[xxx, yyy, zzz]` background-plane coefficients.
     pub background: [f64; 3],
-    /// Model reconstruction on the input grid, shape `(n_y, n_x)` —
-    /// matches the orientation of the input `SOPH` argument.
+    /// Model reconstruction on the input grid, shape `(n_y, n_x)`, the
+    /// same orientation as the input `SOPH` argument.
     pub model_soph: Array2<f64>,
+    /// Goodness of fit over the finite bins of the input.
     pub gof: Gof,
+    /// Outer iterations the solver ran.
     pub iters_used: u32,
 }
 
+/// Why a parametric fit could not be run or did not finish.
 #[derive(Debug)]
 pub enum ParamFitError {
+    /// Input shapes or bounds are inconsistent.
     InvalidArgument(String),
+    /// The solver returned an error.
     SolverFailed(String),
 }
 

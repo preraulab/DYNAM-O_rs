@@ -4,7 +4,7 @@
 //! `rayon::prelude::*` so call sites get true multi-threaded iterators.
 //! With `--no-default-features` (the WASM build mode, since WASM has no
 //! native threads) we provide sequential drop-in shims with the same
-//! method names — `into_par_iter`, `par_iter`, `map_init` — so the
+//! method names (`into_par_iter`, `par_iter`, `map_init`) so the
 //! consumer code in `extract_pipeline.rs`, `refine.rs`, `histogram.rs`
 //! and `baseline.rs` stays unchanged.
 
@@ -55,7 +55,7 @@ mod seq {
     }
 
     /// Adds `map_init` to any iterator. State is created once and
-    /// threaded through every call to `f` — semantically equivalent to
+    /// threaded through every call to `f`, semantically equivalent to
     /// rayon's `map_init` running on a single worker.
     pub trait ParallelIteratorShim: Iterator + Sized {
         fn map_init<S, INIT, F, R>(self, init: INIT, f: F) -> MapInit<Self, S, F>
@@ -72,6 +72,8 @@ mod seq {
     }
     impl<I: Iterator> ParallelIteratorShim for I {}
 
+    /// Iterator returned by [`ParallelIteratorShim::map_init`]. It applies
+    /// `f` to each item with one shared mutable state.
     pub struct MapInit<I, S, F> {
         iter: I,
         state: S,
@@ -84,7 +86,7 @@ mod seq {
     {
         type Item = R;
         fn next(&mut self) -> Option<R> {
-            self.iter.next().map(|x| (self.f)(&mut self.state, x))
+            self.iter.next().map(|item| (self.f)(&mut self.state, item))
         }
     }
 }

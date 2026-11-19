@@ -1,4 +1,4 @@
-//! Wilcoxon rank-sum (Mann–Whitney U) test — a faithful port of MATLAB's
+//! Wilcoxon rank-sum (Mann–Whitney U) test. A faithful port of MATLAB's
 //! `ranksum`, including its choice of the exact test for small samples.
 //!
 //! Port fidelity matters here because the desktop app and the MATLAB
@@ -8,10 +8,9 @@
 //!   * **Exact vs approximate.** MATLAB uses the exact permutation
 //!     distribution when `n1 + n2 < 20` and the tie-corrected normal
 //!     approximation otherwise. The two disagree by a few percent at small
-//!     n — e.g. 9 vs 5 gives exact 0.018981, approximate 0.023411 — which
-//!     straddles a q = 0.02 threshold. The TypeScript implementation this
-//!     replaces always approximated, so it silently diverged from MATLAB
-//!     on exactly the thinly-observed pixels at the edge of a SOPH.
+//!     n. For example 9 vs 5 gives exact 0.018981 and approximate 0.023411,
+//!     which straddles a q = 0.02 threshold. Small n is the situation of
+//!     the thinly-observed pixels at the edge of a SOPH.
 //!   * **Missing data** is dropped, never imputed. A SOPH pixel's NaN
 //!     means "under min_time_in_bin, rate undefined", which is a different
 //!     statement from an observed rate of 0.
@@ -24,31 +23,39 @@ use super::normal::two_sided_p;
 /// Sample-size total below which MATLAB `ranksum` uses the exact test.
 ///
 /// `ranksum.m` writes the rule as `(ns < 10) && ((nx + ny) < 20)` with
-/// `ns = min(nx, ny)`, but the first clause is implied by the second —
-/// `2·ns <= nx + ny < 20` forces `ns < 10` — so the total alone decides
+/// `ns = min(nx, ny)`, but the first clause is implied by the second
+/// (`2·ns <= nx + ny < 20` forces `ns < 10`), so the total alone decides
 /// it. Confirmed empirically against R2025a over a 30-case grid.
 const EXACT_MAX_TOTAL: usize = 20;
 
+/// How the p-value is computed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
+    /// Exact permutation distribution of the rank sum.
     Exact,
+    /// Tie-corrected normal approximation with continuity correction.
     Approximate,
 }
 
+/// Result of a rank-sum test.
 #[derive(Debug, Clone, Copy)]
 pub struct RankSum {
     /// Two-sided p-value. NaN when either sample is empty.
     pub p: f64,
     /// Mann–Whitney U (the smaller of U₁, U₂). NaN when undefined.
     pub u: f64,
-    /// z statistic; NaN under the exact method.
+    /// z statistic. NaN under the exact method.
     pub z: f64,
+    /// Finite observations in the first group.
     pub n1: usize,
+    /// Finite observations in the second group.
     pub n2: usize,
+    /// Method that produced `p`.
     pub method: Method,
 }
 
 impl RankSum {
+    /// Result for a test with an empty group: every statistic is NaN.
     fn empty(n1: usize, n2: usize) -> Self {
         Self { p: f64::NAN, u: f64::NAN, z: f64::NAN, n1, n2, method: Method::Exact }
     }
@@ -92,23 +99,24 @@ fn tiedrank(xs: &[f64]) -> (Vec<f64>, f64) {
 ///
 /// The subsets are drawn from the OBSERVED ranks, so ties are handled by
 /// permuting the tied (fractional) rank values rather than the integers
-/// 1..N — enumerating 1..N instead silently gives a different answer
+/// 1..N. Enumerating 1..N instead silently gives a different answer
 /// whenever two observations tie. Counting is done by dynamic programming
-/// rather than materialising C(N, ns) rows; ranks are half-integers, so
+/// rather than materializing C(N, ns) rows. Ranks are half-integers, so
 /// everything is doubled to stay in exact integer arithmetic.
 ///
 /// MATLAB switches to a network algorithm for 10 <= N < 20 purely for
-/// speed — it computes the same exact conditional distribution, and N is
-/// under 20 here, so the DP table is at most 20 × 381.
+/// speed. It computes the same exact conditional distribution. Under the
+/// default method rule N is under 20, so the DP table is at most 10 × 381
+/// (`ns <= 9` and the doubled rank sum is at most 380).
 fn exact_p(w: f64, ranks: &[f64], ns: usize) -> f64 {
-    // Ranks are integers or half-integers; ×2 makes them exact integers.
+    // Ranks are integers or half-integers, so ×2 makes them exact integers.
     let doubled: Vec<usize> = ranks.iter().map(|r| (r * 2.0).round() as usize).collect();
     let max_sum: usize = doubled.iter().sum();
     // counts[k][s] = number of size-k position subsets with doubled sum s.
     let mut counts = vec![vec![0.0f64; max_sum + 1]; ns + 1];
     counts[0][0] = 1.0;
     for (taken, &r) in doubled.iter().enumerate() {
-        // Descending k so each position is used at most once; k can't
+        // Descending k so each position is used at most once. k can't
         // exceed the number of positions seen so far.
         for k in (1..=ns.min(taken + 1)).rev() {
             for s in (r..=max_sum).rev() {
@@ -147,17 +155,29 @@ pub fn ranksum(g1: &[f64], g2: &[f64]) -> RankSum {
 pub fn ranksum_with(g1: &[f64], g2: &[f64], method: Option<Method>) -> RankSum {
     let x: Vec<f64> = g1.iter().copied().filter(|v| v.is_finite()).collect();
     let y: Vec<f64> = g2.iter().copied().filter(|v| v.is_finite()).collect();
-    let (n1, n2) = (x.len(), y.len());
+    let n1 = x.len();
+    let n2 = y.len();
     if n1 == 0 || n2 == 0 {
         return RankSum::empty(n1, n2);
     }
     let n = n1 + n2;
 
     // MATLAB ranks the pooled sample and sums the ranks of the SMALLER
-    // group; the p-value is symmetric either way, but following the same
+    // group. The p-value is symmetric either way, but following the same
     // convention keeps the intermediate statistics comparable when
     // debugging against MATLAB.
-    let (small, large, ns, nl) = if n1 <= n2 { (&x, &y, n1, n2) } else { (&y, &x, n2, n1) };
+    let small: &Vec<f64>;
+    let large: &Vec<f64>;
+    if n1 <= n2 {
+        small = &x;
+        large = &y;
+    } else {
+        small = &y;
+        large = &x;
+    }
+    // Sizes of the smaller and larger group.
+    let ns = small.len();
+    let nl = large.len();
     let mut pooled: Vec<f64> = Vec::with_capacity(n);
     pooled.extend_from_slice(small);
     pooled.extend_from_slice(large);
@@ -190,8 +210,8 @@ pub fn ranksum_with(g1: &[f64], g2: &[f64], method: Option<Method>) -> RankSum {
         };
     }
 
-    // Normal approximation, tie-corrected variance, continuity correction
-    // — MATLAB `ranksum.m`:
+    // Normal approximation, tie-corrected variance, continuity correction.
+    // MATLAB `ranksum.m`:
     //   wmean   = ns(ns + nl + 1)/2
     //   tiescor = 2·tieadj / (N(N − 1)),  tieadj = Σ(t³ − t)/2
     //   wvar    = ns·nl·((N + 1) − tiescor)/12
@@ -208,9 +228,8 @@ pub fn ranksum_with(g1: &[f64], g2: &[f64], method: Option<Method>) -> RankSum {
     }
     let wc = w - w_mean;
     // sign(0) == 0 in MATLAB, so a statistic exactly at the mean gets NO
-    // continuity correction. Writing this as an `if wc < 0 {+0.5} else
-    // {-0.5}` — as the TypeScript version did — nudges z off zero for a
-    // perfectly null pixel.
+    // continuity correction. A two-way `if wc < 0 {+0.5} else {-0.5}`
+    // would nudge z off zero for a perfectly null pixel.
     let corr = if wc > 0.0 {
         -0.5
     } else if wc < 0.0 {
@@ -273,8 +292,7 @@ mod tests {
         assert!(ranksum(&b, &a).p.is_nan());
     }
 
-    /// A two-sample test cannot depend on the order of its arguments —
-    /// this is the invariant the MATLAB zero-fill used to break.
+    /// A two-sample test cannot depend on the order of its arguments.
     #[test]
     fn p_is_symmetric_in_its_arguments() {
         let a = [4.0, 1.5, 9.2, 3.3, f64::NAN, 7.7, 2.0, 8.1, 5.5, 6.0, 1.1, 3.9];
@@ -293,7 +311,7 @@ mod tests {
         assert_eq!(ranksum(&a, &b).p, 1.0);
     }
 
-    /// n = 2 vs 2 bottoms out at 1/3 — the reason a thinly-observed pixel
+    /// n = 2 vs 2 bottoms out at 1/3, the reason a thinly-observed pixel
     /// can never be flagged, whatever the effect size.
     #[test]
     fn tiny_samples_cannot_reach_significance() {

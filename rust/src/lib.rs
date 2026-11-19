@@ -1,19 +1,16 @@
-//! dynamo_rs — Rust kernel for the DYNAM-O merge-loop hotspot.
+//! dynamo_rs: the Rust numerical kernel for DYNAM-O.
 //!
-//! Exposes `merge_segment(labels, data, merge_thresh, max_merges)` which
-//! takes a watershed-labeled 2D image and the spectrogram values, builds
-//! the region adjacency graph (region pixels + watershed-0-line borders +
-//! neighbors via 2-pixel dilation), then runs the iterative max-weight
-//! merge until no edge exceeds `merge_thresh`.
+//! The crate covers the whole per-recording computation: EDF and staging
+//! readers (`io`), artifact detection (`artifacts`), the multitaper
+//! spectrogram presets (`mts`), baseline (`baseline`), TF-peak extraction
+//! (`matlab_watershed`, `adjacency`, `merge`, `trim`, `extract_pipeline`),
+//! peak refinement (`refine`), SO-power and SO-phase (`so_power`,
+//! `so_phase`), per-peak assignment (`peak_assign`), histograms
+//! (`histogram`, `histpeaks`), the SOPH fits (`paramfit`, `spline_basis`),
+//! and group statistics (`stats`).
 //!
-//! Output: a (F, T) int32 label image where every surviving region's
-//! pixels carry its label; watershed 0-line pixels stay 0.
-//!
-//! Merge rule (symmetric, matches current MATLAB `edgeWeightEqual.m`):
-//!   A_ij_max = max(data at border intersection of i and j)
-//!   w_ij = 2·A_ij_max − min_bnds_i − max_over(i_region ∪ i_border)
-//!   w_ji = 2·A_ij_max − min_bnds_j − max_over(j_region ∪ j_border)
-//!   weight = max(w_ij, w_ji)
+//! Three front ends expose it: the C ABI in `c_api` (MATLAB MEX), the PyO3
+//! module below (behind the `python` feature), and the `dynamo` binary.
 
 pub mod adjacency;
 pub mod artifacts;
@@ -46,6 +43,31 @@ pub mod trim;
 mod python {
     use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
     use pyo3::prelude::*;
+
+    /// Copy an `(n_sections, 6)` SOS matrix into one `[b0 b1 b2 a0 a1 a2]`
+    /// row per section. The caller checks that there are 6 columns.
+    fn sos_rows(sos: numpy::ndarray::ArrayView2<'_, f64>) -> Vec<[f64; 6]> {
+        let mut rows: Vec<[f64; 6]> = Vec::with_capacity(sos.nrows());
+        for section in 0..sos.nrows() {
+            let mut coeffs = [0.0_f64; 6];
+            for (col, coeff) in coeffs.iter_mut().enumerate() {
+                *coeff = sos[[section, col]];
+            }
+            rows.push(coeffs);
+        }
+        rows
+    }
+
+    /// Store `values` in `dict` under `name` as a 1-D numpy array.
+    fn set_vec_item<'py, T: numpy::Element>(
+        py: Python<'py>,
+        dict: &Bound<'py, pyo3::types::PyDict>,
+        name: &str,
+        values: Vec<T>,
+    ) -> PyResult<()> {
+        let array = ndarray::Array1::from(values).into_pyarray_bound(py);
+        dict.set_item(name, array)
+    }
 
     /// merge_segment(label_img, data, merge_thresh=8.0, max_merges=inf)
     #[pyfunction]
@@ -111,23 +133,28 @@ mod python {
         vol_thresh: f64,
         shift_val: Option<f64>,
     ) -> PyResult<Bound<'py, PyArray2<i32>>> {
-        let lab = labels.as_array();
-        let dat = data.as_array();
-        if lab.shape() != dat.shape() {
+        let labels_view = labels.as_array();
+        let data_view = data.as_array();
+        if labels_view.shape() != data_view.shape() {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "labels and data shape mismatch",
             ));
         }
-        let sv = match shift_val {
-            Some(v) => v,
+        let shift = match shift_val {
+            Some(value) => value,
             None => {
-                let slice = dat.as_slice().ok_or_else(|| {
+                // Default shift: the minimum of the data.
+                let data_slice = data_view.as_slice().ok_or_else(|| {
                     pyo3::exceptions::PyValueError::new_err("data must be C-contiguous")
                 })?;
-                slice.iter().cloned().fold(f64::INFINITY, f64::min)
+                let mut data_min = f64::INFINITY;
+                for &value in data_slice {
+                    data_min = f64::min(data_min, value);
+                }
+                data_min
             }
         };
-        let out = super::trim::trim_all_regions(lab, dat, vol_thresh, sv)
+        let out = super::trim::trim_all_regions(labels_view, data_view, vol_thresh, shift)
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
         Ok(out.into_pyarray_bound(py))
     }
@@ -154,10 +181,10 @@ mod python {
     /// and paint the *dense* 1..N cell index into the output. Higher labels
     /// overwrite lower on overlap (MATLAB-exact). Zero stays background.
     ///
-    /// This replaces `skimage.segmentation.expand_labels(distance=5)` as
-    /// the border-fill step so that pydynamo's pass-2 count matches
-    /// MATLAB's ~0.8% peak-drift target (instead of skimage's ~+2%).
-    /// Input must be 2D int64 C-contiguous; output is int64 same shape.
+    /// This is the default border-fill step. It keeps pydynamo's pass-2
+    /// peak count within about 0.8% of MATLAB, where
+    /// `skimage.segmentation.expand_labels(distance=5)` gives about +2%.
+    /// Input must be 2D int64 C-contiguous. Output is int64, same shape.
     #[pyfunction]
     fn matlab_paint_labels<'py>(
         py: Python<'py>,
@@ -173,7 +200,7 @@ mod python {
     ///                           outlier_threshold, norm_method, retain_fs)
     ///   → (so_power_norm, so_power_times, so_power_stages, ptile)
     ///
-    /// Post-spectrogram SO-power pipeline — port of computeSOpower.m steps
+    /// Post-spectrogram SO-power pipeline, a port of computeSOpower.m steps
     /// 3–8 and pydynamo soph/sopower.py lines ~93–164. Takes the
     /// already-computed multitaper spectrogram over the SO band, emits the
     /// normalized SO-power time series on either the window-center grid
@@ -208,7 +235,7 @@ mod python {
         use super::so_power::{so_power_from_spectrogram as rs_fn, NormMethod, PtileUsed};
 
         let spect_arr = so_spect.as_array();
-        let (nf, nt) = spect_arr.dim();
+        let (n_freqs, n_times) = spect_arr.dim();
         let spect_contig = spect_arr.to_owned();
         let spect_slice = spect_contig.as_slice().ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err("so_spect must be C-contiguous")
@@ -221,7 +248,7 @@ mod python {
         let stage_times_slice = stage_times.as_array().to_owned().into_raw_vec_and_offset().0;
         let stage_vals_slice = stage_vals.as_array().to_owned().into_raw_vec_and_offset().0;
 
-        let nm = NormMethod::parse(norm_method).ok_or_else(|| {
+        let norm = NormMethod::parse(norm_method).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "unrecognized norm_method {:?}",
                 norm_method
@@ -229,11 +256,11 @@ mod python {
         })?;
 
         let out = rs_fn(
-            spect_slice, nf, nt,
+            spect_slice, n_freqs, n_times,
             &stimes_slice, &sfreqs_slice,
             &eeg_times_slice, &isexcluded_slice,
             &stage_times_slice, &stage_vals_slice,
-            time_range, outlier_threshold, &nm, retain_fs,
+            time_range, outlier_threshold, &norm, retain_fs,
         )
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
@@ -280,20 +307,12 @@ mod python {
         let stage_vals_vec = stage_vals.as_array().to_owned().into_raw_vec_and_offset().0;
 
         let sos_arr = sos.as_array();
-        let (nsec, ncols) = sos_arr.dim();
-        if ncols != 6 {
+        if sos_arr.ncols() != 6 {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "sos must have 6 columns (scipy SOS format: [b0 b1 b2 a0 a1 a2]).",
             ));
         }
-        let sos_slice: Vec<[f64; 6]> = (0..nsec)
-            .map(|i| {
-                [
-                    sos_arr[[i, 0]], sos_arr[[i, 1]], sos_arr[[i, 2]],
-                    sos_arr[[i, 3]], sos_arr[[i, 4]], sos_arr[[i, 5]],
-                ]
-            })
-            .collect();
+        let sos_slice = sos_rows(sos_arr);
 
         let out = super::so_phase::so_phase_from_eeg(
             &eeg_vec, &eeg_times_vec, &isexcluded_vec, &sos_slice,
@@ -337,7 +356,7 @@ mod python {
         smooth_duration: f64, detrend_duration: f64, buffer_duration: f64,
     ) -> PyResult<Bound<'py, numpy::PyArray1<bool>>> {
         use super::artifacts::{detect_artifacts as rs_fn, ArtifactOpts, ZScoreMethod};
-        let zm = match zscore_method.to_ascii_lowercase().as_str() {
+        let zscore = match zscore_method.to_ascii_lowercase().as_str() {
             "robust" => ZScoreMethod::Robust,
             "standard" => ZScoreMethod::Standard,
             other => {
@@ -351,17 +370,18 @@ mod python {
             hf_pass, hf_crit, bb_pass, bb_crit,
             hf_detrend, bb_detrend,
             smooth_duration, detrend_duration, buffer_duration,
-            zscore_method: zm,
+            zscore_method: zscore,
         };
-        let vec = data.as_array().to_owned().into_raw_vec_and_offset().0;
-        let out = rs_fn(&vec, fs, &opts);
+        let data_vec = data.as_array().to_owned().into_raw_vec_and_offset().0;
+        let out = rs_fn(&data_vec, fs, &opts);
         Ok(numpy::ndarray::Array1::from(out).into_pyarray_bound(py))
     }
 
     /// build_baseline_exclude(t_data, stage_times, stage_vals, baseline_stages,
     ///                        artifacts, user_exclude=None) -> (N,) bool
     ///
-    /// OR together (explicit_exclude, stage_not_in_baseline_stages, artifacts).
+    /// ORs together three masks: `user_exclude` (when given), samples whose
+    /// stage is not in `baseline_stages`, and `artifacts`.
     /// Matches pydynamo pipeline.py:123-129.
     #[pyfunction]
     #[pyo3(signature = (
@@ -377,16 +397,22 @@ mod python {
         artifacts: PyReadonlyArray1<'py, bool>,
         user_exclude: Option<PyReadonlyArray1<'py, bool>>,
     ) -> PyResult<Bound<'py, numpy::PyArray1<bool>>> {
-        let t = t_data.as_array().to_owned().into_raw_vec_and_offset().0;
-        let st = stage_times.as_array().to_owned().into_raw_vec_and_offset().0;
-        let sv = stage_vals.as_array().to_owned().into_raw_vec_and_offset().0;
-        let bs = baseline_stages.as_array().to_owned().into_raw_vec_and_offset().0;
-        let art: Vec<bool> = artifacts.as_array().iter().copied().collect();
-        let ue_vec: Option<Vec<bool>> = user_exclude
+        let t_data_vec = t_data.as_array().to_owned().into_raw_vec_and_offset().0;
+        let stage_times_vec = stage_times.as_array().to_owned().into_raw_vec_and_offset().0;
+        let stage_vals_vec = stage_vals.as_array().to_owned().into_raw_vec_and_offset().0;
+        let baseline_stages_vec =
+            baseline_stages.as_array().to_owned().into_raw_vec_and_offset().0;
+        let artifacts_vec: Vec<bool> = artifacts.as_array().iter().copied().collect();
+        let user_exclude_vec: Option<Vec<bool>> = user_exclude
             .as_ref()
-            .map(|ue| ue.as_array().iter().copied().collect());
+            .map(|mask| mask.as_array().iter().copied().collect());
         let out = super::baseline::build_baseline_exclude(
-            &t, &st, &sv, &bs, &art, ue_vec.as_deref(),
+            &t_data_vec,
+            &stage_times_vec,
+            &stage_vals_vec,
+            &baseline_stages_vec,
+            &artifacts_vec,
+            user_exclude_vec.as_deref(),
         )
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
         Ok(numpy::ndarray::Array1::from(out).into_pyarray_bound(py))
@@ -495,16 +521,15 @@ mod python {
         min_time_in_bin: f64,
         min_peak_at_freq: i32,
     ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        let v = c_valid.as_array().to_owned();
-        let va = c_valid_allstages.as_array().to_owned();
-        let v_vec: Vec<bool> = v.iter().copied().collect();
-        let va_vec: Vec<bool> = va.iter().copied().collect();
+        let c_valid_vec: Vec<bool> = c_valid.as_array().iter().copied().collect();
+        let c_valid_allstages_vec: Vec<bool> =
+            c_valid_allstages.as_array().iter().copied().collect();
         let inp = super::histogram::HistogramInputs {
             c_metric: c_metric.as_array(),
             c_stages: c_stages.as_array(),
             c_dt,
-            c_valid: &v_vec,
-            c_valid_allstages: &va_vec,
+            c_valid: &c_valid_vec,
+            c_valid_allstages: &c_valid_allstages_vec,
             peak_freqs: peak_freqs.as_array(),
             peak_c: peak_c.as_array(),
             freq_edges: freq_edges.as_array(),
@@ -528,6 +553,9 @@ mod python {
 
     /// hann_event_spectra(data, fs, event_times, t0, freq_range, window_size, dsfreqs, detrend_opt)
     /// → (spect (F, N), sfreqs (F,))
+    ///
+    /// One Hann-windowed spectrum per event, centered on each event time.
+    /// Column `i` of `spect` is the spectrum for `event_times[i]`.
     #[pyfunction]
     #[pyo3(signature = (
         data, fs, event_times, t0,
@@ -564,6 +592,10 @@ mod python {
 
     /// refine_from_spectra(spect, sfreqs, bbox_lo, bbox_hi, n_grid=1000, remove_edge_peaks=true)
     /// → refined_freqs (N,)
+    ///
+    /// Refine each peak frequency by locating the spectral maximum inside
+    /// its bounding-box frequency range `[bbox_lo[i], bbox_hi[i]]`, on an
+    /// `n_grid`-point interpolation grid.
     #[pyfunction]
     #[pyo3(signature = (spect, sfreqs, bbox_lo, bbox_hi, n_grid=1000, remove_edge_peaks=true))]
     fn refine_from_spectra<'py>(
@@ -601,12 +633,7 @@ mod python {
                 "sos must have 6 columns (b0 b1 b2 a0 a1 a2)",
             ));
         }
-        let sos_vec: Vec<[f64; 6]> = (0..sos_arr.nrows())
-            .map(|r| [
-                sos_arr[[r, 0]], sos_arr[[r, 1]], sos_arr[[r, 2]],
-                sos_arr[[r, 3]], sos_arr[[r, 4]], sos_arr[[r, 5]],
-            ])
-            .collect();
+        let sos_vec = sos_rows(sos_arr);
         let x_vec: Vec<f64> = x.as_array().iter().copied().collect();
         let y = super::signal::sosfiltfilt(&sos_vec, &x_vec);
         Ok(ndarray::Array1::from(y).into_pyarray_bound(py))
@@ -626,7 +653,7 @@ mod python {
         ))
     }
 
-    /// unwrap(p, discont=π) — matches numpy.unwrap.
+    /// unwrap(p, discont=π), matching numpy.unwrap.
     #[pyfunction]
     #[pyo3(signature = (p, discont=std::f64::consts::PI))]
     fn unwrap<'py>(
@@ -634,28 +661,30 @@ mod python {
         p: PyReadonlyArray1<'py, f64>,
         discont: f64,
     ) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-        let v: Vec<f64> = p.as_array().iter().copied().collect();
-        let out = super::signal::unwrap(&v, discont);
+        let phase_vec: Vec<f64> = p.as_array().iter().copied().collect();
+        let out = super::signal::unwrap(&phase_vec, discont);
         Ok(ndarray::Array1::from(out).into_pyarray_bound(py))
     }
 
-    /// movmean(x, win) — MATLAB-style centered moving mean with partial edges.
+    /// movmean(x, win): MATLAB-style centered moving mean with partial edges.
     #[pyfunction]
     fn movmean<'py>(
         py: Python<'py>,
         x: PyReadonlyArray1<'py, f64>,
         win: usize,
     ) -> PyResult<Bound<'py, numpy::PyArray1<f64>>> {
-        let v: Vec<f64> = x.as_array().iter().copied().collect();
-        let out = super::signal::movmean(&v, win);
+        let x_vec: Vec<f64> = x.as_array().iter().copied().collect();
+        let out = super::signal::movmean(&x_vec, win);
         Ok(ndarray::Array1::from(out).into_pyarray_bound(py))
     }
 
-    /// read_edf(path, channel=None) → dict with header, signals, data, fs, channel.
+    /// read_edf(path, channel=None) → dict
     ///
-    /// If `channel` is None, returns all signals in a list. Otherwise returns
-    /// (data, fs, label) for the single selected channel (with A–B rereference
-    /// support). Port of `read_EDF_mex.c`.
+    /// The dict always has `header`, `labels` and `sampling_frequencies`.
+    /// If `channel` is None it also has `signals`, a list with one dict per
+    /// signal (header fields plus `data`). Otherwise it has `data`, `fs`,
+    /// `label` and `signal_header` for the single selected channel (with
+    /// A–B rereference support). Port of `read_EDF_mex.c`.
     #[pyfunction]
     #[pyo3(signature = (path, channel=None))]
     fn read_edf<'py>(
@@ -670,62 +699,62 @@ mod python {
         let out = PyDict::new_bound(py);
 
         // Header
-        let hdr = PyDict::new_bound(py);
-        hdr.set_item("edf_ver", &edf.header.edf_ver)?;
-        hdr.set_item("patient_id", &edf.header.patient_id)?;
-        hdr.set_item("local_rec_id", &edf.header.local_rec_id)?;
-        hdr.set_item("recording_startdate", &edf.header.recording_startdate)?;
-        hdr.set_item("recording_starttime", &edf.header.recording_starttime)?;
-        hdr.set_item("num_header_bytes", edf.header.num_header_bytes)?;
-        hdr.set_item("num_data_records", edf.header.num_data_records)?;
-        hdr.set_item("data_record_duration", edf.header.data_record_duration)?;
-        hdr.set_item("num_signals", edf.header.num_signals)?;
-        out.set_item("header", hdr)?;
+        let header_dict = PyDict::new_bound(py);
+        header_dict.set_item("edf_ver", &edf.header.edf_ver)?;
+        header_dict.set_item("patient_id", &edf.header.patient_id)?;
+        header_dict.set_item("local_rec_id", &edf.header.local_rec_id)?;
+        header_dict.set_item("recording_startdate", &edf.header.recording_startdate)?;
+        header_dict.set_item("recording_starttime", &edf.header.recording_starttime)?;
+        header_dict.set_item("num_header_bytes", edf.header.num_header_bytes)?;
+        header_dict.set_item("num_data_records", edf.header.num_data_records)?;
+        header_dict.set_item("data_record_duration", edf.header.data_record_duration)?;
+        header_dict.set_item("num_signals", edf.header.num_signals)?;
+        out.set_item("header", header_dict)?;
 
         // All signal labels (useful even when selecting one channel).
-        let labels: Vec<&str> = edf.signals.iter().map(|s| s.signal_labels.as_str()).collect();
+        let labels: Vec<&str> = edf.signals.iter().map(|signal| signal.signal_labels.as_str()).collect();
         out.set_item("labels", labels)?;
-        let fs_all: Vec<f64> = edf.signals.iter().map(|s| s.sampling_frequency).collect();
+        let fs_all: Vec<f64> = edf.signals.iter().map(|signal| signal.sampling_frequency).collect();
         out.set_item("sampling_frequencies", fs_all)?;
 
-        if let Some(ch) = channel {
-            let (sh, values) = super::io::edf::select_channel(&edf, ch)
+        if let Some(channel_expr) = channel {
+            let (signal_header, values) = super::io::edf::select_channel(&edf, channel_expr)
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
             let arr = ndarray::Array1::from(values);
             out.set_item("data", arr.into_pyarray_bound(py))?;
-            out.set_item("fs", sh.sampling_frequency)?;
-            out.set_item("label", sh.signal_labels.clone())?;
-            let sinfo = PyDict::new_bound(py);
-            sinfo.set_item("signal_labels", sh.signal_labels)?;
-            sinfo.set_item("transducer_type", sh.transducer_type)?;
-            sinfo.set_item("physical_dimension", sh.physical_dimension)?;
-            sinfo.set_item("physical_min", sh.physical_min)?;
-            sinfo.set_item("physical_max", sh.physical_max)?;
-            sinfo.set_item("digital_min", sh.digital_min)?;
-            sinfo.set_item("digital_max", sh.digital_max)?;
-            sinfo.set_item("prefiltering", sh.prefiltering)?;
-            sinfo.set_item("samples_in_record", sh.samples_in_record)?;
-            sinfo.set_item("sampling_frequency", sh.sampling_frequency)?;
-            out.set_item("signal_header", sinfo)?;
+            out.set_item("fs", signal_header.sampling_frequency)?;
+            out.set_item("label", signal_header.signal_labels.clone())?;
+            let signal_info = PyDict::new_bound(py);
+            signal_info.set_item("signal_labels", signal_header.signal_labels)?;
+            signal_info.set_item("transducer_type", signal_header.transducer_type)?;
+            signal_info.set_item("physical_dimension", signal_header.physical_dimension)?;
+            signal_info.set_item("physical_min", signal_header.physical_min)?;
+            signal_info.set_item("physical_max", signal_header.physical_max)?;
+            signal_info.set_item("digital_min", signal_header.digital_min)?;
+            signal_info.set_item("digital_max", signal_header.digital_max)?;
+            signal_info.set_item("prefiltering", signal_header.prefiltering)?;
+            signal_info.set_item("samples_in_record", signal_header.samples_in_record)?;
+            signal_info.set_item("sampling_frequency", signal_header.sampling_frequency)?;
+            out.set_item("signal_header", signal_info)?;
         } else {
-            let lst = PyList::empty_bound(py);
-            for (s, v) in edf.signals.iter().zip(edf.data.iter()) {
-                let d = PyDict::new_bound(py);
-                d.set_item("signal_labels", &s.signal_labels)?;
-                d.set_item("transducer_type", &s.transducer_type)?;
-                d.set_item("physical_dimension", &s.physical_dimension)?;
-                d.set_item("physical_min", s.physical_min)?;
-                d.set_item("physical_max", s.physical_max)?;
-                d.set_item("digital_min", s.digital_min)?;
-                d.set_item("digital_max", s.digital_max)?;
-                d.set_item("prefiltering", &s.prefiltering)?;
-                d.set_item("samples_in_record", s.samples_in_record)?;
-                d.set_item("sampling_frequency", s.sampling_frequency)?;
-                let arr = ndarray::Array1::from(v.clone());
-                d.set_item("data", arr.into_pyarray_bound(py))?;
-                lst.append(d)?;
+            let signal_list = PyList::empty_bound(py);
+            for (signal, samples) in edf.signals.iter().zip(edf.data.iter()) {
+                let signal_dict = PyDict::new_bound(py);
+                signal_dict.set_item("signal_labels", &signal.signal_labels)?;
+                signal_dict.set_item("transducer_type", &signal.transducer_type)?;
+                signal_dict.set_item("physical_dimension", &signal.physical_dimension)?;
+                signal_dict.set_item("physical_min", signal.physical_min)?;
+                signal_dict.set_item("physical_max", signal.physical_max)?;
+                signal_dict.set_item("digital_min", signal.digital_min)?;
+                signal_dict.set_item("digital_max", signal.digital_max)?;
+                signal_dict.set_item("prefiltering", &signal.prefiltering)?;
+                signal_dict.set_item("samples_in_record", signal.samples_in_record)?;
+                signal_dict.set_item("sampling_frequency", signal.sampling_frequency)?;
+                let arr = ndarray::Array1::from(samples.clone());
+                signal_dict.set_item("data", arr.into_pyarray_bound(py))?;
+                signal_list.append(signal_dict)?;
             }
-            out.set_item("signals", lst)?;
+            out.set_item("signals", signal_list)?;
         }
 
         Ok(out)
@@ -734,6 +763,9 @@ mod python {
     /// read_staging(path, time_col=1, stage_col=2, header_lines=0,
     ///              delimiter=",", epoch_dur=30.0, start_time=None)
     /// → (times (N,), vals (N,)) numpy arrays.
+    ///
+    /// Read a delimited-text sleep-staging file. `time_col` and `stage_col`
+    /// are 1-based column numbers. Port of `read_staging.m`.
     #[pyfunction]
     #[pyo3(signature = (
         path, time_col=1, stage_col=2, header_lines=0,
@@ -767,22 +799,22 @@ mod python {
         };
         let out = super::io::staging::read_staging(path, &opts)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
-        let t = ndarray::Array1::from(out.times);
-        let v = ndarray::Array1::from(out.vals);
-        Ok((t.into_pyarray_bound(py), v.into_pyarray_bound(py)))
+        let times = ndarray::Array1::from(out.times);
+        let vals = ndarray::Array1::from(out.vals);
+        Ok((times.into_pyarray_bound(py), vals.into_pyarray_bound(py)))
     }
 
     /// Unpack a length-3 background-coefficient array into `[f64; 3]`.
     fn bg3(name: &str, arr: PyReadonlyArray1<'_, f64>) -> PyResult<[f64; 3]> {
-        let v = arr.as_array();
-        if v.len() != 3 {
+        let coeffs = arr.as_array();
+        if coeffs.len() != 3 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "{} must have 3 elements, got {}",
                 name,
-                v.len()
+                coeffs.len()
             )));
         }
-        Ok([v[0], v[1], v[2]])
+        Ok([coeffs[0], coeffs[1], coeffs[2]])
     }
 
     /// Pack a `ParamFitOut` into the dict both paramfit kernels return. The
@@ -822,12 +854,11 @@ mod python {
     ///
     /// The kernel is
     /// `amp * exp(-0.5*(u/fstd)^2 - 0.5*(v/pstd)^2)`, so `fstd` and `pstd`
-    /// are standard deviations — not variances, and not the `sqrt(2)`-
-    /// inflated widths this function used before 0.2.0. To preserve an old
-    /// modeled surface or bound window, divide stored pre-0.2.0 widths in
-    /// columns 2 and 4 by `sqrt(2)`. Fresh seeds and priors already expressed
-    /// as standard deviations keep their numeric values. The signature did
-    /// not change, and this function applies no conversion at its boundary.
+    /// are standard deviations, not variances. Widths stored by versions
+    /// below 0.2.0 are `sqrt(2)` times larger. To reuse such widths as a
+    /// modeled surface or bound window, divide columns 2 and 4 by `sqrt(2)`.
+    /// Seeds and priors already expressed as standard deviations keep their
+    /// numeric values. This function applies no conversion at its boundary.
     #[pyfunction]
     #[pyo3(signature = (soph, x_grid, y_grid, initial, lower, upper,
                         bg_initial, bg_lower, bg_upper, max_iters=0))]
@@ -845,12 +876,12 @@ mod python {
         bg_upper: PyReadonlyArray1<'py, f64>,
         max_iters: u32,
     ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        let xg: Vec<f64> = x_grid.as_array().iter().copied().collect();
-        let yg: Vec<f64> = y_grid.as_array().iter().copied().collect();
+        let x_grid_vec: Vec<f64> = x_grid.as_array().iter().copied().collect();
+        let y_grid_vec: Vec<f64> = y_grid.as_array().iter().copied().collect();
         let out = super::paramfit::rot_gauss::fit_rotgauss(
             soph.as_array(),
-            &xg,
-            &yg,
+            &x_grid_vec,
+            &y_grid_vec,
             initial.as_array(),
             lower.as_array(),
             upper.as_array(),
@@ -876,15 +907,15 @@ mod python {
     ///
     /// The kernel is `amp * exp(-0.5*(dy/fstd)^2) *
     /// exp(k*(cos(dx) - 1))`, `k = 1/recikappa^2`, so both widths are
-    /// standard deviations. To preserve an old modeled surface or bound
-    /// window, divide stored pre-0.2.0 `fstd` values by `sqrt(2)`; fresh seeds
-    /// and priors already expressed as standard deviations keep their numeric
-    /// values. `recikappa` (column 4) is unchanged and must NOT be rescaled:
-    /// the von Mises factor is its own small-angle Gaussian and carries the
-    /// half intrinsically. Column 4 is `pstd` for `fit_rotgauss` and
-    /// `recikappa` here, so any migration driven by column index rather than
-    /// by kernel corrupts every phase fit. This function applies no conversion
-    /// at its boundary.
+    /// standard deviations. `fstd` values stored by versions below 0.2.0 are
+    /// `sqrt(2)` times larger. To reuse them as a modeled surface or bound
+    /// window, divide by `sqrt(2)`. Seeds and priors already expressed as
+    /// standard deviations keep their numeric values. `recikappa` (column 4)
+    /// must NOT be rescaled, because the von Mises factor is its own
+    /// small-angle Gaussian and carries the half intrinsically. Column 4 is
+    /// `pstd` for `fit_rotgauss` and `recikappa` here, so any conversion
+    /// driven by column index instead of by kernel corrupts every phase fit.
+    /// This function applies no conversion at its boundary.
     #[pyfunction]
     #[pyo3(signature = (soph, x_grid, y_grid, initial, lower, upper,
                         bg_initial, bg_lower, bg_upper, max_iters=0, unit_row=true))]
@@ -903,12 +934,12 @@ mod python {
         max_iters: u32,
         unit_row: bool,
     ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        let xg: Vec<f64> = x_grid.as_array().iter().copied().collect();
-        let yg: Vec<f64> = y_grid.as_array().iter().copied().collect();
+        let x_grid_vec: Vec<f64> = x_grid.as_array().iter().copied().collect();
+        let y_grid_vec: Vec<f64> = y_grid.as_array().iter().copied().collect();
         let out = super::paramfit::vm_gauss::fit_vmgauss(
             soph.as_array(),
-            &xg,
-            &yg,
+            &x_grid_vec,
+            &y_grid_vec,
             initial.as_array(),
             lower.as_array(),
             upper.as_array(),
@@ -928,7 +959,7 @@ mod python {
     /// → dict{coefs (m_y,m_x), splinefit (n_x,n_y), knots_x_aug, knots_y_aug}
     ///
     /// Tensor-product cubic B-spline least squares, equivalent to MATLAB
-    /// `spap2`. `soph` is `(n_x, n_y)` — the transpose of the canonical
+    /// `spap2`. `soph` is `(n_x, n_y)`, the transpose of the canonical
     /// `(n_freqs, n_features)` layout, matching what `spline_basis.m` feeds
     /// `spap2`.
     #[pyfunction]
@@ -944,16 +975,16 @@ mod python {
         order: usize,
         boundary_multiplicity: usize,
     ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        let xe: Vec<f64> = x_eval.as_array().iter().copied().collect();
-        let ye: Vec<f64> = y_eval.as_array().iter().copied().collect();
-        let kx: Vec<f64> = internal_knots_x.as_array().iter().copied().collect();
-        let ky: Vec<f64> = internal_knots_y.as_array().iter().copied().collect();
+        let x_eval_vec: Vec<f64> = x_eval.as_array().iter().copied().collect();
+        let y_eval_vec: Vec<f64> = y_eval.as_array().iter().copied().collect();
+        let knots_x_vec: Vec<f64> = internal_knots_x.as_array().iter().copied().collect();
+        let knots_y_vec: Vec<f64> = internal_knots_y.as_array().iter().copied().collect();
         let out = super::spline_basis::fit_tensor_product_spline(
             soph.as_array(),
-            &xe,
-            &ye,
-            &kx,
-            &ky,
+            &x_eval_vec,
+            &y_eval_vec,
+            &knots_x_vec,
+            &knots_y_vec,
             order,
             boundary_multiplicity,
         )
@@ -1038,37 +1069,31 @@ mod python {
             ht_db_min,
             expand_labels_distance,
         };
-        let bl = baseline.as_ref().map(|b| b.as_array());
+        let baseline_view = baseline.as_ref().map(|values| values.as_array());
         let (peaks, labels) = super::extract_pipeline::extract_tfpeaks(
             spect.as_array(),
             stimes.as_array(),
             sfreqs.as_array(),
-            bl,
+            baseline_view,
             &params,
             None,
             None,
         )
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
-        let n = peaks.len();
+        let n_peaks = peaks.len();
         let dict = pyo3::types::PyDict::new_bound(py);
-        macro_rules! put {
-            ($name:expr, $v:expr) => {
-                dict.set_item($name,
-                    ndarray::Array1::from($v).into_pyarray_bound(py))?;
-            };
-        }
-        put!("peak_time", peaks.peak_time);
-        put!("peak_freq", peaks.peak_freq);
-        put!("duration", peaks.duration);
-        put!("bandwidth", peaks.bandwidth);
-        put!("height", peaks.height);
-        put!("volume", peaks.volume);
-        put!("segment_num", peaks.segment_num);
-        put!("area", peaks.area);
-        put!("peakiness", peaks.peakiness);
+        set_vec_item(py, &dict, "peak_time", peaks.peak_time)?;
+        set_vec_item(py, &dict, "peak_freq", peaks.peak_freq)?;
+        set_vec_item(py, &dict, "duration", peaks.duration)?;
+        set_vec_item(py, &dict, "bandwidth", peaks.bandwidth)?;
+        set_vec_item(py, &dict, "height", peaks.height)?;
+        set_vec_item(py, &dict, "volume", peaks.volume)?;
+        set_vec_item(py, &dict, "segment_num", peaks.segment_num)?;
+        set_vec_item(py, &dict, "area", peaks.area)?;
+        set_vec_item(py, &dict, "peakiness", peaks.peakiness)?;
 
-        let bbox = ndarray::Array2::from_shape_vec((n, 4), peaks.bbox)
+        let bbox = ndarray::Array2::from_shape_vec((n_peaks, 4), peaks.bbox)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(
                 format!("bbox shape: {}", e)))?;
         dict.set_item("bbox", bbox.into_pyarray_bound(py))?;
@@ -1078,7 +1103,7 @@ mod python {
             let items: Vec<Bound<'py, numpy::PyArray1<f64>>> = peaks
                 .height_data
                 .into_iter()
-                .map(|v| ndarray::Array1::from(v).into_pyarray_bound(py))
+                .map(|pixel_values| ndarray::Array1::from(pixel_values).into_pyarray_bound(py))
                 .collect();
             dict.set_item("height_data", items)?;
         }
@@ -1086,9 +1111,9 @@ mod python {
             let items: Vec<Bound<'py, numpy::PyArray2<f64>>> = peaks
                 .boundaries_xy
                 .into_iter()
-                .map(|v| {
-                    let m = v.len() / 2;
-                    ndarray::Array2::from_shape_vec((m, 2), v)
+                .map(|xy_flat| {
+                    let n_points = xy_flat.len() / 2;
+                    ndarray::Array2::from_shape_vec((n_points, 2), xy_flat)
                         .unwrap_or_else(|_| ndarray::Array2::zeros((0, 2)))
                         .into_pyarray_bound(py)
                 })
@@ -1102,13 +1127,13 @@ mod python {
     //
     // Thin wrappers over `crate::stats`, so pydynamo runs the same code
     // the desktop app and CLI do. Shapes are flat `(n_bins * n_trials)`
-    // row-major with `n_bins` given separately; the Python layer owns
+    // row-major with `n_bins` given separately. The Python layer owns
     // reshaping, which keeps 1-D and 2-D (SOPH) callers on one binding.
 
     /// fdr_grid(g1, g2, n_bins, q=0.05, method="dep", paired=False)
     ///
     /// Returns `(p_values, p_adj, sigbins, crit_p, m)`. Port of
-    /// `FDR_1D.m` / `FDR_2D.m`; missing data is dropped, never imputed,
+    /// `FDR_1D.m` / `FDR_2D.m`. Missing data is dropped, never imputed,
     /// and untestable bins return NaN and stay out of the FDR family.
     #[pyfunction]
     #[pyo3(signature = (g1, g2, n_bins, q=0.05, method="dep", paired=false))]
@@ -1128,29 +1153,31 @@ mod python {
         usize,
     )> {
         use crate::stats::{fdr, fdr_grid as fg};
-        let meth = fdr::Method::parse(method).ok_or_else(|| {
+        let fdr_method = fdr::Method::parse(method).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "unknown FDR method '{}' (want dep/dependent or pdep/independent)",
                 method
             ))
         })?;
-        let test = fg::Test::from_matlab_flags(true, paired)
+        // The kernel implements only the nonparametric tests.
+        let nonparam = true;
+        let test = fg::Test::from_matlab_flags(nonparam, paired)
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
-        let r = fg::fdr_grid(
+        let result = fg::fdr_grid(
             g1.as_slice()?,
             g2.as_slice()?,
             n_bins,
             q,
-            meth,
+            fdr_method,
             test,
         )
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
         Ok((
-            r.p_values.into_pyarray_bound(py),
-            r.p_adj.into_pyarray_bound(py),
-            ndarray::Array1::from(r.sigbins).into_pyarray_bound(py),
-            r.crit_p,
-            r.m,
+            result.p_values.into_pyarray_bound(py),
+            result.p_adj.into_pyarray_bound(py),
+            ndarray::Array1::from(result.sigbins).into_pyarray_bound(py),
+            result.crit_p,
+            result.m,
         ))
     }
 
@@ -1167,11 +1194,11 @@ mod python {
         method: &str,
     ) -> PyResult<(Bound<'py, numpy::PyArray1<f64>>, f64, usize)> {
         use crate::stats::fdr;
-        let meth = fdr::Method::parse(method).ok_or_else(|| {
+        let fdr_method = fdr::Method::parse(method).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!("unknown FDR method '{}'", method))
         })?;
-        let r = fdr::adjust(pvals.as_slice()?, q, meth);
-        Ok((r.p_adj.into_pyarray_bound(py), r.crit_p, r.m))
+        let result = fdr::adjust(pvals.as_slice()?, q, fdr_method);
+        Ok((result.p_adj.into_pyarray_bound(py), result.crit_p, result.m))
     }
 
     /// gpermtest(g1, g2, n_bins, alpha=0.05, iterations=10000, seed=0)
@@ -1197,7 +1224,7 @@ mod python {
         usize,
         Option<String>,
     )> {
-        let r = crate::stats::permtest::gpermtest(
+        let result = crate::stats::permtest::gpermtest(
             g1.as_slice()?,
             g2.as_slice()?,
             n_bins,
@@ -1207,11 +1234,11 @@ mod python {
         )
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
         Ok((
-            ndarray::Array1::from(r.sigbins).into_pyarray_bound(py),
-            r.acceptance_bounds.into_pyarray_bound(py),
-            r.true_stat.into_pyarray_bound(py),
-            r.n_excluded,
-            r.warning,
+            ndarray::Array1::from(result.sigbins).into_pyarray_bound(py),
+            result.acceptance_bounds.into_pyarray_bound(py),
+            result.true_stat.into_pyarray_bound(py),
+            result.n_excluded,
+            result.warning,
         ))
     }
 

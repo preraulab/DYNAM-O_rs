@@ -1,4 +1,4 @@
-//! Benjamini–Hochberg and Benjamini–Yekutieli FDR control — port of the
+//! Benjamini–Hochberg and Benjamini–Yekutieli FDR control. Port of the
 //! `fdr_bh` nested in DYNAM-O's `FDR_1D.m` (itself David Groppe's
 //! `fdr_bh.m`).
 //!
@@ -20,11 +20,11 @@ pub const DEFAULT_Q: f64 = 0.05;
 /// Which dependence structure the correction is valid under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
-    /// Benjamini–Hochberg — independent or positively dependent tests.
+    /// Benjamini–Hochberg: independent or positively dependent tests.
     /// MATLAB `'pdep'`, `FDR_2D`'s `'independent'`.
     Pdep,
-    /// Benjamini–Yekutieli — any dependence structure. MATLAB `'dep'`,
-    /// `FDR_2D`'s `'dependent'` and its default. Neighbouring SOPH pixels
+    /// Benjamini–Yekutieli: any dependence structure. MATLAB `'dep'`,
+    /// `FDR_2D`'s `'dependent'` and its default. Neighboring SOPH pixels
     /// are strongly correlated, so this is what the app uses.
     Dep,
 }
@@ -41,65 +41,77 @@ impl Method {
     }
 }
 
+/// Output of [`adjust`].
 #[derive(Debug, Clone)]
 pub struct FdrResult {
     /// Adjusted p-values, aligned with the input. NaN wherever the input
-    /// was non-finite. Not clipped to 1 — BY can exceed it, and MATLAB
-    /// doesn't clip either.
+    /// was non-finite. Not clipped to 1, because BY can exceed it and
+    /// MATLAB doesn't clip either.
     pub p_adj: Vec<f64>,
     /// Largest raw p-value that passes, or 0 when nothing does.
     pub crit_p: f64,
     /// Tests that survive at `q`.
     pub n_sig: usize,
-    /// Family size — finite p-values only.
+    /// Family size: finite p-values only.
     pub m: usize,
 }
 
 /// Apply FDR control at level `q`.
 pub fn adjust(pvals: &[f64], q: f64, method: Method) -> FdrResult {
-    let finite: Vec<(usize, f64)> = pvals
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| p.is_finite())
-        .map(|(i, p)| (i, *p))
-        .collect();
-    let m = finite.len();
+    // (original index, p-value) for every finite p-value, sorted ascending
+    // by p-value below.
+    let mut order: Vec<(usize, f64)> = Vec::new();
+    for (i, p) in pvals.iter().enumerate() {
+        if p.is_finite() {
+            order.push((i, *p));
+        }
+    }
+    let m = order.len();
     let mut p_adj = vec![f64::NAN; pvals.len()];
     if m == 0 {
         return FdrResult { p_adj, crit_p: 0.0, n_sig: 0, m: 0 };
     }
 
-    let mut order = finite.clone();
     order.sort_by(|a, b| a.1.partial_cmp(&b.1).expect("filtered to finite"));
     let p_sorted: Vec<f64> = order.iter().map(|(_, p)| *p).collect();
     let mf = m as f64;
 
-    let (thresh, wtd_p): (Vec<f64>, Vec<f64>) = match method {
-        Method::Pdep => (
-            (1..=m).map(|k| k as f64 * q / mf).collect(),
-            p_sorted.iter().enumerate().map(|(k, p)| mf * p / (k + 1) as f64).collect(),
-        ),
+    // Denominator of the step-up thresholds. BH uses m. BY uses
+    // m · Σ 1/k for k = 1..m.
+    let denom = match method {
+        Method::Pdep => mf,
         Method::Dep => {
-            // BY denominator: m · Σ 1/k for k = 1..m
-            let denom = mf * (1..=m).map(|k| 1.0 / k as f64).sum::<f64>();
-            (
-                (1..=m).map(|k| k as f64 * q / denom).collect(),
-                p_sorted.iter().enumerate().map(|(k, p)| denom * p / (k + 1) as f64).collect(),
-            )
+            let mut harmonic_sum = 0.0_f64;
+            for k in 1..=m {
+                harmonic_sum += 1.0 / k as f64;
+            }
+            mf * harmonic_sum
         }
     };
+
+    // For the k-th smallest p-value (k = 1..m):
+    //   thresh = k * q / denom   (the rejection threshold)
+    //   wtd_p  = denom * p / k   (the p-value scaled to the q axis)
+    let mut thresh = Vec::with_capacity(m);
+    let mut wtd_p = Vec::with_capacity(m);
+    for k in 0..m {
+        let rank = (k + 1) as f64;
+        thresh.push(rank * q / denom);
+        wtd_p.push(denom * p_sorted[k] / rank);
+    }
 
     // Adjusted p in sorted order: the running minimum of `wtd_p` from the
     // top, which makes the sequence monotone non-decreasing. Implemented
     // as the same sort-and-fill Groppe uses so the two agree exactly,
-    // including on ties.
+    // including on ties. Each weighted p-value, taken in ascending order,
+    // fills every still-empty slot up to and including its own position.
     let mut wtd_order: Vec<(usize, f64)> = wtd_p.iter().copied().enumerate().collect();
     wtd_order.sort_by(|a, b| a.1.partial_cmp(&b.1).expect("finite"));
     let mut adj_sorted = vec![f64::NAN; m];
     let mut next_fill = 0usize;
     for &(target, v) in &wtd_order {
         if target >= next_fill {
-            for slot in adj_sorted.iter_mut().take(target + 1).skip(next_fill) {
+            for slot in &mut adj_sorted[next_fill..=target] {
                 *slot = v;
             }
             next_fill = target + 1;
@@ -109,18 +121,19 @@ pub fn adjust(pvals: &[f64], q: f64, method: Method) -> FdrResult {
         }
     }
 
-    let crit_p = p_sorted
-        .iter()
-        .zip(thresh.iter())
-        .enumerate()
-        .filter(|(_, (p, t))| *p <= *t)
-        .map(|(k, _)| p_sorted[k])
-        .next_back()
-        .unwrap_or(0.0);
+    // Largest sorted p-value at or below its threshold, or 0 if none is.
+    let mut crit_p = 0.0;
+    for k in 0..m {
+        if p_sorted[k] <= thresh[k] {
+            crit_p = p_sorted[k];
+        }
+    }
 
     let mut n_sig = 0usize;
     for (k, (orig_idx, _)) in order.iter().enumerate() {
         p_adj[*orig_idx] = adj_sorted[k];
+        // The stored value is unclipped. Only the significance count clips
+        // at 1.
         if adj_sorted[k].min(1.0) <= q {
             n_sig += 1;
         }

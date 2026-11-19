@@ -1,4 +1,4 @@
-//! Per-bin group comparison with FDR control — port of `FDR_1D.m` /
+//! Per-bin group comparison with FDR control. Port of `FDR_1D.m` /
 //! `FDR_2D.m`.
 //!
 //! `FDR_2D` is `FDR_1D` over a flattened grid, so both live here and the
@@ -11,7 +11,7 @@
 //! 0 collapses the first onto the second, and since the values are
 //! non-negative the injected zeros sit at the bottom of every rank
 //! ordering and swamp the real observations. A bin with nothing left to
-//! compare is untestable and yields NaN; [`super::fdr::adjust`] keeps
+//! compare is untestable and yields NaN, and [`super::fdr::adjust`] keeps
 //! those out of the family entirely.
 
 use super::fdr;
@@ -49,20 +49,20 @@ impl Test {
 pub struct FdrGrid {
     /// `p_adj <= q`, per bin. False wherever the bin was untestable.
     pub sigbins: Vec<bool>,
-    /// Adjusted p per bin; NaN where untestable. Not clipped to 1 — BY
-    /// can exceed it and MATLAB does not clip either.
+    /// Adjusted p per bin, NaN where untestable. Not clipped to 1, because
+    /// BY can exceed it and MATLAB does not clip either.
     pub p_adj: Vec<f64>,
-    /// Raw p per bin; NaN where untestable.
+    /// Raw p per bin, NaN where untestable.
     pub p_values: Vec<f64>,
     /// Largest raw p that passes, or 0.0 when none do.
     pub crit_p: f64,
-    /// Family size — testable bins only.
+    /// Family size: testable bins only.
     pub m: usize,
 }
 
 /// Is there anything left to compare in this bin?
 ///
-/// Unpaired needs at least one observation in each group; paired needs
+/// Unpaired needs at least one observation in each group. Paired needs
 /// at least one position where BOTH are observed, because `signrank`
 /// has nothing to rank otherwise.
 fn testable(a: &[f64], b: &[f64], test: Test) -> bool {
@@ -109,6 +109,7 @@ pub fn fdr_grid(
         ));
     }
 
+    // Map +Inf and -Inf to NaN so the rank tests see them as missing.
     let clean = |v: f64| if v.is_finite() { v } else { f64::NAN };
     let mut p_values = Vec::with_capacity(n_bins);
     let mut buf_a: Vec<f64> = Vec::with_capacity(n1);
@@ -118,18 +119,20 @@ pub fn fdr_grid(
         buf_b.clear();
         buf_a.extend(g1[bin * n1..(bin + 1) * n1].iter().map(|v| clean(*v)));
         buf_b.extend(g2[bin * n2..(bin + 1) * n2].iter().map(|v| clean(*v)));
-        p_values.push(if testable(&buf_a, &buf_b, test) {
-            match test {
+        let p_value;
+        if testable(&buf_a, &buf_b, test) {
+            p_value = match test {
                 Test::RankSum => ranksum(&buf_a, &buf_b).p,
                 Test::SignRank => signrank(&buf_a, &buf_b),
-            }
+            };
         } else {
-            f64::NAN
-        });
+            p_value = f64::NAN;
+        }
+        p_values.push(p_value);
     }
 
-    let r = fdr::adjust(&p_values, q, method);
-    let sigbins = r
+    let adjusted = fdr::adjust(&p_values, q, method);
+    let sigbins = adjusted
         .p_adj
         .iter()
         // Benjamini-Hochberg rejects at an adjusted p-value equal to q, so
@@ -138,10 +141,10 @@ pub fn fdr_grid(
         .collect();
     Ok(FdrGrid {
         sigbins,
-        p_adj: r.p_adj,
+        p_adj: adjusted.p_adj,
         p_values,
-        crit_p: r.crit_p,
-        m: r.m,
+        crit_p: adjusted.crit_p,
+        m: adjusted.m,
     })
 }
 
@@ -151,12 +154,13 @@ mod tests {
 
     #[test]
     fn planted_effect_is_found_and_nothing_else_is() {
-        // 4 bins x 20 subjects; only bin 2 differs.
-        let (n_bins, n) = (4usize, 20usize);
+        // 4 bins x 20 subjects. Only bin 2 differs.
+        let n_bins = 4usize;
+        let n_subjects = 20usize;
         let mut g1 = Vec::new();
         let mut g2 = Vec::new();
         for bin in 0..n_bins {
-            for k in 0..n {
+            for k in 0..n_subjects {
                 let base = (k % 7) as f64 * 0.01;
                 g1.push(base + if bin == 2 { 10.0 } else { 1.0 });
                 g2.push(base + 1.0);
@@ -170,11 +174,12 @@ mod tests {
 
     #[test]
     fn untestable_bins_leave_the_family() {
-        let (n_bins, n) = (3usize, 10usize);
+        let n_bins = 3usize;
+        let n_subjects = 10usize;
         let mut g1 = Vec::new();
         let mut g2 = Vec::new();
         for bin in 0..n_bins {
-            for k in 0..n {
+            for k in 0..n_subjects {
                 // bin 1: group 1 entirely unobserved -> untestable
                 g1.push(if bin == 1 { f64::NAN } else { k as f64 });
                 g2.push(k as f64 + 5.0);

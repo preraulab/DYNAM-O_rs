@@ -1,23 +1,11 @@
-//! Top-level DYNAM-O pipeline orchestrators (pure Rust).
+//! Top-level DYNAM-O pipeline helpers (pure Rust).
 //!
-//! Three entry points, in increasing scope:
-//!
-//! 1. [`run_extract_from_spectrogram`] — shortest path: given a pre-computed
-//!    spectrogram (baseline-normalized or raw), run the watershed-merge-trim
-//!    extract pipeline and return `SegmentPeaks` + label image. This is
-//!    what the CLI binary wires up today. Multitaper + baseline + refine
-//!    are the caller's responsibility.
-//!
-//! 2. `run_extract_two_pass` (TODO) — chain pass-1 baseline + extract, then
-//!    pass-2 with mask_spectrogram from pass-1 labels.
-//!
-//! 3. `run_dynamo` (TODO) — full pipeline: EDF → artifacts → multitaper ×2 →
-//!    baseline ×2 → extract ×2 → refine → peak_stage → SO-power/phase →
-//!    histograms. Blocked on DPSS source (Part 5 step 7 note: tapers are
-//!    caller-supplied until we embed DPSS fixtures or a Slepian solver).
-//!
-//! The plumbing for all three is already in separate modules — this file
-//! just assembles them.
+//! * [`run_extract_from_spectrogram`]: given a pre-computed spectrogram
+//!   (baseline-normalized or raw), run the watershed-merge-trim extract
+//!   pipeline and return `SegmentPeaks` plus the label image. Multitaper,
+//!   baseline and refine are the caller's responsibility.
+//! * [`default_extract_params`]: the `runDYNAMO` extraction defaults.
+//! * [`write_stats_csv`]: the per-peak stats table writer.
 
 use crate::extract_pipeline::{extract_tfpeaks, ExtractParams, SegmentPeaks};
 use ndarray::{Array2, ArrayView1, ArrayView2};
@@ -26,9 +14,8 @@ use ndarray::{Array2, ArrayView1, ArrayView2};
 /// applied by the caller if desired). Returns (peaks, full-resolution label
 /// image).
 ///
-/// This wraps `extract_tfpeaks` with a named-output struct for clarity;
-/// the underlying function also takes an optional per-segment progress
-/// callback, omitted here.
+/// Thin wrapper over `extract_tfpeaks` with no baseline, no progress
+/// callback, and no cancel check.
 pub fn run_extract_from_spectrogram(
     spect: ArrayView2<f64>,
     stimes: ArrayView1<f64>,
@@ -62,38 +49,13 @@ pub fn default_extract_params() -> ExtractParams {
     }
 }
 
-/// Write a `SegmentPeaks` to a CSV file, with an optional `#` provenance
-/// preamble (see [`StatsCsvProvenance`]; `None` → bare format-2 layout,
-/// data rows identical either way). Column layout mirrors the MATLAB
-/// `stats_table` (PeakTime, PeakFrequency, Duration, Bandwidth, Height,
-/// Volume, SegmentNum, Area, Peakiness — where Peakiness =
-/// N/(N−1)·(max − mean)/(max − min) of region pixels, unitless in
-/// [0, 1] — bbox_tl_s, bbox_tl_Hz), with two
-/// deliberate omissions from MATLAB's set: the bbox extent columns
-/// `bbox_width_s` / `bbox_height_Hz` are dropped because they are identical
-/// to `Duration` / `Bandwidth` (same `n_pixels * bin size`), so only the
-/// top-left corner of the bounding box is kept. Variable-length columns
-/// (HeightData, Boundaries) are also omitted from CSV.
-///
-/// Three trailing per-peak columns are appended beyond MATLAB's base
-/// `stats_table` so downstream views (the TF-peak scatter) are
-/// self-contained. They mirror exactly what MATLAB `runDYNAMO` appends
-/// in its "additional peak feature properties" block, with the same
-/// column names and order:
-///   * `PeakStage` — `computePeakStage`: interp1(stage_times,
-///     stage_vals, PeakTime, 'previous'); 0 = Unknown, 6 = Artifact.
-///   * `SOpower`   — `computePeakSOpower`: SO-power at PeakTime.
-///   * `SOphase`   — `computePeakSOphase`: SO-phase at PeakTime, rad.
-/// Callers without staging (the bare extract CLI) pass empty slices —
-/// those rows then carry stage `0` and `NaN` SO-power/phase.
 /// Significant-figure precision per stats-CSV column, resolved + validated
 /// against the run's actual `fs` so the caller can never accidentally
-/// serialise a too-coarse value. Build via [`StatsCsvPrecision::resolve`],
-/// which honours the `OutputOpts` knobs and bumps any user override below
+/// serialize a too-coarse value. Build via [`StatsCsvPrecision::resolve`],
+/// which honors the `OutputOpts` knobs and bumps any user override below
 /// its safe minimum with a `log::warn!` per adjustment.
 ///
-/// Every column uses significant figures (decimals-after-the-dot was the
-/// previous mix; the unification is documented in OUTPUT_FORMAT.md §6.2).
+/// Every column uses significant figures (see OUTPUT_FORMAT.md §6.2).
 /// For time columns specifically, the floor is `fs`-derived so a long
 /// recording at high `fs` still resolves sub-sample.
 #[derive(Debug, Clone, Copy)]
@@ -106,19 +68,30 @@ pub struct StatsCsvPrecision {
     pub freq_sigfigs: u8,
     /// Significant figures for the `SOphase` column (radians).
     pub phase_sigfigs: u8,
-    /// Significant figures for each variable-magnitude "other" column.
+    /// Significant figures for the `Height` column.
     pub height_sigfigs: u8,
+    /// Significant figures for the `Volume` column.
     pub volume_sigfigs: u8,
+    /// Significant figures for the `Area` column.
     pub area_sigfigs: u8,
+    /// Significant figures for the `Peakiness` column.
     pub peakiness_sigfigs: u8,
+    /// Significant figures for the `SOpower` column.
     pub sopower_sigfigs: u8,
 }
+
+/// Lowest allowed significant figures for the frequency and phase columns.
+const MIN_FREQ_PHASE_SIGFIGS: u8 = 4;
+/// Lowest allowed significant figures for the variable-magnitude columns
+/// (height, volume, area, peakiness, SO-power).
+const MIN_MAGNITUDE_SIGFIGS: u8 = 3;
 
 impl StatsCsvPrecision {
     /// Build the effective precision for a run. **Never returns a value
     /// that would lose information**: time has an fs-derived floor
-    /// (`time_sigfigs_for_fs(fs)`); every other knob has a flat floor of
-    /// 4 sig figs (~5e-5 relative — orders below any physical noise).
+    /// (`time_sigfigs_for_fs(fs)`). Frequency and phase have a flat floor
+    /// of 4 sig figs (~5e-5 relative, orders below any physical noise), and
+    /// height, volume, area, peakiness and SO-power have a floor of 3.
     /// A user override below its floor is bumped up with a `log::warn!`.
     /// The default path (no overrides at `fs ≤ 100 Hz`) emits no warnings.
     pub fn resolve(
@@ -159,20 +132,20 @@ impl StatsCsvPrecision {
         };
         Self {
             time_sigfigs,
-            freq_sigfigs: bump("csv_freq_sigfigs", freq_sigfigs, 4),
-            phase_sigfigs: bump("csv_phase_sigfigs", phase_sigfigs, 4),
-            height_sigfigs: bump("csv_height_sigfigs", height_sigfigs, 3),
-            volume_sigfigs: bump("csv_volume_sigfigs", volume_sigfigs, 3),
-            area_sigfigs: bump("csv_area_sigfigs", area_sigfigs, 3),
-            peakiness_sigfigs: bump("csv_peakiness_sigfigs", peakiness_sigfigs, 3),
-            sopower_sigfigs: bump("csv_sopower_sigfigs", sopower_sigfigs, 3),
+            freq_sigfigs: bump("csv_freq_sigfigs", freq_sigfigs, MIN_FREQ_PHASE_SIGFIGS),
+            phase_sigfigs: bump("csv_phase_sigfigs", phase_sigfigs, MIN_FREQ_PHASE_SIGFIGS),
+            height_sigfigs: bump("csv_height_sigfigs", height_sigfigs, MIN_MAGNITUDE_SIGFIGS),
+            volume_sigfigs: bump("csv_volume_sigfigs", volume_sigfigs, MIN_MAGNITUDE_SIGFIGS),
+            area_sigfigs: bump("csv_area_sigfigs", area_sigfigs, MIN_MAGNITUDE_SIGFIGS),
+            peakiness_sigfigs: bump("csv_peakiness_sigfigs", peakiness_sigfigs, MIN_MAGNITUDE_SIGFIGS),
+            sopower_sigfigs: bump("csv_sopower_sigfigs", sopower_sigfigs, MIN_MAGNITUDE_SIGFIGS),
         }
     }
 }
 
 impl Default for StatsCsvPrecision {
-    /// Settings-side defaults assuming `fs = 100 Hz` (matches the
-    /// matching defaults in `dynamo_pipeline::OutputOpts`). Used by the
+    /// Settings-side defaults assuming `fs = 100 Hz` (the same values as
+    /// `dynamo_pipeline::OutputOpts`). Used by the
     /// bare CLI bin and tests that don't carry an `OutputOpts` through.
     fn default() -> Self {
         Self {
@@ -190,8 +163,8 @@ impl Default for StatsCsvPrecision {
 
 /// Stats-CSV schema version written by this crate (OUTPUT_FORMAT.md §8.2):
 /// format 3 = the 14-column layout below plus the `#` provenance preamble.
-/// Format 2 was the same columns bare; format 1 was the 16-column layout
-/// with the redundant `bbox_width_s`/`bbox_height_Hz`.
+/// Format 2 is the same columns with no preamble. Format 1 is the
+/// 16-column layout that also carries `bbox_width_s`/`bbox_height_Hz`.
 pub const STATS_CSV_FORMAT: u32 = 3;
 
 /// Caller-supplied half of the stats-CSV provenance stamp
@@ -207,11 +180,34 @@ pub struct StatsCsvProvenance<'a> {
     pub writer_version: &'a str,
     /// Emitted as `# subjectID:` when non-empty.
     pub subject_id: Option<&'a str>,
-    /// Computation-semantics version (`# semantics:` line); emitted when
+    /// Computation-semantics version (`# semantics:` line), emitted when
     /// `Some`. Same number across builds ⇒ comparable numbers.
     pub semantics: Option<u32>,
 }
 
+/// Write a `SegmentPeaks` to a CSV file, with an optional `#` provenance
+/// preamble (see [`StatsCsvProvenance`]). `None` gives the bare format-2
+/// layout, with identical data rows either way. Column layout mirrors the
+/// MATLAB `stats_table` (PeakTime, PeakFrequency, Duration, Bandwidth,
+/// Height, Volume, SegmentNum, Area, Peakiness, bbox_tl_s, bbox_tl_Hz).
+/// Peakiness is N/(N−1)·(max − mean)/(max − min) of the region pixels,
+/// unitless in [0, 1]. Two parts of MATLAB's set are left out. The bbox
+/// extent columns `bbox_width_s` / `bbox_height_Hz` have no column because
+/// they are identical to `Duration` / `Bandwidth` (same `n_pixels * bin
+/// size`), so only the top-left corner of the bounding box is written. The
+/// variable-length columns (HeightData, Boundaries) are not written either.
+///
+/// Three trailing per-peak columns are appended beyond MATLAB's base
+/// `stats_table` so downstream views (the TF-peak scatter) are
+/// self-contained. They mirror exactly what MATLAB `runDYNAMO` appends
+/// in its "additional peak feature properties" block, with the same
+/// column names and order:
+///   * `PeakStage`: `computePeakStage`, interp1(stage_times,
+///     stage_vals, PeakTime, 'previous'). 0 = Unknown, 6 = Artifact.
+///   * `SOpower`: `computePeakSOpower`, SO-power at PeakTime.
+///   * `SOphase`: `computePeakSOphase`, SO-phase at PeakTime, rad.
+/// Callers without staging (the bare extract CLI) pass empty slices.
+/// Those rows then carry stage `0` and `NaN` SO-power/phase.
 pub fn write_stats_csv(
     peaks: &SegmentPeaks,
     peak_sopower: &[f64],
@@ -222,60 +218,61 @@ pub fn write_stats_csv(
     path: &std::path::Path,
 ) -> std::io::Result<()> {
     use std::io::Write;
-    let f = std::fs::File::create(path)?;
-    let mut w = std::io::BufWriter::new(f);
-    // Provenance preamble (format 3). `None` emits the bare format-2 file —
-    // identical data rows, no `#` lines — for callers that manage their own
-    // provenance or need the legacy shape.
-    if let Some(p) = prov {
-        writeln!(w, "# DYNAM-O stats table")?;
-        writeln!(w, "# format: {}", STATS_CSV_FORMAT)?;
-        writeln!(w, "# writer: {}", p.writer)?;
-        writeln!(w, "# writer_version: {}", p.writer_version)?;
-        writeln!(w, "# kernel_version: {}", crate::build_info::VERSION)?;
-        if let Some(sem) = p.semantics {
-            writeln!(w, "# semantics: {}", sem)?;
+    let file = std::fs::File::create(path)?;
+    let mut writer = std::io::BufWriter::new(file);
+    // Provenance preamble (format 3). `None` emits the bare format-2 file
+    // (identical data rows, no `#` lines) for callers that manage their own
+    // provenance or need the format-2 shape.
+    if let Some(provenance) = prov {
+        writeln!(writer, "# DYNAM-O stats table")?;
+        writeln!(writer, "# format: {}", STATS_CSV_FORMAT)?;
+        writeln!(writer, "# writer: {}", provenance.writer)?;
+        writeln!(writer, "# writer_version: {}", provenance.writer_version)?;
+        writeln!(writer, "# kernel_version: {}", crate::build_info::VERSION)?;
+        if let Some(semantics) = provenance.semantics {
+            writeln!(writer, "# semantics: {}", semantics)?;
         }
-        if let Some(sid) = p.subject_id {
-            if !sid.is_empty() {
-                writeln!(w, "# subjectID: {}", sid)?;
+        if let Some(subject_id) = provenance.subject_id {
+            if !subject_id.is_empty() {
+                writeln!(writer, "# subjectID: {}", subject_id)?;
             }
         }
     }
     writeln!(
-        w,
+        writer,
         "PeakTime,PeakFrequency,Duration,Bandwidth,Height,Volume,SegmentNum,Area,Peakiness,bbox_tl_s,bbox_tl_Hz,PeakStage,SOpower,SOphase"
     )?;
     // Every float column rounds to its column-class significant figures.
     // `Display` then picks the shortest round-trippable text so
-    // `1.000000000003638 → 1`. Integer columns stay untouched; NaN / ±∞
+    // `1.000000000003638 → 1`. Integer columns stay untouched. NaN / ±∞
     // pass through.
-    let t  = |v: f64| round_sig(v, prec.time_sigfigs);
-    let fz = |v: f64| round_sig(v, prec.freq_sigfigs);
-    let ph = |v: f64| round_sig(v, prec.phase_sigfigs);
+    let round_time = |v: f64| round_sig(v, prec.time_sigfigs);
+    let round_freq = |v: f64| round_sig(v, prec.freq_sigfigs);
+    let round_phase = |v: f64| round_sig(v, prec.phase_sigfigs);
     for i in 0..peaks.len() {
-        // Only the bounding-box top-left corner is emitted. The bbox extent
-        // (width_s, height_Hz) is byte-for-byte identical to Duration /
-        // Bandwidth (all = n_pixels * bin size; see extract_pipeline), so the
-        // two extent columns were pure duplication and are dropped.
-        let b0 = peaks.bbox[i * 4];
-        let b1 = peaks.bbox[i * 4 + 1];
+        // Only the bounding-box top-left corner is written. The bbox extent
+        // (width_s, height_Hz) equals Duration / Bandwidth (all are
+        // n_pixels * bin size, see extract_pipeline), so it has no column
+        // of its own.
+        let bbox_time_tl = peaks.bbox[i * 4];
+        let bbox_freq_tl = peaks.bbox[i * 4 + 1];
         writeln!(
-            w,
+            writer,
             "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-            t(peaks.peak_time[i]),
-            fz(peaks.peak_freq[i]),
-            t(peaks.duration[i]),
-            fz(peaks.bandwidth[i]),
+            round_time(peaks.peak_time[i]),
+            round_freq(peaks.peak_freq[i]),
+            round_time(peaks.duration[i]),
+            round_freq(peaks.bandwidth[i]),
             round_sig(peaks.height[i], prec.height_sigfigs),
             round_sig(peaks.volume[i], prec.volume_sigfigs),
             peaks.segment_num[i],
             round_sig(peaks.area[i], prec.area_sigfigs),
             round_sig(peaks.peakiness[i], prec.peakiness_sigfigs),
-            t(b0), fz(b1),
+            round_time(bbox_time_tl),
+            round_freq(bbox_freq_tl),
             peak_stage.get(i).copied().unwrap_or(0),
             round_sig(peak_sopower.get(i).copied().unwrap_or(f64::NAN), prec.sopower_sigfigs),
-            ph(peak_sophase.get(i).copied().unwrap_or(f64::NAN)),
+            round_phase(peak_sophase.get(i).copied().unwrap_or(f64::NAN)),
         )?;
     }
     Ok(())
@@ -287,24 +284,26 @@ pub fn write_stats_csv(
 /// PeakTime up to ~1e5 s ≈ 28 h with ~½-sample headroom), clamped to
 /// `[6, 12]`. `fs=10 → 7`, `fs=100 → 8`, `fs=1000 → 9`, `fs=10000 → 10`.
 pub fn time_sigfigs_for_fs(fs: f64) -> u8 {
+    // Invalid fs: fall back to the value for the common 100 Hz case.
+    const FALLBACK_TIME_SIGFIGS: u8 = 8;
     if !fs.is_finite() || fs <= 0.0 {
-        return 8;
+        return FALLBACK_TIME_SIGFIGS;
     }
-    let log = fs.log10().ceil() as i32;
-    (log + 6).clamp(6, 12) as u8
+    let fs_decades = fs.log10().ceil() as i32;
+    (fs_decades + 6).clamp(6, 12) as u8
 }
 
 /// Round an `f64` to `n` significant figures (analogue of C `printf "%.Ng"`).
-/// `1.000000000003638 → 1` at n=6; `0.357365679560… → 0.357366` at n=6;
+/// `1.000000000003638 → 1` at n=6, `0.357365679560… → 0.357366` at n=6,
 /// `4321.39241260… → 4321.39` at n=6. `0` / `NaN` / `±∞` pass through.
 fn round_sig(v: f64, n: u8) -> f64 {
     if v == 0.0 || !v.is_finite() {
         return v;
     }
-    let m = v.abs().log10().floor() as i32;
-    // n sig figs → (n-1) trailing digits relative to leading.
-    let p = 10f64.powi((n as i32 - 1) - m);
-    (v * p).round() / p
+    let leading_exponent = v.abs().log10().floor() as i32;
+    // n sig figs keeps (n - 1) digits after the leading digit.
+    let scale = 10f64.powi((n as i32 - 1) - leading_exponent);
+    (v * scale).round() / scale
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-//! Global permutation testing — port of `gpermtest.m` / `gpermtest2.m`.
+//! Global permutation testing. Port of `gpermtest.m` / `gpermtest2.m`.
 //!
 //! Where [`super::fdr_grid`] controls the *false discovery rate* (the
 //! expected share of flagged bins that are false), this controls the
@@ -14,8 +14,8 @@
 //! the control family-wise rather than per-bin.
 //!
 //! Permutations are drawn from a seeded PRNG so a run is reproducible.
-//! Results are not expected to match MATLAB draw-for-draw — different
-//! generators — only in distribution.
+//! The generator differs from MATLAB's, so results are expected to match
+//! MATLAB in distribution only, not draw-for-draw.
 
 /// MATLAB default global acceptance level.
 /// cbindgen:ignore
@@ -23,6 +23,13 @@ pub const DEFAULT_ALPHA: f64 = 0.05;
 /// MATLAB default permutation count.
 /// cbindgen:ignore
 pub const DEFAULT_ITERATIONS: usize = 10_000;
+
+/// MATLAB's offset added to each candidate bound. It keeps the bound
+/// strictly above the sorted-null column it came from, so that column does
+/// not count itself as an exceedance.
+const BOUND_OFFSET: f64 = 1e-5;
+/// Largest |requested alpha - achieved alpha| accepted without a warning.
+const ALPHA_MISMATCH_TOLERANCE: f64 = 0.01;
 
 /// Outcome of a global permutation test.
 #[derive(Debug, Clone)]
@@ -33,16 +40,17 @@ pub struct PermTest {
     pub acceptance_bounds: Vec<f64>,
     /// Observed `statfcn(g1) - statfcn(g2)`.
     pub true_stat: Vec<f64>,
-    /// Permutations excluded by the final bound — the achieved alpha
-    /// numerator. Compare `n_excluded / iterations` against `alpha`.
+    /// Permutations excluded by the final bound, which is the achieved
+    /// alpha numerator. Compare `n_excluded / iterations` against `alpha`.
     pub n_excluded: usize,
     /// Set when the requested alpha could not be resolved on the
-    /// permutation grid; the caller should surface it.
+    /// permutation grid. The caller should surface it.
     pub warning: Option<String>,
 }
 
-/// xoshiro256++ — small, fast, good enough for label shuffling, and
-/// vendored here so the kernel gains no dependency for one use.
+/// xoshiro256++ generator. Small, fast, good enough for label shuffling,
+/// and vendored here so the kernel gains no dependency for one use. The
+/// four fields are the 256-bit state.
 struct Rng(u64, u64, u64, u64);
 
 impl Rng {
@@ -58,6 +66,7 @@ impl Rng {
         };
         Rng(next(), next(), next(), next())
     }
+    /// Next 64 random bits (the reference xoshiro256++ step).
     fn next_u64(&mut self) -> u64 {
         let r = self.0.wrapping_add(self.3).rotate_left(23).wrapping_add(self.0);
         let t = self.1 << 17;
@@ -80,6 +89,7 @@ impl Rng {
             }
         }
     }
+    /// Fisher-Yates shuffle in place.
     fn shuffle(&mut self, idx: &mut [usize]) {
         for i in (1..idx.len()).rev() {
             let j = self.below((i + 1) as u64) as usize;
@@ -88,8 +98,12 @@ impl Rng {
     }
 }
 
-/// NaN-omitting mean across observations — MATLAB's default `statfcn`,
+/// NaN-omitting mean across observations, MATLAB's default `statfcn`,
 /// `@(x) mean(x, 2, 'omitnan')`.
+///
+/// `data` is row-major `(n_bins, n_obs)`. The mean of each bin is taken over
+/// the observation columns listed in `cols`, skipping non-finite values. A
+/// bin with no finite value yields NaN.
 fn nanmean_rows(data: &[f64], n_bins: usize, cols: &[usize], n_obs: usize) -> Vec<f64> {
     let mut out = vec![f64::NAN; n_bins];
     for (bin, slot) in out.iter_mut().enumerate() {
@@ -109,12 +123,32 @@ fn nanmean_rows(data: &[f64], n_bins: usize, cols: &[usize], n_obs: usize) -> Ve
     out
 }
 
+/// Indices of the observations (columns) that have a finite value in at
+/// least one bin. `data` is row-major `(n_bins, n_obs)`. This is MATLAB's
+/// `g(:, any(~isnan(g)))`.
+fn observed_columns(data: &[f64], n_bins: usize, n_obs: usize) -> Vec<usize> {
+    let mut kept = Vec::new();
+    for c in 0..n_obs {
+        let mut has_finite_value = false;
+        for b in 0..n_bins {
+            if data[b * n_obs + c].is_finite() {
+                has_finite_value = true;
+                break;
+            }
+        }
+        if has_finite_value {
+            kept.push(c);
+        }
+    }
+    kept
+}
+
 /// Global (max-statistic) permutation test over a bin grid.
 ///
 /// `g1` / `g2` are row-major `(n_bins, n_trials)`. Observations that are
 /// entirely NaN across bins are dropped first, as `gpermtest.m` does.
-/// The statistic is fixed to the NaN-omitting mean; MATLAB accepts an
-/// arbitrary `statfcn` handle, which has no clean analogue across an FFI
+/// The statistic is fixed to the NaN-omitting mean. MATLAB accepts an
+/// arbitrary `statfcn` handle, which has no clean analog across an FFI
 /// boundary and is unused by DYNAM-O.
 pub fn gpermtest(
     g1: &[f64],
@@ -139,52 +173,51 @@ pub fn gpermtest(
     let n1 = g1.len() / n_bins;
     let n2 = g2.len() / n_bins;
 
-    // Drop all-NaN observations (MATLAB `g(:, any(~isnan(g)))`).
-    let keep = |data: &[f64], n_obs: usize| -> Vec<usize> {
-        (0..n_obs)
-            .filter(|c| (0..n_bins).any(|b| data[b * n_obs + c].is_finite()))
-            .collect()
-    };
-    let k1 = keep(g1, n1);
-    let k2 = keep(g2, n2);
-    if k1.is_empty() || k2.is_empty() {
+    // Drop observations with no finite value in any bin.
+    let kept1 = observed_columns(g1, n_bins, n1);
+    let kept2 = observed_columns(g2, n_bins, n2);
+    if kept1.is_empty() || kept2.is_empty() {
         return Err("both groups need at least one non-empty observation".into());
     }
 
-    // Pool into one (n_bins, k1+k2) block so permuting is an index shuffle.
-    let n_pool = k1.len() + k2.len();
+    // Pool into one (n_bins, kept1 + kept2) block so permuting is an index
+    // shuffle.
+    let n_pool = kept1.len() + kept2.len();
     let mut pooled = vec![f64::NAN; n_bins * n_pool];
     for b in 0..n_bins {
-        for (i, &c) in k1.iter().enumerate() {
+        for (i, &c) in kept1.iter().enumerate() {
             pooled[b * n_pool + i] = g1[b * n1 + c];
         }
-        for (i, &c) in k2.iter().enumerate() {
-            pooled[b * n_pool + k1.len() + i] = g2[b * n2 + c];
+        for (i, &c) in kept2.iter().enumerate() {
+            pooled[b * n_pool + kept1.len() + i] = g2[b * n2 + c];
         }
     }
 
-    let stat_a = nanmean_rows(g1, n_bins, &k1, n1);
-    let stat_b = nanmean_rows(g2, n_bins, &k2, n2);
+    let stat_a = nanmean_rows(g1, n_bins, &kept1, n1);
+    let stat_b = nanmean_rows(g2, n_bins, &kept2, n2);
     let true_stat: Vec<f64> = stat_a
         .iter()
         .zip(stat_b.iter())
         .map(|(a, b)| a - b)
         .collect();
 
-    // Null: |mean(A) - mean(B)| per bin, over shuffled labels.
+    // Null: |mean(A) - mean(B)| per bin, over shuffled labels. `null_mat`
+    // is row-major (n_bins, iterations).
     let mut rng = Rng::new(seed);
     let mut idx: Vec<usize> = (0..n_pool).collect();
     let mut null_mat = vec![0.0f64; n_bins * iterations];
     for it in 0..iterations {
         rng.shuffle(&mut idx);
-        let a = nanmean_rows(&pooled, n_bins, &idx[..k1.len()], n_pool);
-        let b = nanmean_rows(&pooled, n_bins, &idx[k1.len()..], n_pool);
+        let a = nanmean_rows(&pooled, n_bins, &idx[..kept1.len()], n_pool);
+        let b = nanmean_rows(&pooled, n_bins, &idx[kept1.len()..], n_pool);
         for bin in 0..n_bins {
             null_mat[bin * iterations + it] = (a[bin] - b[bin]).abs();
         }
     }
 
-    // Per-bin sorted null (NaN sorts last so it never becomes a bound).
+    // Per-bin sorted null, ascending. A comparison involving NaN is
+    // reported as Greater, which is meant to place NaN at the end of the
+    // row. That comparator is not a total order when a row contains NaN.
     let mut sorted = null_mat.clone();
     for bin in 0..n_bins {
         let row = &mut sorted[bin * iterations..(bin + 1) * iterations];
@@ -210,32 +243,36 @@ pub fn gpermtest(
             bounds[bin] = sorted[bin * iterations + iterations - 1];
         }
     } else {
-        // Walk down until `numout` permutations have ANY bin at or above
-        // the bound. The 1e-5 offset is MATLAB's: it keeps the bound
-        // strictly above the column it came from so that column does not
-        // count itself as an exceedance.
-        for bin in 0..n_bins {
-            bounds[bin] = sorted[bin * iterations + iterations - 1];
-        }
+        // Walk down the sorted null, one column per pass, until at least
+        // `out_crit` permutations have ANY bin at or above the bound. Here
+        // 1 <= out_crit < iterations, so the first pass always runs and
+        // sets every bound.
         let mut cutoff = iterations as isize - 1;
         while numout < out_crit && cutoff >= 0 {
             for bin in 0..n_bins {
-                bounds[bin] = sorted[bin * iterations + cutoff as usize] + 1e-5;
+                bounds[bin] = sorted[bin * iterations + cutoff as usize] + BOUND_OFFSET;
             }
-            numout = (0..iterations)
-                .filter(|it| {
-                    (0..n_bins).any(|bin| {
-                        let v = null_mat[bin * iterations + it];
-                        v.is_finite() && v >= bounds[bin]
-                    })
-                })
-                .count();
+            // Count the permutations in which any bin reaches its bound.
+            numout = 0;
+            for it in 0..iterations {
+                let mut any_bin_exceeds = false;
+                for bin in 0..n_bins {
+                    let v = null_mat[bin * iterations + it];
+                    if v.is_finite() && v >= bounds[bin] {
+                        any_bin_exceeds = true;
+                        break;
+                    }
+                }
+                if any_bin_exceeds {
+                    numout += 1;
+                }
+            }
             cutoff -= 1;
         }
     }
 
     let achieved = numout as f64 / iterations as f64;
-    if warning.is_none() && (alpha - achieved).abs() > 0.01 {
+    if warning.is_none() && (alpha - achieved).abs() > ALPHA_MISMATCH_TOLERANCE {
         warning = Some(format!(
             "achieved alpha {:.4} differs from requested {:.4} by more than 0.01; \
              increase iterations or de-noise the data",
@@ -276,7 +313,8 @@ mod tests {
 
     #[test]
     fn finds_a_planted_effect_and_leaves_the_rest() {
-        let (n_bins, n) = (6, 24);
+        let n_bins = 6;
+        let n = 24;
         let (g1, g2) = two_groups(n_bins, n, Some(3));
         let r = gpermtest(&g1, &g2, n_bins, 0.05, 2000, 42).unwrap();
         assert!(r.sigbins[3], "planted bin must exceed the global bound");
@@ -285,7 +323,8 @@ mod tests {
 
     #[test]
     fn null_data_yields_no_significant_bins() {
-        let (n_bins, n) = (6, 24);
+        let n_bins = 6;
+        let n = 24;
         let (g1, g2) = two_groups(n_bins, n, None);
         let r = gpermtest(&g1, &g2, n_bins, 0.05, 2000, 7).unwrap();
         assert_eq!(r.sigbins.iter().filter(|s| **s).count(), 0);
@@ -295,7 +334,8 @@ mod tests {
     /// permutations with any bin exceeding it should land near alpha.
     #[test]
     fn achieved_alpha_tracks_the_request() {
-        let (n_bins, n) = (8, 20);
+        let n_bins = 8;
+        let n = 20;
         let (g1, g2) = two_groups(n_bins, n, None);
         let iterations = 4000;
         let r = gpermtest(&g1, &g2, n_bins, 0.05, iterations, 11).unwrap();
@@ -309,7 +349,8 @@ mod tests {
 
     #[test]
     fn is_reproducible_for_a_given_seed() {
-        let (n_bins, n) = (4, 16);
+        let n_bins = 4;
+        let n = 16;
         let (g1, g2) = two_groups(n_bins, n, Some(1));
         let a = gpermtest(&g1, &g2, n_bins, 0.05, 500, 99).unwrap();
         let b = gpermtest(&g1, &g2, n_bins, 0.05, 500, 99).unwrap();
