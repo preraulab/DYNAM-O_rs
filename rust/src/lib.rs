@@ -21,6 +21,7 @@ pub mod extract_pipeline;
 pub mod filter_cache;
 pub mod filter_design;
 pub mod fits;
+pub mod fits_table;
 pub mod histogram;
 pub mod histpeaks;
 pub mod io;
