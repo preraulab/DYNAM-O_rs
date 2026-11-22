@@ -18,12 +18,35 @@
 #define DYNAMO_C_ABI_VERSION 1
 
 /**
+ * Per-mode `[amp/Density, FreqMean, FreqStd, SO*Mean, SO*Std, Theta]` —
+ * the emitted 6-param layout. `amp` (index 0) is unused for containment.
+ */
+#define MODE_FMEAN 1
+
+#define MODE_FSTD 2
+
+#define MODE_SOMEAN 3
+
+#define MODE_SOSTD 4
+
+#define MODE_THETA 5
+
+/**
  * Stats-CSV schema version written by this crate (OUTPUT_FORMAT.md §8.2):
  * format 3 = the 14-column layout below plus the `#` provenance preamble.
  * Format 2 is the same columns with no preamble. Format 1 is the
  * 16-column layout that also carries `bbox_width_s`/`bbox_height_Hz`.
  */
 #define STATS_CSV_FORMAT 3
+
+/**
+ * Footprint radius the density rules use when none is spelled out.
+ * 1.5σ hugs the visually distinct mode core (~67.5% of the mode's
+ * mass), and the NSS footprint sweep showed the Pk property means sit
+ * on a plateau around it (1.3–1.7σ moves them by only a few percent —
+ * the footprint choice mainly scales PkCount).
+ */
+#define DEFAULT_DENSITY_FOOTPRINT_SIGMA 1.5
 
 /**
  * Input descriptor for [`dynamo_extract_tfpeaks`].
