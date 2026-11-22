@@ -98,6 +98,55 @@ pub fn paramfit_rows(
     rows
 }
 
+/// The trailing member-peak columns, in CSV order.
+pub const PK_COLUMNS: [&str; 11] = [
+    "PkCount", "PkFreq", "PkDuration", "PkBandwidth", "PkHeight", "PkPower",
+    "PkVolume", "PkArea", "PkPeakiness", "PkSOpower", "PkSOphase",
+];
+
+/// Column names of a paramfit table on `axis`, in CSV order.
+pub fn table_columns(axis: FitAxis) -> Vec<&'static str> {
+    let mut columns: Vec<&'static str> = match axis {
+        FitAxis::Power => vec![
+            "Density", "FreqMean", "FreqStd", "SOpowerMean", "SOpowerStd", "Theta",
+            "Volume", "PrefPhase", "Coupling",
+        ],
+        FitAxis::Phase => vec![
+            "Density", "FreqMean", "FreqStd", "SOphaseMean", "SOphaseStd", "Theta",
+            "Volume", "SOpowerMean",
+        ],
+    };
+    columns.extend_from_slice(&PK_COLUMNS);
+    columns
+}
+
+/// One row's values in [`table_columns`] order. A mode without member-peak
+/// statistics gets a count of 0 and NaN summaries, as the CSV writes it.
+pub fn row_values(row: &ModeRow, axis: FitAxis) -> Vec<f64> {
+    let mut values = vec![
+        row.density, row.freq_mean, row.freq_std, row.so_mean, row.so_std, row.theta,
+        row.volume,
+    ];
+    match axis {
+        FitAxis::Power => {
+            values.push(row.pref_phase);
+            values.push(row.coupling);
+        }
+        FitAxis::Phase => values.push(row.sopower_mean),
+    }
+    match &row.peaks {
+        Some(p) => values.extend_from_slice(&[
+            p.count as f64, p.freq, p.duration, p.bandwidth, p.height, p.power,
+            p.volume, p.area, p.peakiness, p.sopower, p.sophase,
+        ]),
+        None => {
+            values.push(0.0);
+            values.extend_from_slice(&[f64::NAN; 10]);
+        }
+    }
+    values
+}
+
 /// The peak assignment the `Pk*` columns were computed under on `axis`. The
 /// phase axis always uses a numeric contour, so under the density rules
 /// (background / argmax) it uses [`PEAK_ASSIGN_PHASE_FALLBACK`].

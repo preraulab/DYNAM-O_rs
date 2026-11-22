@@ -1245,6 +1245,223 @@ mod python {
         ))
     }
 
+
+    /// One axis of [`fit_paramfits`], as a dict.
+    #[allow(clippy::too_many_arguments)]
+    fn paramfit_axis_dict<'py>(
+        py: Python<'py>,
+        fit: &Result<super::fits::ParamFitResult, super::fits::FitError>,
+        axis: super::fits_table::FitAxis,
+        freq_bins: &[f64],
+        phase_fit: Option<&super::fits::ParamFitResult>,
+        phase_bins: Option<&[f64]>,
+        sopower_hist: Option<&ndarray::Array2<f64>>,
+        peaks: Option<&super::mode_peaks::PeakProps<'_>>,
+        assign: super::paramfit::opts::PeakAssign,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        use super::fits_table::{
+            compute_mode_peaks, effective_peak_assign, paramfit_rows, row_values, table_columns,
+            FitAxis,
+        };
+        let dict = pyo3::types::PyDict::new_bound(py);
+        let columns = table_columns(axis);
+        dict.set_item("columns", columns.clone())?;
+        let effective = effective_peak_assign(axis, assign);
+        dict.set_item("peak_assign", effective.to_string())?;
+        let fit = match fit {
+            Ok(fit) => fit,
+            Err(e) => {
+                // The fit declined (degenerate input): no modes, and why.
+                dict.set_item("skipped", e.to_string())?;
+                dict.set_item("table", ndarray::Array2::<f64>::zeros((0, columns.len())).into_pyarray_bound(py))?;
+                return Ok(dict);
+            }
+        };
+        dict.set_item("skipped", py.None())?;
+        dict.set_item("params", fit.params.clone().into_pyarray_bound(py))?;
+        dict.set_item("background", ndarray::Array1::from(fit.background.to_vec()).into_pyarray_bound(py))?;
+        dict.set_item("unit_row", fit.unit_row)?;
+        dict.set_item("model", fit.model.clone().into_pyarray_bound(py))?;
+        let gof = pyo3::types::PyDict::new_bound(py);
+        gof.set_item("sse", fit.gof.sse)?;
+        gof.set_item("rsquare", fit.gof.rsquare)?;
+        gof.set_item("adjrsquare", fit.gof.adjrsquare)?;
+        gof.set_item("rmse", fit.gof.rmse)?;
+        gof.set_item("dfe", fit.gof.dfe)?;
+        gof.set_item("dfm", fit.gof.dfm)?;
+        dict.set_item("gof", gof)?;
+
+        let is_phase = axis == FitAxis::Phase;
+        let mode_peaks = peaks.map(|p| compute_mode_peaks(fit, is_phase, p, assign));
+        let rows = paramfit_rows(
+            fit, axis, freq_bins, phase_fit, phase_bins, sopower_hist, mode_peaks.as_deref(),
+        );
+        let mut table = ndarray::Array2::<f64>::zeros((rows.len(), columns.len()));
+        for (r, row) in rows.iter().enumerate() {
+            for (c, value) in row_values(row, axis).into_iter().enumerate() {
+                table[[r, c]] = value;
+            }
+        }
+        dict.set_item("table", table.into_pyarray_bound(py))?;
+        Ok(dict)
+    }
+
+    /// One float column of the `peaks` dict.
+    fn peak_column(peaks: &Bound<'_, pyo3::types::PyDict>, key: &str) -> PyResult<Vec<f64>> {
+        let item = peaks
+            .get_item(key)?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!("peaks is missing '{key}'")))?;
+        let array: PyReadonlyArray1<'_, f64> = item.extract()?;
+        Ok(array.as_array().iter().copied().collect())
+    }
+
+    /// fit_paramfits(sopower_hist, sophase_hist, sopower_bins, sophase_bins,
+    ///               freq_bins, opts_json=None, peaks=None,
+    ///               baseline=None, baseline_freqs=None)
+    /// → dict{"power": axis, "phase": axis}
+    ///
+    /// Both parametric-basis fits of a recording's SOPHs and their paramfit
+    /// tables, exactly as the DesktopApp and CLI compute them. The
+    /// histograms are `(n_so, n_freq)`. `opts_json` is the `paramfit`
+    /// section of a settings file (`{"power": {...}, "phase": {...},
+    /// "peak_assign": ...}`); omitted keys take their defaults.
+    ///
+    /// `peaks`, when given, fills the `Pk*` columns: a dict of 1-D arrays
+    /// over the TF-peaks, keys `freq, duration, bandwidth, height, volume,
+    /// area, peakiness, sopower, sophase` (floats) and `in_hist` (bools,
+    /// the peaks the SOPHs counted). `baseline` / `baseline_freqs` (the
+    /// extraction baseline, linear power) give `PkPower`; without them it
+    /// is NaN.
+    ///
+    /// Each axis dict: `columns` (names), `table` (n_modes x columns),
+    /// `peak_assign` (rule as used on that axis), `skipped` (None, or why
+    /// the fit declined), and for a fit: `params` (n_modes x 6),
+    /// `background` (3,), `unit_row`, `model` (n_so x n_freq), `gof`.
+    #[pyfunction]
+    #[pyo3(signature = (sopower_hist, sophase_hist, sopower_bins, sophase_bins, freq_bins,
+                        opts_json=None, peaks=None, baseline=None, baseline_freqs=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn fit_paramfits<'py>(
+        py: Python<'py>,
+        sopower_hist: PyReadonlyArray2<'py, f64>,
+        sophase_hist: PyReadonlyArray2<'py, f64>,
+        sopower_bins: PyReadonlyArray1<'py, f64>,
+        sophase_bins: PyReadonlyArray1<'py, f64>,
+        freq_bins: PyReadonlyArray1<'py, f64>,
+        opts_json: Option<&str>,
+        peaks: Option<Bound<'py, pyo3::types::PyDict>>,
+        baseline: Option<PyReadonlyArray1<'py, f64>>,
+        baseline_freqs: Option<PyReadonlyArray1<'py, f64>>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        use super::fits_table::FitAxis;
+        let opts: super::paramfit::opts::ParamFitOpts = match opts_json {
+            Some(text) => serde_json::from_str(text)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("opts_json: {e}")))?,
+            None => super::paramfit::opts::ParamFitOpts::default(),
+        };
+        let sopower_bins: Vec<f64> = sopower_bins.as_array().iter().copied().collect();
+        let sophase_bins: Vec<f64> = sophase_bins.as_array().iter().copied().collect();
+        let freq_bins: Vec<f64> = freq_bins.as_array().iter().copied().collect();
+        let sopower_hist = sopower_hist.as_array().to_owned();
+        let sophase_hist = sophase_hist.as_array().to_owned();
+
+        let power_fit = super::fits::fit_paramfit_power(
+            sopower_hist.view(), &sopower_bins, &freq_bins, &opts.power,
+        );
+        let phase_fit = super::fits::fit_paramfit_phase(
+            sophase_hist.view(), &sophase_bins, &freq_bins, &opts.phase,
+        );
+
+        // Peak properties for the Pk* columns, owned here and borrowed below.
+        let mut peak_columns: Option<(Vec<Vec<f64>>, Vec<bool>, Vec<f64>)> = None;
+        if let Some(p) = &peaks {
+            let names = [
+                "freq", "duration", "bandwidth", "height", "volume", "area", "peakiness",
+                "sopower", "sophase",
+            ];
+            let mut columns = Vec::with_capacity(names.len());
+            for name in names {
+                columns.push(peak_column(p, name)?);
+            }
+            let in_hist_item = p
+                .get_item("in_hist")?
+                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("peaks is missing 'in_hist'"))?;
+            let in_hist_array: PyReadonlyArray1<'_, bool> = in_hist_item.extract()?;
+            let in_hist: Vec<bool> = in_hist_array.as_array().iter().copied().collect();
+            let power = match (&baseline, &baseline_freqs) {
+                (Some(b), Some(bf)) => {
+                    let b: Vec<f64> = b.as_array().iter().copied().collect();
+                    let bf: Vec<f64> = bf.as_array().iter().copied().collect();
+                    super::mode_peaks::peak_power_db(&columns[0], &columns[3], &b, &bf)
+                }
+                _ => vec![f64::NAN; columns[0].len()],
+            };
+            peak_columns = Some((columns, in_hist, power));
+        }
+        let peak_props = peak_columns.as_ref().map(|(c, in_hist, power)| super::mode_peaks::PeakProps {
+            freq: &c[0],
+            duration: &c[1],
+            bandwidth: &c[2],
+            height: &c[3],
+            volume: &c[4],
+            area: &c[5],
+            peakiness: &c[6],
+            sopower: &c[7],
+            sophase: &c[8],
+            power,
+            in_hist,
+        });
+
+        let out = pyo3::types::PyDict::new_bound(py);
+        let power_dict = paramfit_axis_dict(
+            py, &power_fit, FitAxis::Power, &freq_bins,
+            phase_fit.as_ref().ok(), Some(&sophase_bins), None,
+            peak_props.as_ref(), opts.peak_assign,
+        )?;
+        let phase_dict = paramfit_axis_dict(
+            py, &phase_fit, FitAxis::Phase, &freq_bins,
+            None, Some(&sopower_bins), Some(&sopower_hist),
+            peak_props.as_ref(), opts.peak_assign,
+        )?;
+        out.set_item("power", power_dict)?;
+        out.set_item("phase", phase_dict)?;
+        Ok(out)
+    }
+
+    /// rebuild_phase_model(modes, background, phase_bins, freq_bins)
+    /// → (n_freq, n_phase) array
+    ///
+    /// Rebuild a phase fit's model surface from its paramfit CSV values
+    /// (`modes` n x 6 with the recorded Density in column 0), matching the
+    /// fit's own model. See `fits::rebuild_phase_model`.
+    #[pyfunction]
+    fn rebuild_phase_model<'py>(
+        py: Python<'py>,
+        modes: PyReadonlyArray2<'py, f64>,
+        background: PyReadonlyArray1<'py, f64>,
+        phase_bins: PyReadonlyArray1<'py, f64>,
+        freq_bins: PyReadonlyArray1<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let modes = modes.as_array();
+        if modes.ncols() != 6 {
+            return Err(pyo3::exceptions::PyValueError::new_err("modes must be n x 6"));
+        }
+        let mut rows: Vec<[f64; 6]> = Vec::with_capacity(modes.nrows());
+        for r in 0..modes.nrows() {
+            let mut row = [0.0; 6];
+            for c in 0..6 {
+                row[c] = modes[[r, c]];
+            }
+            rows.push(row);
+        }
+        let phase_bins: Vec<f64> = phase_bins.as_array().iter().copied().collect();
+        let freq_bins: Vec<f64> = freq_bins.as_array().iter().copied().collect();
+        let surface = super::fits::rebuild_phase_model(
+            &rows, bg3("background", background)?, &phase_bins, &freq_bins,
+        );
+        Ok(surface.into_pyarray_bound(py))
+    }
+
     #[pymodule]
     fn dynamo_rs(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(merge_segment, m)?)?;
@@ -1272,6 +1489,8 @@ mod python {
         m.add_function(wrap_pyfunction!(fit_rotgauss, m)?)?;
         m.add_function(wrap_pyfunction!(fit_vmgauss, m)?)?;
         m.add_function(wrap_pyfunction!(fit_tensor_product_spline, m)?)?;
+        m.add_function(wrap_pyfunction!(fit_paramfits, m)?)?;
+        m.add_function(wrap_pyfunction!(rebuild_phase_model, m)?)?;
         m.add_function(wrap_pyfunction!(build_info_py, m)?)?;
         m.add_function(wrap_pyfunction!(fdr_grid, m)?)?;
         m.add_function(wrap_pyfunction!(fdr_adjust, m)?)?;
