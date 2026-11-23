@@ -109,6 +109,32 @@ pub fn segment_peaks_from_stats(inp: &RebuildInputs) -> SegmentPeaks {
     }
 }
 
+/// Collapse a per-sample artifact bool mask into `[start_s, end_s]`
+/// runs. `end_s` is exclusive (the time of the first non-artifact
+/// sample after the run), matching how the summary plot draws spans.
+pub fn artifact_mask_to_spans(mask: &[bool], fs: f64) -> Vec<[f64; 2]> {
+    let mut spans: Vec<[f64; 2]> = Vec::new();
+    if fs <= 0.0 {
+        return spans;
+    }
+    let mut run_start: Option<usize> = None;
+    for (i, &is_art) in mask.iter().enumerate() {
+        match (is_art, run_start) {
+            (true, None) => run_start = Some(i),
+            (false, Some(start)) => {
+                spans.push([start as f64 / fs, i as f64 / fs]);
+                run_start = None;
+            }
+            _ => {}
+        }
+    }
+    // A run still open at the end of the mask closes at the mask length.
+    if let Some(start) = run_start {
+        spans.push([start as f64 / fs, mask.len() as f64 / fs]);
+    }
+    spans
+}
+
 /// Expand `[start_s, end_s]` artifact runs to a per-sample bool mask of
 /// length `n` at sample rate `fs`. Inverse of `artifact_mask_to_spans`
 /// in `dynamo-export`. The summary figure reads a per-sample mask.

@@ -1661,6 +1661,15 @@ mod python {
         )?;
         dict.set_item("stage_times", arr1(py, &out.stage_times))?;
         dict.set_item("stage_vals", arr1(py, &out.stage_vals))?;
+        // Artifact runs as [start_s, end_s] (end exclusive), as the
+        // auxiliary-data file stores them.
+        let spans = super::run::rebuild::artifact_mask_to_spans(&out.artifacts, out.fs);
+        let mut span_array = ndarray::Array2::<f64>::zeros((spans.len(), 2));
+        for (row, span) in spans.iter().enumerate() {
+            span_array[[row, 0]] = span[0];
+            span_array[[row, 1]] = span[1];
+        }
+        dict.set_item("artifact_spans", span_array.into_pyarray_bound(py))?;
 
         // Per-peak columns, named as the stats CSV names them.
         let peaks = pyo3::types::PyDict::new_bound(py);
@@ -1772,6 +1781,52 @@ mod python {
         splinefit.set_item("phase", splinefit_dict(py, out.splinefit_phase.as_ref())?)?;
         dict.set_item("splinefit", splinefit)?;
         dict.set_item("semantics", super::run::settings_schema::SEMANTICS_VERSION)?;
+        Ok(dict)
+    }
+
+    /// fit_splinefits(sopower_hist, sophase_hist, sopower_bins, sophase_bins,
+    ///                freq_bins, settings_json=None)
+    /// → dict{"power": dict|None, "phase": dict|None, "skipped": dict}
+    ///
+    /// Both spline-basis fits of a recording's SOPHs (`(n_so, n_freq)`), as
+    /// the DYNAM-O app fits them, with the `splinefit` options of
+    /// `settings_json` (the settings file's `settings` section). Each fit
+    /// is a dict of `coefs`, `splinefit`, `knots_x_aug`, `knots_y_aug`,
+    /// `fit_so_bins`, `fit_freq_bins`; `skipped` maps a declined axis to
+    /// the reason.
+    #[pyfunction]
+    #[pyo3(signature = (sopower_hist, sophase_hist, sopower_bins, sophase_bins, freq_bins,
+                        settings_json=None))]
+    fn fit_splinefits<'py>(
+        py: Python<'py>,
+        sopower_hist: PyReadonlyArray2<'py, f64>,
+        sophase_hist: PyReadonlyArray2<'py, f64>,
+        sopower_bins: PyReadonlyArray1<'py, f64>,
+        sophase_bins: PyReadonlyArray1<'py, f64>,
+        freq_bins: PyReadonlyArray1<'py, f64>,
+        settings_json: Option<&str>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let settings = parse_settings(settings_json)?;
+        let sopower_bins: Vec<f64> = sopower_bins.as_array().iter().copied().collect();
+        let sophase_bins: Vec<f64> = sophase_bins.as_array().iter().copied().collect();
+        let freq_bins: Vec<f64> = freq_bins.as_array().iter().copied().collect();
+        let power = super::fits::splinefit_power_or_nan(
+            sopower_hist.as_array(), &sopower_bins, &freq_bins, &settings.splinefit.power,
+        );
+        let phase = super::fits::splinefit_phase_or_nan(
+            sophase_hist.as_array(), &sophase_bins, &freq_bins, &settings.splinefit.phase,
+        );
+        let dict = pyo3::types::PyDict::new_bound(py);
+        let skipped = pyo3::types::PyDict::new_bound(py);
+        if let Err(e) = &power {
+            skipped.set_item("power", e.to_string())?;
+        }
+        if let Err(e) = &phase {
+            skipped.set_item("phase", e.to_string())?;
+        }
+        dict.set_item("power", splinefit_dict(py, power.as_ref().ok())?)?;
+        dict.set_item("phase", splinefit_dict(py, phase.as_ref().ok())?)?;
+        dict.set_item("skipped", skipped)?;
         Ok(dict)
     }
 
@@ -1887,6 +1942,7 @@ mod python {
         m.add_function(wrap_pyfunction!(load_recording, m)?)?;
         m.add_function(wrap_pyfunction!(run_dynamo, m)?)?;
         m.add_function(wrap_pyfunction!(write_stats_csv, m)?)?;
+        m.add_function(wrap_pyfunction!(fit_splinefits, m)?)?;
         m.add("SEMANTICS_VERSION", super::run::settings_schema::SEMANTICS_VERSION)?;
         m.add_function(wrap_pyfunction!(build_info_py, m)?)?;
         m.add_function(wrap_pyfunction!(fdr_grid, m)?)?;

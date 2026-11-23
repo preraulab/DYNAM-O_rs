@@ -1528,6 +1528,36 @@ fn max_pairwise_overlap(
     worst
 }
 
+/// The SO-power splinefit as a run makes it: a SOPH with no finite value
+/// (a channel that is all artifact) gets [`nan_splinefit_result`] on the
+/// full grid instead of a fit, so its outputs exist and read as "no data".
+pub fn splinefit_power_or_nan(
+    sopower_hist: ArrayView2<f64>,
+    so_bins: &[f64],
+    freq_bins: &[f64],
+    opts: &crate::paramfit::opts::SplinePowerOpts,
+) -> Result<SplineFitResult, FitError> {
+    let n_finite = sopower_hist.iter().filter(|v| v.is_finite()).count();
+    if n_finite == 0 {
+        return Ok(nan_splinefit_result(so_bins, freq_bins, opts.num_knots_x, opts.num_knots_y));
+    }
+    fit_splinefit_power(sopower_hist, so_bins, freq_bins, opts)
+}
+
+/// The SO-phase splinefit as a run makes it (see [`splinefit_power_or_nan`]).
+pub fn splinefit_phase_or_nan(
+    sophase_hist: ArrayView2<f64>,
+    phase_bins: &[f64],
+    freq_bins: &[f64],
+    opts: &crate::paramfit::opts::SplinePhaseOpts,
+) -> Result<SplineFitResult, FitError> {
+    let n_finite = sophase_hist.iter().filter(|v| v.is_finite()).count();
+    if n_finite == 0 {
+        return Ok(nan_splinefit_result(phase_bins, freq_bins, opts.num_knots_x, opts.num_knots_y));
+    }
+    fit_splinefit_phase(sophase_hist, phase_bins, freq_bins, opts)
+}
+
 /// Tensor-product B-spline LSQ fit on the SO-power histogram.
 /// Mirrors `spline_basis.m('power')` — SO/freq windows and knot counts
 /// come from `opts` (MATLAB `spline_basis_opts('power')`); order 4 with

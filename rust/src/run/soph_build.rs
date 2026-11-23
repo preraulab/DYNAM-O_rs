@@ -434,15 +434,9 @@ pub(crate) fn build_soph_outputs(
         let spline_pw = &inp.settings.splinefit.power;
         let spline_ph = &inp.settings.splinefit.phase;
         let sop_finite = sopower_hist.iter().filter(|v| v.is_finite()).count();
-        let spline_power_fit = if sop_finite == 0 {
-            Some(crate::fits::nan_splinefit_result(
-                &sopower_bin_centers,
-                &hist_freq_centers,
-                spline_pw.num_knots_x,
-                spline_pw.num_knots_y,
-            ))
-        } else {
-            match crate::fits::fit_splinefit_power(
+        // No finite value (an all-artifact channel) gives a NaN result.
+        let spline_power_fit = {
+            match crate::fits::splinefit_power_or_nan(
                 sopower_hist.view(),
                 &sopower_bin_centers,
                 &hist_freq_centers,
@@ -468,15 +462,9 @@ pub(crate) fn build_soph_outputs(
             }
         };
         let sph_finite = sophase_hist.iter().filter(|v| v.is_finite()).count();
-        let spline_phase_fit = if sph_finite == 0 {
-            Some(crate::fits::nan_splinefit_result(
-                &sophase_bin_centers,
-                &hist_freq_centers,
-                spline_ph.num_knots_x,
-                spline_ph.num_knots_y,
-            ))
-        } else {
-            match crate::fits::fit_splinefit_phase(
+        // No finite value (an all-artifact channel) gives a NaN result.
+        let spline_phase_fit = {
+            match crate::fits::splinefit_phase_or_nan(
                 sophase_hist.view(),
                 &sophase_bin_centers,
                 &hist_freq_centers,
