@@ -99,6 +99,59 @@ pub enum PtileUsed {
     Pair(f64, f64),
 }
 
+/// SO-power on the EEG sample grid, as MATLAB `computeSOpower.m` builds it
+/// with `retain_Fs` (lines 200-204): linear interpolation through the
+/// finite window values only (so windows that are NaN, from artifact
+/// overlap or outlier rejection, are bridged), held flat from the first
+/// EEG time to the first finite window and from the last finite window to
+/// the last EEG time, then NaN at every excluded EEG sample.
+///
+/// `so_power_norm` / `so_power_times` are the window series (absolute
+/// times), `eeg_times` the EEG sample times and `isexcluded` the
+/// per-sample artifact mask (same length as `eeg_times`). Returns `None`
+/// when no window value is finite.
+pub fn upsample_to_eeg_rate(
+    so_power_norm: &[f64],
+    so_power_times: &[f64],
+    eeg_times: &[f64],
+    isexcluded: &[bool],
+) -> Option<Vec<f64>> {
+    // Window samples with a finite value, and their times.
+    let mut valid_vals: Vec<f64> = Vec::new();
+    let mut valid_times: Vec<f64> = Vec::new();
+    for i in 0..so_power_norm.len() {
+        if so_power_norm[i].is_finite() {
+            valid_vals.push(so_power_norm[i]);
+            valid_times.push(so_power_times[i]);
+        }
+    }
+    if valid_vals.is_empty() || eeg_times.is_empty() {
+        return None;
+    }
+
+    // Pad with the first and last EEG times so the interpolation holds
+    // flat outside the valid range (MATLAB pads the same way).
+    let first_eeg_time = eeg_times[0];
+    let last_eeg_time = eeg_times[eeg_times.len() - 1];
+    let mut padded_times = Vec::with_capacity(valid_times.len() + 2);
+    let mut padded_vals = Vec::with_capacity(valid_vals.len() + 2);
+    padded_times.push(first_eeg_time);
+    padded_vals.push(valid_vals[0]);
+    padded_times.extend_from_slice(&valid_times);
+    padded_vals.extend_from_slice(&valid_vals);
+    padded_times.push(last_eeg_time);
+    padded_vals.push(valid_vals[valid_vals.len() - 1]);
+
+    let mut upsampled = interp_linear_padded(&padded_times, &padded_vals, eeg_times);
+    // NaN only at the excluded EEG samples themselves.
+    for (value, &excluded) in upsampled.iter_mut().zip(isexcluded.iter()) {
+        if excluded {
+            *value = f64::NAN;
+        }
+    }
+    Some(upsampled)
+}
+
 /// Compute the SO-power time series from a pre-computed multitaper spectrogram
 /// over the SO band.
 ///
@@ -277,45 +330,18 @@ pub fn so_power_from_spectrogram(
 
     // Step: upsample to EEG rate if requested. pydynamo:148-164.
     if retain_fs {
-        // Coarse-grid samples with a finite value, and their times.
-        let mut valid_vals: Vec<f64> = Vec::new();
-        let mut valid_times: Vec<f64> = Vec::new();
-        for i in 0..so_power_norm.len() {
-            if so_power_norm[i].is_finite() {
-                valid_vals.push(so_power_norm[i]);
-                valid_times.push(so_power_times[i]);
+        let upsampled = match upsample_to_eeg_rate(&so_power_norm, &so_power_times, eeg_times, isexcluded) {
+            Some(values) => values,
+            None => {
+                // Nothing valid → stay at the downsampled grid.
+                return Ok(SoPowerOut {
+                    so_power_norm,
+                    so_power_times,
+                    so_power_stages,
+                    ptile: ptile_used,
+                });
             }
-        }
-
-        if valid_vals.is_empty() {
-            // Nothing valid → stay at the downsampled grid.
-            return Ok(SoPowerOut {
-                so_power_norm,
-                so_power_times,
-                so_power_stages,
-                ptile: ptile_used,
-            });
-        }
-        // Pad endpoints with eeg_times[0]/eeg_times[-1] so interp holds flat
-        // outside the valid range (matches pydynamo's xp/fp pad trick).
-        let last_eeg_time = *eeg_times.last().unwrap();
-        let mut padded_times = Vec::with_capacity(valid_times.len() + 2);
-        let mut padded_vals = Vec::with_capacity(valid_vals.len() + 2);
-        padded_times.push(t0);
-        padded_vals.push(valid_vals[0]);
-        padded_times.extend_from_slice(&valid_times);
-        padded_vals.extend_from_slice(&valid_vals);
-        padded_times.push(last_eeg_time);
-        padded_vals.push(*valid_vals.last().unwrap());
-
-        let mut upsampled = interp_linear_padded(&padded_times, &padded_vals, eeg_times);
-        // Match MATLAB/Python: interpolate through finite coarse-grid values,
-        // then restore NaNs only at the original excluded EEG samples.
-        for (v, &ex) in upsampled.iter_mut().zip(isexcluded.iter()) {
-            if ex {
-                *v = f64::NAN;
-            }
-        }
+        };
         so_power_norm = upsampled;
         so_power_times = eeg_times.to_vec();
 
