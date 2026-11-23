@@ -152,7 +152,16 @@ rust/
     mts.rs                # thin wrapper around `multitaper_rs` crate
     signal.rs             # sosfiltfilt, hilbert, unwrap, movmean
     paramfit/             # rotGauss + vmGauss LM fits — the front ends'
-                          #   "paramfit" / parametric-basis columns
+                          #   "paramfit" / parametric-basis columns;
+                          #   paramfit/opts.rs = the fit options (settings schema)
+    fits.rs               # parametric-basis + spline fits of a SOPH: seeding,
+                          #   iterative mode loop, model selection, phase rebuild
+    mode_peaks.rs         # TF-peak to mode assignment + per-mode Pk* statistics
+    fits_table.rs         # per-mode rows of a paramfit table (Volume, PrefPhase,
+                          #   Coupling, SOpowerMean, Pk*), what the CSV holds
+    run/                  # the end-to-end run: settings + semantics version,
+                          #   orchestrator, SOPH build, resampler, cache rebuild
+                          #   (what the DYNAM-O app and pydynamo both call)
     spline_basis.rs       # tensor-product B-spline fit ("splinefit")
     filter_cache.rs       # SOphase SOS cache (.npy) + cheby1 fallback
     filter_design.rs      # cheby1_sos (ported from scipy.signal.cheby1)

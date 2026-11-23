@@ -18,12 +18,86 @@
 #define DYNAMO_C_ABI_VERSION 1
 
 /**
+ * Per-mode `[amp/Density, FreqMean, FreqStd, SO*Mean, SO*Std, Theta]` —
+ * the emitted 6-param layout. `amp` (index 0) is unused for containment.
+ */
+#define MODE_FMEAN 1
+
+#define MODE_FSTD 2
+
+#define MODE_SOMEAN 3
+
+#define MODE_SOSTD 4
+
+#define MODE_THETA 5
+
+/**
  * Stats-CSV schema version written by this crate (OUTPUT_FORMAT.md §8.2):
  * format 3 = the 14-column layout below plus the `#` provenance preamble.
  * Format 2 is the same columns with no preamble. Format 1 is the
  * 16-column layout that also carries `bbox_width_s`/`bbox_height_Hz`.
  */
 #define STATS_CSV_FORMAT 3
+
+/**
+ * The computation-semantics version. Bumped when either:
+ *
+ * 1. a settings field keeps its name, type and position but changes
+ *    what its value means (the original trigger — these entries carry
+ *    a real migration), or
+ * 2. **any change alters the numbers the pipeline computes** from the
+ *    same inputs and settings — a numeric bugfix, a changed constant,
+ *    a reworked algorithm. These get a NO-OP migration (precedent:
+ *    v2→v3 is log-only) whose `summary` line IS the numeric-changelog
+ *    entry.
+ *
+ * Because every artifact stamps this number (`# semantics:`,
+ * dynamo-export `stamp.rs`), it is what lets `check-results` /
+ * `validate` say whether an existing tree's numbers still match
+ * current code: builds whose shas differ but whose semantics match are
+ * numerically comparable (the commits between are UI or tooling).
+ * **A numeric change that ships without a bump silently breaks that
+ * verdict** — when in doubt, bump.
+ *
+ * Shape changes are caught by [`fingerprint`] and alone must NOT bump
+ * this.
+ *
+ * | value | date       | what changed |
+ * |-------|------------|--------------|
+ * | 1     | (pre-2026-08-03) | original convention |
+ * | 2     | 2026-08-03 | paramfit Gaussian widths became true standard deviations. `paramfit.{power,phase}.mode_bounds.fstd_*` and `paramfit.power.mode_bounds.pstd_*` are now σ, previously `√2·σ`. `paramfit.phase.mode_bounds.pstd_*` (recikappa) is unchanged. A v1 file's width bounds are `√2` too wide if read as v2. |
+ * | 3     | 2026-08-03 | `constrain_freq_center` / `constrain_power_center` now constrain to the VALID (non-NaN) data inside the fit window, not to the window itself, matching MATLAB `param_basis_*.m`. The field names, types and values are unchanged, but the region they describe is narrower wherever `hist.min_time_in_bin` emptied SO-power bins, so the same v2 file yields different fits under v3. Also affects the derived (`null`) value of the new `mode_bounds.{fmean,pmean}_*` slots. |
+ * | 4     | 2026-09-11 | `paramfit.peak_assign_prob` was absorbed into the flexible `paramfit.peak_assign`, whose default is argmax within a 1.5σ footprint (serialized `"argmax 1.5 sigma"`) — so an ABSENT key changed meaning (it used to mean a 0.95 probability contour). Migration pins a pre-v4 file to its old meaning: the stored `peak_assign_prob` (or 0.95 when absent) becomes `peak_assign: "<x> p"` and the retired key is removed. (The footprint default was fixed at 1.5σ on 2026-09-12, the day after v4 landed, before any tree outside local test data ran under bare argmax.) |
+ * | 5     | 2026-10-13 | The per-mode `Pk*` peak-property columns aggregate by MEDIAN instead of mean (`PkSOphase` stays a circular mean, `PkCount` a count): the per-peak size properties are heavy-tailed and a mean is dominated by a few giant tail events — on the NSS two-night cohort the mean costs all night-to-night subject reliability (PkVolume r ≈ 0.0 mean vs ≈ 0.8 median). Also adds `PkPower` (median per-peak `pow2db(Height × baseline(PeakFrequency))`, absolute power re-anchored to the extraction baseline, which phase-1 now persists in aux h5). No settings value changes shape or meaning; the migration is a changelog no-op. |
+ * | 6     | 2026-11-16 | Per-peak `SOphase` is interpolated from the UNWRAPPED SO-phase series and wrapped afterwards (MATLAB `computePeakSOphase.m`). It was interpolated from the wrapped series, so a peak whose two neighboring EEG samples straddle ±π received an arbitrary phase in (−π, π) instead of one near ±π: ~0.7% of peaks on the Twin test cohort, which carved a ~3% trough into every SO-phase histogram bin covering ±π. Changes the stats-table `SOphase` column for those peaks, the SO-phase SOPH, and everything fit to it. No settings value changes shape or meaning; the migration is a changelog no-op. |
+ * | 7     | 2026-11-17 | Per-peak `PeakStage`, `SOpower`, and `SOphase` come from the kernel's `assign_peak_*`, which follow MATLAB `computePeakStage.m` / `computePeakSOpower.m` / `computePeakSOphase.m` exactly. The artifact override (stage 6) now tests the EEG sample NEAREST the peak time, as MATLAB's `interp1(..., 'nearest')` does. It tested the sample at or before the peak time, which shifted every artifact span half a sample late, so a peak in the half-sample before an artifact onset was not labeled 6 and a peak in the half-sample after an artifact end was. The SO-power and SO-phase lookups gain MATLAB's one-grid-step endpoint pad (a peak up to one step outside the series takes the end value instead of NaN), which no peak reaches while `sopower.retain_fs` is true. Changes `PeakStage` for peaks within half a sample of an artifact-span edge, and with it the SOPH membership of those peaks. No settings value changes shape or meaning; the migration is a changelog no-op. |
+ * | 8     | 2026-11-17 | Artifact detection matches MATLAB `detect_artifacts.m` in two places where it did not. (1) The slope-test mask is folded into the bad-sample set BEFORE the high-frequency and broadband tests, so slope-flagged samples are interpolated out of the filtered signal and left out of the z-score statistics. It was OR-ed onto the finished band mask, which computed the band thresholds from data MATLAB excludes. (2) The 2 s envelope smoothing and 300 s detrend use MATLAB's alignment for even-length `movmean` / `movmedian` windows (samples `i - k/2` to `i + k/2 - 1`). They sat one sample later, which shifted every band-detected artifact span by one sample. On the Twin test cohort the artifact mask differed from MATLAB's at 0.07% to 1.6% of each recording and now differs at 0 or 1 sample. The mask feeds the baseline, SO-power, SO-phase, `PeakStage`, and the surviving peak set, so every downstream number can change. No settings value changes shape or meaning; the migration is a changelog no-op. |
+ * | 9     | 2026-11-17 | TF-peak extraction follows the pure-MATLAB code (`runWatershed.m`, `mergeWshedSegment.m`, `mergeRegions.m`) in four places where it did not. (1) After a merge, a region whose only remaining neighbor is the merged region is absorbed into it. (2) Merging continues only while the heaviest edge is strictly above `detection.merge_thresh`. An edge exactly at the threshold used to merge. (3) Watershed regions are renumbered by `bwlabel` order (first pixel going down the columns) before the merge, and each merge keeps the label MATLAB keeps, which decides the order equal-weight edges merge in and which region owns a shared border pixel. (4) Equal-weight edges merge in MATLAB's edge-table order. On the Twin test cohort the per-segment extraction went from 27% of MATLAB's peaks reproduced exactly to all of them. A recording keeps about 93% of its peaks within 0.1 s and 0.5 Hz, loses 1.5% to 1.9% of its peak count, and most surviving peaks move slightly in every property. The SOPH mode-peak finder that seeds the parametric fit keeps its own merge procedure and is unchanged. No settings value changes shape or meaning; the migration is a changelog no-op. |
+ * | 10    | 2026-11-17 | Peak-frequency refinement interpolates the event spectrum with a not-a-knot cubic spline, as MATLAB `interp1(..., 'spline')` in `refinePeakFrequency.m` does. It used a natural spline (second derivative forced to zero at both ends of the frequency axis). The two agree away from the ends, so only peaks whose bounding box reaches the bottom or top of the analyzed band move: about 0.1% of peaks on the Twin test cohort, by up to 0.23 Hz, and a handful of peaks per recording change sides of the edge-peak removal. Given the same samples, event times, and bounding boxes, the refined frequency now equals MATLAB's for every event. No settings value changes shape or meaning; the migration is a changelog no-op. |
+ * | 11    | 2026-11-17 | The peak BoundingBox is the exact extent of the region's pixels: its corner sits half a bin before the center of the first pixel on each axis (it sat on that center), so the box ends half a bin after the center of the last pixel. `bbox_tl_s` moves half a time bin earlier and `bbox_tl_Hz` half a frequency bin lower for every peak, and width and height are unchanged. The box is the frequency window the refinement searches, so the window moves down by half a bin (0.049 Hz at the defaults): about 1% more peaks survive the edge-peak removal on the Twin test cohort, and a few change refined frequency. MATLAB's corner was a full bin high and is fixed to the same extent in the MATLAB toolbox. No settings value changes shape or meaning; the migration is a changelog no-op. |
+ * | 12    | 2026-11-17 | The pass-2 mask zeros each pass-1 region's traced contour, as MATLAB `maskSpectrogram` does with the `bwtraceboundary` borders from `trimWshedRegions.m`. It zeroed every region pixel with a differently labeled neighbor in any of the 8 directions, which also removed pixels touching the outside only at a corner: about 5% of all region pixels on the Twin test cohort. With those pixels kept, pass 2 finds more and slightly larger peaks: the final peak count rises 2.4% to 3.0%, about 92% to 93% of peaks keep a partner within 0.1 s and 0.5 Hz, and the SOPHs correlate with their previous versions at 0.997 (SO-power) and 0.962 to 0.976 (SO-phase). The masked spectrogram now equals MATLAB's pixel for pixel. No settings value changes shape or meaning; the migration is a changelog no-op. |
+ * | 13    | 2026-11-17 | Zero-phase filtering follows MATLAB `filtfilt`: each second-order section is run forward and backward on its own odd-reflected extension of `3 x filter order` samples, before the next section starts. It ran all sections forward and then all backward on one extension of `6 x sections + 3` samples (the scipy `sosfiltfilt` procedure). The two agree away from the ends of a recording and differ inside the filter's start-up transient, which for the narrow slow-oscillation band lasts minutes: the filtered slow-oscillation signal differed from MATLAB's by several times its RMS in the first and last 10 s, and SO-phase differed by more than 0.01 rad at 1% to 5% of samples. It now equals MATLAB's to 1e-10 of RMS, and SO-phase to 1e-7 rad. Effect on outputs is small because the ends of a night are mostly wake: SO-phase SOPHs correlate with their previous versions at 0.999 or better, and peaks, artifact masks, and SO-power are unchanged or change by a handful of samples. No settings value changes shape or meaning; the migration is a changelog no-op. |
+ * | 14    | 2026-11-17 | The minimum TF-peak height is computed from the chi² quantile for any number of tapers, as MATLAB `computeTFPeaks.m` does: `-2 x pow2db(2K / chi2inv(0.975, 2K))`. It was a stored constant for 3 tapers and no floor at all for any other count, so a run with `mtm.n_tapers` other than 3 kept every low peak that MATLAB removes. The stored 3-taper quantile was also off in the 8th digit (14.449374448 against MATLAB's 14.449375335), which moves the default floor by 5e-7 dB: no peak changes on the three Twin test nights. Runs at the default 3 tapers are unchanged. Runs at another taper count now lose the peaks below the floor. No settings value changes shape or meaning; the migration is a changelog no-op. |
+ * | 15    | 2026-11-17 | `PrefPhase` and `Coupling` in the power paramfit CSV are NaN for a mode whose `FreqMean` lies outside the phase fit's frequency window. The phase model is zero there, so the argmax returned the first SO-phase bin with a coupling of 0, a value that reads as real. Only reachable when the power and phase fits use different frequency windows, or a frequency row is invalid for the phase fit only. Every other value is unchanged. No settings value changes shape or meaning; the migration is a changelog no-op. |
+ * | 16    | 2026-11-19 | The TF-peak region labels found on the downsampled segment are resized to full resolution exactly as MATLAB `imresize(..., 'nearest')` does (kernel `resize_labels_nn`, DYNAM-O_rs #39). A full-resolution column that falls halfway between two downsampled columns was rounded half to even. `imresize` settles it by its own floating-point arithmetic, so for a 571-column segment (30 s at the default 0.05 s step) column 286 read a different downsampled column than in MATLAB, and regions touching it entered the trim with a few more or fewer pixels. On the three Twin test nights 2 of 136,238 peaks move (by at most 0.028 s and 0.007 Hz), no peak is added or removed, and every paramfit value is unchanged. No settings value changes shape or meaning; the migration is a changelog no-op. |
+ *
+ * A value changing meaning without changing its name or type is a rare
+ * and deliberate act; entries land here only when the same file would
+ * yield different outputs under new code. The read path stays
+ * regardless: a few hundred existing files are v1, and the conversion
+ * from `√2·σ` to `σ` has to remain available or those files become
+ * unmigratable. Freezing the table is not a reason to delete the field.
+ */
+#define SEMANTICS_VERSION 16
+
+/**
+ * Footprint radius the density rules use when none is spelled out.
+ * 1.5σ hugs the visually distinct mode core (~67.5% of the mode's
+ * mass), and the NSS footprint sweep showed the Pk property means sit
+ * on a plateau around it (1.3–1.7σ moves them by only a few percent —
+ * the footprint choice mainly scales PkCount).
+ */
+#define DEFAULT_DENSITY_FOOTPRINT_SIGMA 1.5
 
 /**
  * Input descriptor for [`dynamo_extract_tfpeaks`].

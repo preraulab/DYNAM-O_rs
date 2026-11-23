@@ -17,7 +17,8 @@
 //! The MATLAB-side `fit_rotGauss.m` / `fit_vmGauss.m` `reshape(B0, 1, [])`
 //! flattening (column-major over an Nx6 matrix) produces this exact layout.
 //!
-//! [`defaults`] holds the default bounds on the mode shape parameters.
+//! [`defaults`] holds the default bounds on the mode shape parameters, and
+//! [`opts`] the fit options as a settings file spells them.
 //!
 //! [`bounded_lm`] is a port of scipy's trust-region-reflective solver, the
 //! same algorithm MATLAB's `lsqcurvefit` uses by default.
@@ -26,6 +27,7 @@ pub mod rot_gauss;
 pub mod vm_gauss;
 pub mod bounded_lm;
 pub mod defaults;
+pub mod opts;
 
 use ndarray::Array2;
 

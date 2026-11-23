@@ -20,6 +20,8 @@ pub mod c_api;
 pub mod extract_pipeline;
 pub mod filter_cache;
 pub mod filter_design;
+pub mod fits;
+pub mod fits_table;
 pub mod histogram;
 pub mod histpeaks;
 pub mod io;
@@ -27,10 +29,12 @@ pub mod mask;
 pub mod matlab_watershed;
 pub mod mts;
 pub mod merge;
+pub mod mode_peaks;
 pub mod parallel;
 pub mod peak_assign;
 pub mod pipeline;
 pub mod refine;
+pub mod run;
 pub mod signal;
 pub mod paramfit;
 pub mod so_phase;
@@ -1242,6 +1246,668 @@ mod python {
         ))
     }
 
+
+    /// One axis of [`fit_paramfits`], as a dict.
+    #[allow(clippy::too_many_arguments)]
+    fn paramfit_axis_dict<'py>(
+        py: Python<'py>,
+        fit: Result<&super::fits::ParamFitResult, String>,
+        axis: super::fits_table::FitAxis,
+        freq_bins: &[f64],
+        phase_fit: Option<&super::fits::ParamFitResult>,
+        phase_bins: Option<&[f64]>,
+        sopower_hist: Option<&ndarray::Array2<f64>>,
+        peaks: Option<&super::mode_peaks::PeakProps<'_>>,
+        assign: super::paramfit::opts::PeakAssign,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        use super::fits_table::{
+            compute_mode_peaks, effective_peak_assign, paramfit_rows, row_values, table_columns,
+            FitAxis,
+        };
+        let dict = pyo3::types::PyDict::new_bound(py);
+        let columns = table_columns(axis);
+        dict.set_item("columns", columns.clone())?;
+        let effective = effective_peak_assign(axis, assign);
+        dict.set_item("peak_assign", effective.to_string())?;
+        let fit = match fit {
+            Ok(fit) => fit,
+            Err(reason) => {
+                // The fit declined (degenerate input) or was not run: no
+                // modes, and why.
+                dict.set_item("skipped", reason)?;
+                dict.set_item("table", ndarray::Array2::<f64>::zeros((0, columns.len())).into_pyarray_bound(py))?;
+                return Ok(dict);
+            }
+        };
+        dict.set_item("skipped", py.None())?;
+        dict.set_item("params", fit.params.clone().into_pyarray_bound(py))?;
+        dict.set_item("background", ndarray::Array1::from(fit.background.to_vec()).into_pyarray_bound(py))?;
+        dict.set_item("unit_row", fit.unit_row)?;
+        dict.set_item("model", fit.model.clone().into_pyarray_bound(py))?;
+        let gof = pyo3::types::PyDict::new_bound(py);
+        gof.set_item("sse", fit.gof.sse)?;
+        gof.set_item("rsquare", fit.gof.rsquare)?;
+        gof.set_item("adjrsquare", fit.gof.adjrsquare)?;
+        gof.set_item("rmse", fit.gof.rmse)?;
+        gof.set_item("dfe", fit.gof.dfe)?;
+        gof.set_item("dfm", fit.gof.dfm)?;
+        dict.set_item("gof", gof)?;
+
+        let is_phase = axis == FitAxis::Phase;
+        let mode_peaks = peaks.map(|p| compute_mode_peaks(fit, is_phase, p, assign));
+        let rows = paramfit_rows(
+            fit, axis, freq_bins, phase_fit, phase_bins, sopower_hist, mode_peaks.as_deref(),
+        );
+        let mut table = ndarray::Array2::<f64>::zeros((rows.len(), columns.len()));
+        for (r, row) in rows.iter().enumerate() {
+            for (c, value) in row_values(row, axis).into_iter().enumerate() {
+                table[[r, c]] = value;
+            }
+        }
+        dict.set_item("table", table.into_pyarray_bound(py))?;
+        Ok(dict)
+    }
+
+    /// One float column of the `peaks` dict.
+    fn peak_column(peaks: &Bound<'_, pyo3::types::PyDict>, key: &str) -> PyResult<Vec<f64>> {
+        let item = peaks
+            .get_item(key)?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!("peaks is missing '{key}'")))?;
+        let array: PyReadonlyArray1<'_, f64> = item.extract()?;
+        Ok(array.as_array().iter().copied().collect())
+    }
+
+    /// fit_paramfits(sopower_hist, sophase_hist, sopower_bins, sophase_bins,
+    ///               freq_bins, opts_json=None, peaks=None,
+    ///               baseline=None, baseline_freqs=None)
+    /// → dict{"power": axis, "phase": axis}
+    ///
+    /// Both parametric-basis fits of a recording's SOPHs and their paramfit
+    /// tables, exactly as the DesktopApp and CLI compute them. The
+    /// histograms are `(n_so, n_freq)`. `opts_json` is the `paramfit`
+    /// section of a settings file (`{"power": {...}, "phase": {...},
+    /// "peak_assign": ...}`); omitted keys take their defaults.
+    ///
+    /// `peaks`, when given, fills the `Pk*` columns: a dict of 1-D arrays
+    /// over the TF-peaks, keys `freq, duration, bandwidth, height, volume,
+    /// area, peakiness, sopower, sophase` (floats) and `in_hist` (bools,
+    /// the peaks the SOPHs counted). `baseline` / `baseline_freqs` (the
+    /// extraction baseline, linear power) give `PkPower`; without them it
+    /// is NaN.
+    ///
+    /// Each axis dict: `columns` (names), `table` (n_modes x columns),
+    /// `peak_assign` (rule as used on that axis), `skipped` (None, or why
+    /// the fit declined), and for a fit: `params` (n_modes x 6),
+    /// `background` (3,), `unit_row`, `model` (n_so x n_freq), `gof`.
+    #[pyfunction]
+    #[pyo3(signature = (sopower_hist, sophase_hist, sopower_bins, sophase_bins, freq_bins,
+                        opts_json=None, peaks=None, baseline=None, baseline_freqs=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn fit_paramfits<'py>(
+        py: Python<'py>,
+        sopower_hist: PyReadonlyArray2<'py, f64>,
+        sophase_hist: PyReadonlyArray2<'py, f64>,
+        sopower_bins: PyReadonlyArray1<'py, f64>,
+        sophase_bins: PyReadonlyArray1<'py, f64>,
+        freq_bins: PyReadonlyArray1<'py, f64>,
+        opts_json: Option<&str>,
+        peaks: Option<Bound<'py, pyo3::types::PyDict>>,
+        baseline: Option<PyReadonlyArray1<'py, f64>>,
+        baseline_freqs: Option<PyReadonlyArray1<'py, f64>>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        use super::fits_table::FitAxis;
+        let opts: super::paramfit::opts::ParamFitOpts = match opts_json {
+            Some(text) => serde_json::from_str(text)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("opts_json: {e}")))?,
+            None => super::paramfit::opts::ParamFitOpts::default(),
+        };
+        let sopower_bins: Vec<f64> = sopower_bins.as_array().iter().copied().collect();
+        let sophase_bins: Vec<f64> = sophase_bins.as_array().iter().copied().collect();
+        let freq_bins: Vec<f64> = freq_bins.as_array().iter().copied().collect();
+        let sopower_hist = sopower_hist.as_array().to_owned();
+        let sophase_hist = sophase_hist.as_array().to_owned();
+
+        let power_fit = super::fits::fit_paramfit_power(
+            sopower_hist.view(), &sopower_bins, &freq_bins, &opts.power,
+        );
+        let phase_fit = super::fits::fit_paramfit_phase(
+            sophase_hist.view(), &sophase_bins, &freq_bins, &opts.phase,
+        );
+
+        // Peak properties for the Pk* columns, owned here and borrowed below.
+        let mut peak_columns: Option<(Vec<Vec<f64>>, Vec<bool>, Vec<f64>)> = None;
+        if let Some(p) = &peaks {
+            let names = [
+                "freq", "duration", "bandwidth", "height", "volume", "area", "peakiness",
+                "sopower", "sophase",
+            ];
+            let mut columns = Vec::with_capacity(names.len());
+            for name in names {
+                columns.push(peak_column(p, name)?);
+            }
+            let in_hist_item = p
+                .get_item("in_hist")?
+                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("peaks is missing 'in_hist'"))?;
+            let in_hist_array: PyReadonlyArray1<'_, bool> = in_hist_item.extract()?;
+            let in_hist: Vec<bool> = in_hist_array.as_array().iter().copied().collect();
+            let power = match (&baseline, &baseline_freqs) {
+                (Some(b), Some(bf)) => {
+                    let b: Vec<f64> = b.as_array().iter().copied().collect();
+                    let bf: Vec<f64> = bf.as_array().iter().copied().collect();
+                    super::mode_peaks::peak_power_db(&columns[0], &columns[3], &b, &bf)
+                }
+                _ => vec![f64::NAN; columns[0].len()],
+            };
+            peak_columns = Some((columns, in_hist, power));
+        }
+        let peak_props = peak_columns.as_ref().map(|(c, in_hist, power)| super::mode_peaks::PeakProps {
+            freq: &c[0],
+            duration: &c[1],
+            bandwidth: &c[2],
+            height: &c[3],
+            volume: &c[4],
+            area: &c[5],
+            peakiness: &c[6],
+            sopower: &c[7],
+            sophase: &c[8],
+            power,
+            in_hist,
+        });
+
+        let out = pyo3::types::PyDict::new_bound(py);
+        let power_dict = paramfit_axis_dict(
+            py, power_fit.as_ref().map_err(|e| e.to_string()), FitAxis::Power, &freq_bins,
+            phase_fit.as_ref().ok(), Some(&sophase_bins), None,
+            peak_props.as_ref(), opts.peak_assign,
+        )?;
+        let phase_dict = paramfit_axis_dict(
+            py, phase_fit.as_ref().map_err(|e| e.to_string()), FitAxis::Phase, &freq_bins,
+            None, Some(&sopower_bins), Some(&sopower_hist),
+            peak_props.as_ref(), opts.peak_assign,
+        )?;
+        out.set_item("power", power_dict)?;
+        out.set_item("phase", phase_dict)?;
+        Ok(out)
+    }
+
+    /// rebuild_phase_model(modes, background, phase_bins, freq_bins)
+    /// → (n_freq, n_phase) array
+    ///
+    /// Rebuild a phase fit's model surface from its paramfit CSV values
+    /// (`modes` n x 6 with the recorded Density in column 0), matching the
+    /// fit's own model. See `fits::rebuild_phase_model`.
+    #[pyfunction]
+    fn rebuild_phase_model<'py>(
+        py: Python<'py>,
+        modes: PyReadonlyArray2<'py, f64>,
+        background: PyReadonlyArray1<'py, f64>,
+        phase_bins: PyReadonlyArray1<'py, f64>,
+        freq_bins: PyReadonlyArray1<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let modes = modes.as_array();
+        if modes.ncols() != 6 {
+            return Err(pyo3::exceptions::PyValueError::new_err("modes must be n x 6"));
+        }
+        let mut rows: Vec<[f64; 6]> = Vec::with_capacity(modes.nrows());
+        for r in 0..modes.nrows() {
+            let mut row = [0.0; 6];
+            for c in 0..6 {
+                row[c] = modes[[r, c]];
+            }
+            rows.push(row);
+        }
+        let phase_bins: Vec<f64> = phase_bins.as_array().iter().copied().collect();
+        let freq_bins: Vec<f64> = freq_bins.as_array().iter().copied().collect();
+        let surface = super::fits::rebuild_phase_model(
+            &rows, bg3("background", background)?, &phase_bins, &freq_bins,
+        );
+        Ok(surface.into_pyarray_bound(py))
+    }
+
+
+    /// Convert a run error for Python: invalid inputs raise
+    /// ValueError, anything else RuntimeError.
+    fn run_error(e: super::run::DynamoError) -> PyErr {
+        match e {
+            super::run::DynamoError::Invalid(_) => {
+                pyo3::exceptions::PyValueError::new_err(e.to_string())
+            }
+            _ => pyo3::exceptions::PyRuntimeError::new_err(e.to_string()),
+        }
+    }
+
+    /// The `settings` section of a settings file, parsed with defaults for
+    /// every key it omits (as the DYNAM-O app parses it).
+    fn parse_settings(settings_json: Option<&str>) -> PyResult<super::run::DynamoSettings> {
+        match settings_json {
+            Some(text) => serde_json::from_str(text).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("settings_json: {e}"))
+            }),
+            None => Ok(super::run::DynamoSettings::default()),
+        }
+    }
+
+    /// default_settings() → str
+    ///
+    /// The default `settings` section of a DYNAM-O settings file, as JSON.
+    #[pyfunction]
+    fn default_settings() -> PyResult<String> {
+        serde_json::to_string(&super::run::DynamoSettings::default())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// migrate_settings(settings_json, from_version) → (settings_json, log)
+    ///
+    /// Bring the `settings` section of a settings file written under an
+    /// older semantics version up to this kernel's
+    /// (`SEMANTICS_VERSION`), with one log line per step. The same
+    /// migrations `dynamo-cli migrate-settings` applies.
+    #[pyfunction]
+    fn migrate_settings(settings_json: &str, from_version: u32) -> PyResult<(String, Vec<String>)> {
+        let mut value: serde_json::Value = serde_json::from_str(settings_json)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("settings_json: {e}")))?;
+        let log = super::run::settings_schema::migrate(&mut value, from_version);
+        let text = serde_json::to_string(&value)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok((text, log))
+    }
+
+    /// load_recording(edf_path, channel, staging_path=None, references=None,
+    ///                time_col=1, stage_col=2, header_lines=0,
+    ///                delimiter=",", epoch_dur=30.0, stage_labels=None)
+    /// → dict{data, fs, stage_times, stage_vals}
+    ///
+    /// One channel of an EDF plus its staging, exactly as the DYNAM-O app
+    /// loads a recording: channel expressions and references
+    /// (`mean(C3, C4)`, `C3-A2`, `REF = ...`), staging clock times aligned
+    /// to the EDF recording start, and an all-N2 hypnogram when there is no
+    /// staging file. `stage_labels` is seven alias lists in the order
+    /// `[artifact, wake, REM, N1, N2, N3, unknown]` (the settings file's
+    /// `stage_labels`); empty uses the reader's built-in table.
+    #[pyfunction]
+    #[pyo3(signature = (edf_path, channel, staging_path=None, references=None, time_col=1,
+                        stage_col=2, header_lines=0, delimiter=",", epoch_dur=30.0,
+                        stage_labels=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn load_recording<'py>(
+        py: Python<'py>,
+        edf_path: &str,
+        channel: &str,
+        staging_path: Option<&str>,
+        references: Option<Vec<String>>,
+        time_col: usize,
+        stage_col: usize,
+        header_lines: usize,
+        delimiter: &str,
+        epoch_dur: f64,
+        stage_labels: Option<Vec<Vec<String>>>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let references = references.unwrap_or_default();
+        let stage_labels = stage_labels.unwrap_or_default();
+        let staging = staging_path.map(std::path::Path::new);
+        let (data, fs, stage_times, stage_vals) = super::run::load::load_edf_bundle(
+            std::path::Path::new(edf_path), staging, channel, &references, time_col, stage_col,
+            header_lines, delimiter, epoch_dur, &stage_labels,
+        )
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.0))?;
+        let dict = pyo3::types::PyDict::new_bound(py);
+        dict.set_item("data", ndarray::Array1::from(data).into_pyarray_bound(py))?;
+        dict.set_item("fs", fs)?;
+        dict.set_item("stage_times", ndarray::Array1::from(stage_times).into_pyarray_bound(py))?;
+        dict.set_item("stage_vals", ndarray::Array1::from(stage_vals).into_pyarray_bound(py))?;
+        Ok(dict)
+    }
+
+    /// A 1-D float array from a Vec.
+    fn arr1<'py>(py: Python<'py>, values: &[f64]) -> Bound<'py, numpy::PyArray1<f64>> {
+        ndarray::Array1::from(values.to_vec()).into_pyarray_bound(py)
+    }
+
+    /// One axis's splinefit as a dict, or None.
+    fn splinefit_dict<'py>(
+        py: Python<'py>,
+        fit: Option<&super::fits::SplineFitResult>,
+    ) -> PyResult<PyObject> {
+        let Some(fit) = fit else {
+            return Ok(py.None());
+        };
+        let dict = pyo3::types::PyDict::new_bound(py);
+        dict.set_item("coefs", fit.coefs.clone().into_pyarray_bound(py))?;
+        dict.set_item("splinefit", fit.splinefit.clone().into_pyarray_bound(py))?;
+        dict.set_item("knots_x_aug", arr1(py, &fit.knots_x_aug))?;
+        dict.set_item("knots_y_aug", arr1(py, &fit.knots_y_aug))?;
+        dict.set_item("fit_so_bins", arr1(py, &fit.fit_so_bins))?;
+        dict.set_item("fit_freq_bins", arr1(py, &fit.fit_freq_bins))?;
+        Ok(dict.into_any().unbind())
+    }
+
+    /// run_dynamo(data, fs, stage_times, stage_vals, settings_json=None,
+    ///            time_range=None, keep_spectrogram=False, progress=None)
+    /// → dict
+    ///
+    /// The whole DYNAM-O run of one recording, the code the DYNAM-O app
+    /// and CLI run (`run::run_dynamo`), so the numbers are the same.
+    /// `settings_json` is the `settings` section of a settings file
+    /// (omitted keys take their defaults). `progress`, when given, is
+    /// called as `progress(stage, fraction)`.
+    ///
+    /// Returns: `fs` (the rate the run used, after any resampling),
+    /// `t_time_range`, `artifacts`, `stage_times`, `stage_vals`, `peaks`
+    /// (dict of per-peak columns: PeakTime, PeakFrequency, Duration,
+    /// Bandwidth, Height, Volume, SegmentNum, Area, Peakiness, bbox_tl_s,
+    /// bbox_tl_Hz, PeakStage, SOpower, SOphase), `peak_in_hist`,
+    /// `baseline`, `baseline_freqs`, `so_power_norm`, `so_power_times`,
+    /// `so_power_norm_native`, `so_power_native_t_start`,
+    /// `so_phase_unwrapped`, `so_phase_times`, `sopower_hist` and
+    /// `sophase_hist` (n_so x n_freq), `freq_bins`, `sopower_bins`,
+    /// `sophase_bins`, `summary_spectrogram` (+ `summary_sfreqs`,
+    /// `summary_stimes`), `spectrogram` (+ `spect_sfreqs`,
+    /// `spect_stimes`; empty unless `keep_spectrogram`), `paramfit`
+    /// (`{"power": axis, "phase": axis}` as [`fit_paramfits`] returns),
+    /// `splinefit` (`{"power": dict|None, "phase": dict|None}`),
+    /// `semantics` (the computation-semantics version).
+    #[pyfunction]
+    #[pyo3(signature = (data, fs, stage_times, stage_vals, settings_json=None, time_range=None,
+                        keep_spectrogram=false, progress=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn run_dynamo<'py>(
+        py: Python<'py>,
+        data: PyReadonlyArray1<'py, f64>,
+        fs: f64,
+        stage_times: PyReadonlyArray1<'py, f64>,
+        stage_vals: PyReadonlyArray1<'py, f64>,
+        settings_json: Option<&str>,
+        time_range: Option<(f64, f64)>,
+        keep_spectrogram: bool,
+        progress: Option<PyObject>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        use super::fits_table::FitAxis;
+        let settings = parse_settings(settings_json)?;
+        let data: Vec<f64> = data.as_array().iter().copied().collect();
+        let stage_times: Vec<f64> = stage_times.as_array().iter().copied().collect();
+        let stage_vals: Vec<f64> = stage_vals.as_array().iter().copied().collect();
+
+        let out = if keep_spectrogram {
+            super::run::run_dynamo_keeping_spectrogram(
+                &data, fs, &stage_times, &stage_vals, time_range, &settings,
+            )
+        } else {
+            // The progress callback runs on the run's own thread; it takes
+            // the GIL to call back into Python and ignores any error there.
+            let report = |stage: &str, fraction: f64| {
+                if let Some(callback) = &progress {
+                    Python::with_gil(|py| {
+                        let _ = callback.call1(py, (stage, fraction));
+                    });
+                }
+            };
+            let progress_fn: Option<&super::run::ProgressFn<'_>> = match progress {
+                Some(_) => Some(&report),
+                None => None,
+            };
+            super::run::run_dynamo_with_progress(
+                &data, fs, &stage_times, &stage_vals, time_range, &settings, progress_fn, None,
+                None,
+            )
+        }
+        .map_err(run_error)?;
+
+        let dict = pyo3::types::PyDict::new_bound(py);
+        dict.set_item("fs", out.fs)?;
+        dict.set_item("t_time_range", arr1(py, &out.t_time_range))?;
+        dict.set_item(
+            "artifacts",
+            ndarray::Array1::from(out.artifacts.clone()).into_pyarray_bound(py),
+        )?;
+        dict.set_item("stage_times", arr1(py, &out.stage_times))?;
+        dict.set_item("stage_vals", arr1(py, &out.stage_vals))?;
+        // Artifact runs as [start_s, end_s] (end exclusive), as the
+        // auxiliary-data file stores them.
+        let spans = super::run::rebuild::artifact_mask_to_spans(&out.artifacts, out.fs);
+        let mut span_array = ndarray::Array2::<f64>::zeros((spans.len(), 2));
+        for (row, span) in spans.iter().enumerate() {
+            span_array[[row, 0]] = span[0];
+            span_array[[row, 1]] = span[1];
+        }
+        dict.set_item("artifact_spans", span_array.into_pyarray_bound(py))?;
+
+        // Per-peak columns, named as the stats CSV names them.
+        let peaks = pyo3::types::PyDict::new_bound(py);
+        let stats = &out.stats;
+        let n_peaks = stats.len();
+        let mut bbox_tl_s = Vec::with_capacity(n_peaks);
+        let mut bbox_tl_hz = Vec::with_capacity(n_peaks);
+        for i in 0..n_peaks {
+            bbox_tl_s.push(stats.bbox[4 * i]);
+            bbox_tl_hz.push(stats.bbox[4 * i + 1]);
+        }
+        let mut peak_stage = Vec::with_capacity(n_peaks);
+        for &stage in out.peak_stage.iter() {
+            peak_stage.push(stage as f64);
+        }
+        peaks.set_item("PeakTime", arr1(py, &stats.peak_time))?;
+        peaks.set_item("PeakFrequency", arr1(py, &stats.peak_freq))?;
+        peaks.set_item("Duration", arr1(py, &stats.duration))?;
+        peaks.set_item("Bandwidth", arr1(py, &stats.bandwidth))?;
+        peaks.set_item("Height", arr1(py, &stats.height))?;
+        peaks.set_item("Volume", arr1(py, &stats.volume))?;
+        peaks.set_item("SegmentNum", arr1(py, &stats.segment_num))?;
+        peaks.set_item("Area", arr1(py, &stats.area))?;
+        peaks.set_item("Peakiness", arr1(py, &stats.peakiness))?;
+        peaks.set_item("bbox_tl_s", arr1(py, &bbox_tl_s))?;
+        peaks.set_item("bbox_tl_Hz", arr1(py, &bbox_tl_hz))?;
+        peaks.set_item("PeakStage", arr1(py, &peak_stage))?;
+        peaks.set_item("SOpower", arr1(py, &out.peak_sopower))?;
+        peaks.set_item("SOphase", arr1(py, &out.peak_sophase))?;
+        dict.set_item("peaks", peaks)?;
+        dict.set_item(
+            "peak_in_hist",
+            ndarray::Array1::from(out.peak_in_hist.clone()).into_pyarray_bound(py),
+        )?;
+
+        dict.set_item("baseline", out.baseline.clone().into_pyarray_bound(py))?;
+        dict.set_item("baseline_freqs", arr1(py, &out.baseline_freqs))?;
+        dict.set_item("so_power_norm", arr1(py, &out.so_power_norm))?;
+        dict.set_item("so_power_times", arr1(py, &out.so_power_times))?;
+        dict.set_item("so_power_norm_native", arr1(py, &out.so_power_norm_native))?;
+        dict.set_item("so_power_native_t_start", out.so_power_native_t_start)?;
+        dict.set_item("so_phase_unwrapped", arr1(py, &out.so_phase_unwrapped))?;
+        dict.set_item("so_phase_times", arr1(py, &out.so_phase_times))?;
+        dict.set_item("sopower_hist", out.sopower_hist.clone().into_pyarray_bound(py))?;
+        dict.set_item("sophase_hist", out.sophase_hist.clone().into_pyarray_bound(py))?;
+        dict.set_item("freq_bins", arr1(py, &out.hist_freq_centers))?;
+        dict.set_item("sopower_bins", arr1(py, &out.sopower_bin_centers))?;
+        dict.set_item("sophase_bins", arr1(py, &out.sophase_bin_centers))?;
+        dict.set_item("summary_spectrogram", out.summary_spectrogram.clone().into_pyarray_bound(py))?;
+        dict.set_item("summary_sfreqs", arr1(py, &out.summary_sfreqs))?;
+        dict.set_item("summary_stimes", arr1(py, &out.summary_stimes))?;
+        dict.set_item("spectrogram", out.spectrogram.clone().into_pyarray_bound(py))?;
+        dict.set_item("spect_sfreqs", arr1(py, &out.spect_sfreqs))?;
+        dict.set_item("spect_stimes", arr1(py, &out.spect_stimes))?;
+
+        // Paramfit tables, with the Pk* columns over the peaks the SOPHs
+        // counted, as the app's CSV writer computes them.
+        let peak_power = super::mode_peaks::peak_power_db(
+            &stats.peak_freq,
+            &stats.height,
+            out.baseline.as_slice().unwrap_or(&[]),
+            &out.baseline_freqs,
+        );
+        let peak_props = super::mode_peaks::PeakProps {
+            freq: &stats.peak_freq,
+            duration: &stats.duration,
+            bandwidth: &stats.bandwidth,
+            height: &stats.height,
+            volume: &stats.volume,
+            area: &stats.area,
+            peakiness: &stats.peakiness,
+            sopower: &out.peak_sopower,
+            sophase: &out.peak_sophase,
+            power: &peak_power,
+            in_hist: &out.peak_in_hist,
+        };
+        let not_run = "not computed (paramfits are turned off)".to_string();
+        let power_fit = match (&out.paramfit_power, &out.paramfit_power_skipped) {
+            (Some(fit), _) => Ok(fit),
+            (None, Some(reason)) => Err(reason.clone()),
+            (None, None) => Err(not_run.clone()),
+        };
+        let phase_fit = match (&out.paramfit_phase, &out.paramfit_phase_skipped) {
+            (Some(fit), _) => Ok(fit),
+            (None, Some(reason)) => Err(reason.clone()),
+            (None, None) => Err(not_run),
+        };
+        let paramfit = pyo3::types::PyDict::new_bound(py);
+        paramfit.set_item(
+            "power",
+            paramfit_axis_dict(
+                py, power_fit, FitAxis::Power, &out.hist_freq_centers,
+                out.paramfit_phase.as_ref(), Some(&out.sophase_bin_centers), None,
+                Some(&peak_props), settings.paramfit.peak_assign,
+            )?,
+        )?;
+        paramfit.set_item(
+            "phase",
+            paramfit_axis_dict(
+                py, phase_fit, FitAxis::Phase, &out.hist_freq_centers,
+                None, Some(&out.sopower_bin_centers), Some(&out.sopower_hist),
+                Some(&peak_props), settings.paramfit.peak_assign,
+            )?,
+        )?;
+        dict.set_item("paramfit", paramfit)?;
+
+        let splinefit = pyo3::types::PyDict::new_bound(py);
+        splinefit.set_item("power", splinefit_dict(py, out.splinefit_power.as_ref())?)?;
+        splinefit.set_item("phase", splinefit_dict(py, out.splinefit_phase.as_ref())?)?;
+        dict.set_item("splinefit", splinefit)?;
+        dict.set_item("semantics", super::run::settings_schema::SEMANTICS_VERSION)?;
+        Ok(dict)
+    }
+
+    /// fit_splinefits(sopower_hist, sophase_hist, sopower_bins, sophase_bins,
+    ///                freq_bins, settings_json=None)
+    /// → dict{"power": dict|None, "phase": dict|None, "skipped": dict}
+    ///
+    /// Both spline-basis fits of a recording's SOPHs (`(n_so, n_freq)`), as
+    /// the DYNAM-O app fits them, with the `splinefit` options of
+    /// `settings_json` (the settings file's `settings` section). Each fit
+    /// is a dict of `coefs`, `splinefit`, `knots_x_aug`, `knots_y_aug`,
+    /// `fit_so_bins`, `fit_freq_bins`; `skipped` maps a declined axis to
+    /// the reason.
+    #[pyfunction]
+    #[pyo3(signature = (sopower_hist, sophase_hist, sopower_bins, sophase_bins, freq_bins,
+                        settings_json=None))]
+    fn fit_splinefits<'py>(
+        py: Python<'py>,
+        sopower_hist: PyReadonlyArray2<'py, f64>,
+        sophase_hist: PyReadonlyArray2<'py, f64>,
+        sopower_bins: PyReadonlyArray1<'py, f64>,
+        sophase_bins: PyReadonlyArray1<'py, f64>,
+        freq_bins: PyReadonlyArray1<'py, f64>,
+        settings_json: Option<&str>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let settings = parse_settings(settings_json)?;
+        let sopower_bins: Vec<f64> = sopower_bins.as_array().iter().copied().collect();
+        let sophase_bins: Vec<f64> = sophase_bins.as_array().iter().copied().collect();
+        let freq_bins: Vec<f64> = freq_bins.as_array().iter().copied().collect();
+        let power = super::fits::splinefit_power_or_nan(
+            sopower_hist.as_array(), &sopower_bins, &freq_bins, &settings.splinefit.power,
+        );
+        let phase = super::fits::splinefit_phase_or_nan(
+            sophase_hist.as_array(), &sophase_bins, &freq_bins, &settings.splinefit.phase,
+        );
+        let dict = pyo3::types::PyDict::new_bound(py);
+        let skipped = pyo3::types::PyDict::new_bound(py);
+        if let Err(e) = &power {
+            skipped.set_item("power", e.to_string())?;
+        }
+        if let Err(e) = &phase {
+            skipped.set_item("phase", e.to_string())?;
+        }
+        dict.set_item("power", splinefit_dict(py, power.as_ref().ok())?)?;
+        dict.set_item("phase", splinefit_dict(py, phase.as_ref().ok())?)?;
+        dict.set_item("skipped", skipped)?;
+        Ok(dict)
+    }
+
+    /// write_stats_csv(path, peaks, fs, settings_json=None, writer="pydynamo",
+    ///                 writer_version="", subject_id="")
+    ///
+    /// Write the stats table of a run (the `peaks` dict `run_dynamo`
+    /// returns, with the run's `fs`) with the kernel's writer, the one the
+    /// DYNAM-O app uses: same columns, precision rules and preamble,
+    /// including the `# semantics:` line.
+    #[pyfunction]
+    #[pyo3(signature = (path, peaks, fs, settings_json=None, writer="pydynamo",
+                        writer_version="", subject_id=""))]
+    #[allow(clippy::too_many_arguments)]
+    fn write_stats_csv(
+        path: &str,
+        peaks: Bound<'_, pyo3::types::PyDict>,
+        fs: f64,
+        settings_json: Option<&str>,
+        writer: &str,
+        writer_version: &str,
+        subject_id: &str,
+    ) -> PyResult<()> {
+        let settings = parse_settings(settings_json)?;
+        let column = |name: &str| peak_column(&peaks, name);
+        let peak_time = column("PeakTime")?;
+        let duration = column("Duration")?;
+        let bandwidth = column("Bandwidth")?;
+        let bbox_tl_s = column("bbox_tl_s")?;
+        let bbox_tl_hz = column("bbox_tl_Hz")?;
+        let mut bbox = Vec::with_capacity(4 * peak_time.len());
+        for i in 0..peak_time.len() {
+            bbox.extend_from_slice(&[bbox_tl_s[i], bbox_tl_hz[i], duration[i], bandwidth[i]]);
+        }
+        let mut peak_stage = Vec::with_capacity(peak_time.len());
+        for stage in column("PeakStage")? {
+            peak_stage.push(stage as u8);
+        }
+        let table = super::extract_pipeline::SegmentPeaks {
+            peak_time,
+            peak_freq: column("PeakFrequency")?,
+            duration,
+            bandwidth,
+            height: column("Height")?,
+            volume: column("Volume")?,
+            segment_num: column("SegmentNum")?,
+            bbox,
+            area: column("Area")?,
+            peakiness: column("Peakiness")?,
+            ..Default::default()
+        };
+        let o = &settings.output;
+        let precision = super::pipeline::StatsCsvPrecision::resolve(
+            o.csv_time_sigfigs,
+            o.csv_freq_sigfigs,
+            o.csv_phase_sigfigs,
+            o.csv_height_sigfigs,
+            o.csv_volume_sigfigs,
+            o.csv_area_sigfigs,
+            o.csv_peakiness_sigfigs,
+            o.csv_sopower_sigfigs,
+            fs,
+        );
+        let provenance = super::pipeline::StatsCsvProvenance {
+            writer,
+            writer_version,
+            subject_id: Some(subject_id),
+            semantics: Some(super::run::settings_schema::SEMANTICS_VERSION),
+        };
+        super::pipeline::write_stats_csv(
+            &table,
+            &column("SOpower")?,
+            &column("SOphase")?,
+            &peak_stage,
+            precision,
+            Some(&provenance),
+            std::path::Path::new(path),
+        )
+        .map_err(|e| pyo3::exceptions::PyOSError::new_err(format!("write_stats_csv: {e}")))
+    }
+
     #[pymodule]
     fn dynamo_rs(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(merge_segment, m)?)?;
@@ -1269,6 +1935,15 @@ mod python {
         m.add_function(wrap_pyfunction!(fit_rotgauss, m)?)?;
         m.add_function(wrap_pyfunction!(fit_vmgauss, m)?)?;
         m.add_function(wrap_pyfunction!(fit_tensor_product_spline, m)?)?;
+        m.add_function(wrap_pyfunction!(fit_paramfits, m)?)?;
+        m.add_function(wrap_pyfunction!(rebuild_phase_model, m)?)?;
+        m.add_function(wrap_pyfunction!(default_settings, m)?)?;
+        m.add_function(wrap_pyfunction!(migrate_settings, m)?)?;
+        m.add_function(wrap_pyfunction!(load_recording, m)?)?;
+        m.add_function(wrap_pyfunction!(run_dynamo, m)?)?;
+        m.add_function(wrap_pyfunction!(write_stats_csv, m)?)?;
+        m.add_function(wrap_pyfunction!(fit_splinefits, m)?)?;
+        m.add("SEMANTICS_VERSION", super::run::settings_schema::SEMANTICS_VERSION)?;
         m.add_function(wrap_pyfunction!(build_info_py, m)?)?;
         m.add_function(wrap_pyfunction!(fdr_grid, m)?)?;
         m.add_function(wrap_pyfunction!(fdr_adjust, m)?)?;

@@ -29,7 +29,10 @@ realfft = "3"
 rustfft = "6"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# float_roundtrip: parse every JSON number to the nearest double (the
+# default parser can be one bit off), so settings and bin centers read back
+# exactly what was written, in every build of the kernel.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 # Pure-Rust matrix algebra for the tensor-product B-spline LSQ (small
 # Cholesky on the Gram matrices). WASM-clean.
 nalgebra = { version = "0.34", default-features = false, features = ["std"] }
@@ -44,6 +47,10 @@ pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"], optiona
 numpy = { version = "0.22", optional = true }
 
 log = "0.4"
+# Error types for the end-to-end run (`run::`).
+thiserror = "1"
+# FFT-based downsampling of the EEG before a run (`run::resample`).
+rubato = "0.16"
 
 # WASM-only: faer's `rand` chain transitively requires `getrandom`, which
 # refuses to compile for `wasm32-unknown-unknown` unless the `wasm_js`
@@ -61,4 +68,7 @@ cbindgen = "0.27"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-strip = "debuginfo"
+# No strip. On current macOS toolchains (ld-27106) stripping the Python
+# extension, even debuginfo only, leaves a Mach-O that refuses to load
+# ("mis-aligned LINKEDIT string pool"). Unstripped costs about 0.7 MB.
+strip = "none"
