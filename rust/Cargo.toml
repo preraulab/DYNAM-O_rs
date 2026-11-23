@@ -29,7 +29,10 @@ realfft = "3"
 rustfft = "6"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# float_roundtrip: parse every JSON number to the nearest double (the
+# default parser can be one bit off), so settings and bin centers read back
+# exactly what was written, in every build of the kernel.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 # Pure-Rust matrix algebra for the tensor-product B-spline LSQ (small
 # Cholesky on the Gram matrices). WASM-clean.
 nalgebra = { version = "0.34", default-features = false, features = ["std"] }
