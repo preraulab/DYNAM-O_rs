@@ -34,6 +34,7 @@ pub mod parallel;
 pub mod peak_assign;
 pub mod pipeline;
 pub mod refine;
+pub mod run;
 pub mod signal;
 pub mod paramfit;
 pub mod so_phase;

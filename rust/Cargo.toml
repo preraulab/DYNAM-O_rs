@@ -47,6 +47,10 @@ pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"], optiona
 numpy = { version = "0.22", optional = true }
 
 log = "0.4"
+# Error types for the end-to-end run (`run::`).
+thiserror = "1"
+# FFT-based downsampling of the EEG before a run (`run::resample`).
+rubato = "0.16"
 
 # WASM-only: faer's `rand` chain transitively requires `getrandom`, which
 # refuses to compile for `wasm32-unknown-unknown` unless the `wasm_js`
