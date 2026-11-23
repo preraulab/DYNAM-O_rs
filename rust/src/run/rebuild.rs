@@ -8,8 +8,13 @@
 //! inputs (peaks from `stats.csv`, the native 0.5 s SO-power series, and an
 //! EMPTY SO-phase series) and assembles `DynamoOutputs`.
 //!
-//! The full run feeds the EEG-rate SO-power series; the cache feeds the native
-//! 0.5 s grid (sufficient — the time-in-bin denominator is minute-scale). The
+//! The cache stores SO-power on its native window grid. With
+//! `sopower.retain_fs` (the default) the rebuild brings it to the EEG sample
+//! grid exactly as the full run and MATLAB `computeSOpower.m` do
+//! ([`crate::so_power::upsample_to_eeg_rate`]: interpolate through the finite
+//! windows, then NaN the artifact samples), so the SO-power time-in-bin, and
+//! with it the SOPH, matches a full run. The EEG grid is the scored window
+//! ([`cache_time_grid`]) and the artifact mask comes from the cached spans. The
 //! SO-phase histogram is built from per-peak values alone with an EMPTY
 //! series: `build_soph_outputs` runs the phase axis with `compute_rate=false`
 //! / `min_time_in_bin=0`, so its `c_mat` never reads the series. Per-peak
@@ -154,6 +159,36 @@ fn artifact_spans_to_mask(spans: &[[f64; 2]], n: usize, fs: f64) -> Vec<bool> {
     mask
 }
 
+/// The EEG sample grid a full run analyzes when no time range is given:
+/// `(t0, n_samp)` for the samples `i` with `i / fs` inside the scored window
+/// (first to last epoch staged 1-5, both ends included), the same samples
+/// the orchestrator's time-range truncation keeps. `(0.0, 0)` when nothing
+/// is scored. Callers of [`rebuild_from_cache`] without the signal in hand
+/// pass these as `t0` / `n_samp`.
+pub fn cache_time_grid(stage_times: &[f64], stage_vals: &[u8], fs: f64) -> (f64, usize) {
+    let (window_start, window_end) = match crate::run::orchestrator::scored_window(stage_times, stage_vals) {
+        Some(window) => window,
+        None => return (0.0, 0),
+    };
+    if fs <= 0.0 {
+        return (0.0, 0);
+    }
+    // The first and last sample index inside [window_start, window_end],
+    // tested with the same `i / fs` comparison the truncation uses.
+    let mut first = (window_start * fs).floor().max(0.0) as usize;
+    while (first as f64) / fs < window_start {
+        first += 1;
+    }
+    let mut last = (window_end * fs).ceil().max(0.0) as usize;
+    while last > first && (last as f64) / fs > window_end {
+        last -= 1;
+    }
+    if (last as f64) / fs > window_end || last < first {
+        return (0.0, 0);
+    }
+    (first as f64 / fs, last - first + 1)
+}
+
 pub fn rebuild_from_cache(inp: &RebuildInputs) -> Result<DynamoOutputs, DynamoError> {
     // EDF-free contract: when caller has no signal, the cached PNG must
     // be the figure's spec source; we won't be running the multitaper.
@@ -166,11 +201,36 @@ pub fn rebuild_from_cache(inp: &RebuildInputs) -> Result<DynamoOutputs, DynamoEr
     let stats = segment_peaks_from_stats(inp);
     let stage_vals_f: Vec<f64> = inp.stage_vals.iter().map(|&v| v as f64).collect();
 
-    // SO-power native time grid: t_start + i*step (uniform; histogram TIB
-    // only needs uniform dt).
-    let so_power_times: Vec<f64> = (0..inp.so_power_norm.len())
+    // SO-power native window grid: t_start + i*step.
+    let so_power_native_times: Vec<f64> = (0..inp.so_power_norm.len())
         .map(|i| inp.so_power_t_start + i as f64 * inp.so_power_step)
         .collect();
+
+    // The EEG sample grid and its artifact mask. `data_arr.len()` when the
+    // caller has the signal, the caller's `n_samp` otherwise. Sample times
+    // are `(first_index + k) / fs`, as the full run computes them.
+    let n_samp = inp.data_arr.map(|a| a.len()).unwrap_or(inp.n_samp);
+    let first_index = (inp.t0 * inp.fs).round();
+    let t_time_range: Vec<f64> = (0..n_samp)
+        .map(|k| (first_index + k as f64) / inp.fs)
+        .collect();
+    let artifacts = artifact_spans_to_mask(inp.artifact_spans, n_samp, inp.fs);
+
+    // The SO-power series the SOPH and the figure read: on the EEG grid
+    // when `retain_fs` (as the full run and MATLAB), else the window grid.
+    let mut so_power_norm: Vec<f64> = inp.so_power_norm.to_vec();
+    let mut so_power_times: Vec<f64> = so_power_native_times.clone();
+    if inp.settings.sopower.retain_fs && n_samp > 0 {
+        if let Some(upsampled) = crate::so_power::upsample_to_eeg_rate(
+            inp.so_power_norm,
+            &so_power_native_times,
+            &t_time_range,
+            &artifacts,
+        ) {
+            so_power_norm = upsampled;
+            so_power_times = t_time_range.clone();
+        }
+    }
 
     // `peak_in_analysis` — stage ∈ SOPH_stages AND freq ∈ mtm.freq_range. Time
     // range is unbounded (the cache path doesn't persist a sub-range; peaks
@@ -198,7 +258,7 @@ pub fn rebuild_from_cache(inp: &RebuildInputs) -> Result<DynamoOutputs, DynamoEr
             peak_in_analysis: &peak_in_analysis,
             peak_sopower: inp.peak_sopower,
             peak_sophase: inp.peak_sophase,
-            so_power_norm: inp.so_power_norm,
+            so_power_norm: &so_power_norm,
             so_power_times: &so_power_times,
             so_phase_metric: &[],
             so_phase_times: &[],
@@ -214,11 +274,6 @@ pub fn rebuild_from_cache(inp: &RebuildInputs) -> Result<DynamoOutputs, DynamoEr
     )?;
 
     // ── Assemble DynamoOutputs ──
-    // `data_arr.len()` when caller has a signal; caller-provided `n_samp`
-    // otherwise (EDF-free Phase-2 path derives it from stage_times bounds).
-    let n_samp = inp.data_arr.map(|a| a.len()).unwrap_or(inp.n_samp);
-    let artifacts = artifact_spans_to_mask(inp.artifact_spans, n_samp, inp.fs);
-    let t_time_range: Vec<f64> = (0..n_samp).map(|i| inp.t0 + i as f64 / inp.fs).collect();
 
     Ok(DynamoOutputs {
         stats,
@@ -229,7 +284,7 @@ pub fn rebuild_from_cache(inp: &RebuildInputs) -> Result<DynamoOutputs, DynamoEr
         t_time_range,
         stage_times: inp.stage_times.to_vec(),
         stage_vals: stage_vals_f,
-        so_power_norm: inp.so_power_norm.to_vec(),
+        so_power_norm,
         so_power_times,
         so_power_norm_native: inp.so_power_norm.to_vec(),
         so_power_native_t_start: inp.so_power_t_start,
