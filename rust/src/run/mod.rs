@@ -15,6 +15,7 @@
 //! [`settings::DynamoSettings`] holds every option, and
 //! [`settings_schema`] the settings-file semantics version and migrations.
 
+pub mod load;
 pub mod orchestrator;
 pub mod rebuild;
 pub mod resample;
