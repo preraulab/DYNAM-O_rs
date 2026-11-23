@@ -68,4 +68,7 @@ cbindgen = "0.27"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-strip = "debuginfo"
+# No strip. On current macOS toolchains (ld-27106) stripping the Python
+# extension, even debuginfo only, leaves a Mach-O that refuses to load
+# ("mis-aligned LINKEDIT string pool"). Unstripped costs about 0.7 MB.
+strip = "none"
