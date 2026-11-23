@@ -73,6 +73,7 @@ use crate::run::settings::DynamoSettings;
 /// | 14    | 2026-11-17 | The minimum TF-peak height is computed from the chi² quantile for any number of tapers, as MATLAB `computeTFPeaks.m` does: `-2 x pow2db(2K / chi2inv(0.975, 2K))`. It was a stored constant for 3 tapers and no floor at all for any other count, so a run with `mtm.n_tapers` other than 3 kept every low peak that MATLAB removes. The stored 3-taper quantile was also off in the 8th digit (14.449374448 against MATLAB's 14.449375335), which moves the default floor by 5e-7 dB: no peak changes on the three Twin test nights. Runs at the default 3 tapers are unchanged. Runs at another taper count now lose the peaks below the floor. No settings value changes shape or meaning; the migration is a changelog no-op. |
 /// | 15    | 2026-11-17 | `PrefPhase` and `Coupling` in the power paramfit CSV are NaN for a mode whose `FreqMean` lies outside the phase fit's frequency window. The phase model is zero there, so the argmax returned the first SO-phase bin with a coupling of 0, a value that reads as real. Only reachable when the power and phase fits use different frequency windows, or a frequency row is invalid for the phase fit only. Every other value is unchanged. No settings value changes shape or meaning; the migration is a changelog no-op. |
 /// | 16    | 2026-11-19 | The TF-peak region labels found on the downsampled segment are resized to full resolution exactly as MATLAB `imresize(..., 'nearest')` does (kernel `resize_labels_nn`, DYNAM-O_rs #39). A full-resolution column that falls halfway between two downsampled columns was rounded half to even. `imresize` settles it by its own floating-point arithmetic, so for a 571-column segment (30 s at the default 0.05 s step) column 286 read a different downsampled column than in MATLAB, and regions touching it entered the trim with a few more or fewer pixels. On the three Twin test nights 2 of 136,238 peaks move (by at most 0.028 s and 0.007 Hz), no peak is added or removed, and every paramfit value is unchanged. No settings value changes shape or meaning; the migration is a changelog no-op. |
+/// | 17    | 2026-11-22 | SOPHs rebuilt from a results folder's cache (the second phase of `dynamo-cli batch`, and app re-runs that rebuild SOPHs or fits from `stats.csv` + `aux.h5`) count SO-power time-in-bin on the same series as a full run and MATLAB `computeSOpower.m` with `retain_Fs`: the cached window series interpolated through its finite windows onto the EEG sample grid, then NaN at the artifact samples only. The rebuild used the window series as stored, where every window overlapping an artifact and every outlier window is NaN, so it counted about 6% less valid NREM time on the Twin test cohort and its SO-power SOPH rates came out 2% to 8% high, by a different factor in each SO-power row (relative L1 2.7% to 5.4% against a full run; on one night a column crossed `hist.min_time_in_bin`). It now matches a full run to about 1e-5, the remainder being peaks on a bin edge whose per-peak values the stats CSV stores rounded. The rebuild's sample grid also includes both ends of the scored window, as a full run's does: it was one sample short, which moved the end of a recording's last artifact span by one sample in a rebuilt aux file. Full runs are unchanged. No settings value changes shape or meaning; the migration is a changelog no-op. |
 ///
 /// A value changing meaning without changing its name or type is a rare
 /// and deliberate act; entries land here only when the same file would
@@ -80,7 +81,7 @@ use crate::run::settings::DynamoSettings;
 /// regardless: a few hundred existing files are v1, and the conversion
 /// from `√2·σ` to `σ` has to remain available or those files become
 /// unmigratable. Freezing the table is not a reason to delete the field.
-pub const SEMANTICS_VERSION: u32 = 16;
+pub const SEMANTICS_VERSION: u32 = 17;
 
 /// One migration step between adjacent [`SEMANTICS_VERSION`] values.
 ///
@@ -298,6 +299,24 @@ pub fn migrations() -> Vec<Migration> {
             summary: "region labels are upsampled to full resolution the way MATLAB imresize does",
             apply: migrate_v15_to_v16,
         },
+        Migration {
+            from: 16,
+            summary: "SOPHs rebuilt from the cache count SO-power time-in-bin on the EEG-rate series, as a full run and MATLAB do",
+            apply: migrate_v16_to_v17,
+        },
+    ]
+}
+
+/// v16 → v17: computation semantics only, with no settings rewrite. A
+/// cache rebuild brings the stored SO-power window series to the EEG sample
+/// grid before counting time-in-bin, as a full run does. Every settings
+/// value keeps its shape and meaning, so this step only logs.
+fn migrate_v16_to_v17(_settings: &mut Value) -> Vec<String> {
+    vec![
+        "  no settings values change. SOPHs rebuilt from the cache under v17 \
+         count SO-power time-in-bin on the EEG-rate series, as a full run does; \
+         under v16 their SO-power rates were a few percent high"
+            .to_string(),
     ]
 }
 
